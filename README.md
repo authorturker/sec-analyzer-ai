@@ -7,7 +7,7 @@ A Telegram bot that monitors SEC filings and insider trading activity for a conf
 - **SEC Filings** — Monitors 10-K (annual), 10-Q (quarterly), and 8-K (current events) for each tracked ticker.
 - **Insider Trading** — Fetches and analyzes Form 4 filings (executive buy/sell transactions) from the last 30 days.
 - **Smart Caching** — Never re-analyzes a filing already processed; silent when nothing is new.
-- **OpenRouter LLM** — Uses OpenRouter free tier (Llama 3.3 70B by default, 128K context) for structured investor-focused summaries.
+- **OpenRouter LLM** — Uses OpenRouter free tier for structured investor-focused summaries.
 - **Telegram Interface** — Fully command-driven; responds only to your own chat ID.
 - **Lightweight** — Runs on a mid-range Android phone (tested on Poco F5 via Termux).
 
@@ -171,6 +171,16 @@ sec-analyzer-bot/
 | No time zone found with key UTC | Run `pip install tzdata` |
 | 429 Too Many Requests | Rate limit hit — bot retries automatically; switch model in config if persistent |
 | Analysis shows ⚠️ Analysis unavailable | API timeout — retry or switch to a different free model |
+
+## Support the Project
+
+If you want to support this work, you can buy me a coffe :)
+
+![Bitcoin](https://img.shields.io/badge/bitcoin-2F3134?style=for-the-badge&logo=bitcoin&logoColor=white) : 178hyCd89p2QQnyUCL5y6hpzyJqu7QHz34
+
+![Ethereum](https://img.shields.io/badge/Ethereum-3C3C3D?style=for-the-badge&logo=Ethereum&logoColor=white) : 0xf886b701d0abC89c2f59a8F98d1edF739D4b39a2
+
+![Solana](https://img.shields.io/badge/solana-%239945FF.svg?style=for-the-badge&logo=solana&logoColor=white) : MXpoKvp1ZojjZ1fXYhgLCYfUo3R9U43jiCF8cEA1q1Y
 
 ## Disclaimer
 
