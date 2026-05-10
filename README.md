@@ -1,5 +1,4 @@
-# 📊 SEC Analyzer Bot
-
+# 📊 SEC Analyzer AI
 A Telegram bot that monitors SEC filings and insider trading activity for a configurable list of tickers. Triggered by natural language commands — no scheduled jobs, no cron, no cloud infrastructure required. Runs on Android (Termux) or any Linux machine.
 
 ## Features
