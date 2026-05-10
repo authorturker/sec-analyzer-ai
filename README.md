@@ -40,7 +40,7 @@ Filing cached — won't be processed again
  **Requirements**
  
 - Python 3.10+  
-- Packages: edgartools, requests, tzdata  
+- Packages: edgartools, requests, tzdata [Big thanks to edgartools team, you can reach original repo here](https://github.com/dgunning/edgartools)
 - [OpenRouter API key — free tier, no credit card required](https://openrouter.ai "https://openrouter.ai")  
 - A Telegram bot token via [@BotFather](https://t.me/BotFather "https://t.me/BotFather")  
 - Your Telegram user ID via [@userinfobot](https://t.me/userinfobot "https://t.me/userinfobot")  
