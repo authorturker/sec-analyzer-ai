@@ -163,8 +163,6 @@ python bot.py
 # Ctrl+B then D to detach
 ```
 
-**MIUI / HyperOS:** Settings → Apps → Termux → Battery → No restrictions, enable Auto-start.
-
 ---
 
 ## 🗂 Project Structure
