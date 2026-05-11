@@ -1,8 +1,7 @@
 """
-SEC Analyzer AI — Telegram
-• SEC Filings : 10-K, 10-Q, 8-K
-• Insider Trading : Form 4
-• LLM : OpenRouter API
+SEC Analyzer Bot — Telegram (English)
+Full-featured: wizard setup, ticker & form management,
+on-demand scans, configurable LLM settings.
 """
 
 import time, json, logging, hashlib
@@ -13,66 +12,105 @@ import requests
 from edgar import Company, set_identity
 
 from config import (
-    EDGAR_IDENTITY, OPENROUTER_API_KEY, OPENROUTER_MODEL,
-    TICKERS, FILING_TYPES, DAYS_LOOKBACK,
+    EDGAR_IDENTITY, OPENROUTER_API_KEY,
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-    OUTPUT_DIR, CACHE_FILE, MAX_CHARS,
 )
 
+# ─── Paths ────────────────────────────────────────────────
+BASE_DIR    = Path.home() / "sec-analyzer"
+OUTPUT_DIR  = BASE_DIR / "reports"
+CACHE_FILE  = BASE_DIR / "cache.json"
+CONFIG_FILE = BASE_DIR / "bot_config.json"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
 # ─── Logging ──────────────────────────────────────────────
-Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
-        logging.FileHandler(f"{OUTPUT_DIR}/bot.log"),
+        logging.FileHandler(OUTPUT_DIR / "bot.log"),
         logging.StreamHandler(),
     ]
 )
 log = logging.getLogger(__name__)
 
-# ─── Command matching ─────────────────────────────────────
-CMD_SEC     = ["sec", "any news", "check", "scan", "filings",
-               "/sec", "/check", "/scan"]
-CMD_INSIDER = ["insider", "form4", "form 4", "/insider", "/form4"]
-CMD_ALL     = ["check all", "scan all", "everything", "/all"]
-CMD_HELP    = ["/start", "/help"]
+# ─── Supported forms ──────────────────────────────────────
+FORMS = {
+    "10-K":    "Annual report",
+    "10-Q":    "Quarterly report",
+    "8-K":     "Current events / material events",
+    "4":       "Insider buy/sell transactions",
+    "144":     "Restricted stock sale notice",
+    "SC 13G":  "Passive major shareholder (>5%)",
+    "SC 13D":  "Active major shareholder (>5%)",
+    "S-1":     "IPO registration statement",
+    "424B4":   "Prospectus",
+    "20-F":    "Foreign company annual report",
+    "6-K":     "Foreign company current report",
+    "DEF 14A": "Proxy / shareholder vote statement",
+    "11-K":    "Employee retirement plan report",
+}
+DEFAULT_FORMS = ["10-K", "10-Q", "8-K", "4"]
+
+# ─── Bot config (runtime, managed via Telegram) ───────────
+def load_cfg() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except Exception:
+        return {}
+
+def save_cfg(cfg: dict):
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+def get_cfg() -> dict:
+    cfg = load_cfg()
+    cfg.setdefault("tickers",      [])
+    cfg.setdefault("default_forms", DEFAULT_FORMS)
+    cfg.setdefault("model",        "openrouter/free")
+    cfg.setdefault("days_lookback", 35)
+    cfg.setdefault("max_chars",    10000)
+    cfg.setdefault("first_run",    True)
+    return cfg
+
+def update_cfg(**kwargs):
+    cfg = get_cfg()
+    cfg.update(kwargs)
+    save_cfg(cfg)
 
 # ─── Cache ────────────────────────────────────────────────
 def load_cache() -> dict:
     try:
-        return json.loads(Path(CACHE_FILE).read_text())
+        return json.loads(CACHE_FILE.read_text())
     except Exception:
         return {}
 
-def save_cache(cache: dict):
-    Path(CACHE_FILE).write_text(json.dumps(cache, indent=2))
+def save_cache(c: dict):
+    CACHE_FILE.write_text(json.dumps(c, indent=2))
 
-def cache_key(*args) -> str:
+def ck(*args) -> str:
     return hashlib.md5("_".join(str(a) for a in args).encode()).hexdigest()
 
 def is_new(cache, *args) -> bool:
-    return cache_key(*args) not in cache
+    return ck(*args) not in cache
 
 def mark_done(cache, *args):
-    cache[cache_key(*args)] = {"analyzed_at": datetime.now().isoformat()}
+    cache[ck(*args)] = {"at": datetime.now().isoformat()}
 
 # ─── Telegram ─────────────────────────────────────────────
-_TG_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+_TG = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-def tg_send(text: str):
+def tg(text: str):
     chunks, cur = [], ""
     for line in text.split("\n"):
         if len(cur) + len(line) + 1 > 4000:
-            chunks.append(cur)
-            cur = line
+            chunks.append(cur); cur = line
         else:
             cur += "\n" + line
     if cur.strip():
         chunks.append(cur)
     for chunk in chunks:
         try:
-            requests.post(f"{_TG_URL}/sendMessage", json={
+            requests.post(f"{_TG}/sendMessage", json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": chunk.strip(),
                 "parse_mode": "Markdown",
@@ -80,87 +118,76 @@ def tg_send(text: str):
             }, timeout=15)
             time.sleep(0.3)
         except Exception as e:
-            log.error(f"Telegram send error: {e}")
+            log.error(f"Telegram: {e}")
 
 def get_updates(offset: int) -> list:
     try:
-        r = requests.get(f"{_TG_URL}/getUpdates",
+        r = requests.get(f"{_TG}/getUpdates",
                          params={"offset": offset, "timeout": 30}, timeout=35)
         r.raise_for_status()
         return r.json().get("result", [])
     except Exception as e:
-        log.error(f"getUpdates error: {e}")
-        return []
+        log.error(f"getUpdates: {e}"); return []
 
-# ─── OpenRouter API ───────────────────────────────────────
-_OR_URL = "https://openrouter.ai/api/v1/chat/completions"
-_OR_HEADERS = {
+# ─── OpenRouter LLM ───────────────────────────────────────
+_OR = "https://openrouter.ai/api/v1/chat/completions"
+_OR_H = {
     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
     "Content-Type": "application/json",
-    "HTTP-Referer": "https://github.com/authorturker/sec-analyzer-ai/",
+    "HTTP-Referer": "https://github.com/authorturker/sec-analyzer-ai",
     "X-Title": "SEC Analyzer AI",
 }
-_SYSTEM = (
+_SYS = (
     "You are an experienced financial analyst specializing in SEC filings. "
     "Analyze documents from an investor's perspective. Be concise, structured, "
-    "and use bullet points. Highlight key risks and opportunities. Use emojis "
-    "to improve readability."
+    "use bullet points. Highlight key risks and opportunities. Use emojis."
 )
 
-def llm(prompt: str) -> str:
+def llm(prompt: str, model: str) -> str:
     payload = {
-        "model": OPENROUTER_MODEL,
+        "model": model,
         "messages": [
-            {"role": "system", "content": _SYSTEM},
+            {"role": "system", "content": _SYS},
             {"role": "user",   "content": prompt},
         ],
-        "max_tokens": 1200,
-        "temperature": 0.2,
+        "max_tokens": 1200, "temperature": 0.2,
     }
     for attempt in range(3):
         try:
-            r = requests.post(_OR_URL, headers=_OR_HEADERS, json=payload, timeout=120)
+            r = requests.post(_OR, headers=_OR_H, json=payload, timeout=120)
             if r.status_code == 429:
-                wait = 60 * (attempt + 1)
-                log.warning(f"Rate limit — waiting {wait}s")
-                time.sleep(wait)
-                continue
+                w = 60 * (attempt + 1)
+                log.warning(f"Rate limit — waiting {w}s"); time.sleep(w); continue
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"].strip()
         except Exception as e:
-            log.error(f"OpenRouter error (attempt {attempt + 1}): {e}")
-            time.sleep(10)
+            log.error(f"LLM error (attempt {attempt+1}): {e}"); time.sleep(10)
     return "⚠️ Analysis unavailable — API did not respond."
 
 # ─── Text extraction ──────────────────────────────────────
-_SECTIONS = {
+_SEC = {
     "10-K": ["item 1.", "item 1a.", "item 7.", "item 8."],
     "10-Q": ["item 1.", "item 2.", "item 3."],
-    "8-K":  [],
 }
 
-def prepare(text: str, form: str) -> str:
-    keywords = _SECTIONS.get(form, [])
-    if not keywords:
-        return text[:MAX_CHARS]
-    lines, capturing, chars, out = text.split("\n"), False, 0, []
+def prepare(text: str, form: str, max_chars: int) -> str:
+    kws = _SEC.get(form, [])
+    if not kws:
+        return text[:max_chars]
+    lines, on, chars, out = text.split("\n"), False, 0, []
     for line in lines:
-        if any(line.lower().strip().startswith(k) for k in keywords):
-            capturing = True
-        if capturing:
-            out.append(line)
-            chars += len(line)
-            if chars >= MAX_CHARS:
-                out.append("[text truncated]")
-                break
-    return "\n".join(out) if out else text[:MAX_CHARS]
+        if any(line.lower().strip().startswith(k) for k in kws): on = True
+        if on:
+            out.append(line); chars += len(line)
+            if chars >= max_chars: out.append("[text truncated]"); break
+    return "\n".join(out) if out else text[:max_chars]
 
-# ─── SEC analysis prompts ─────────────────────────────────
-def _prompt(ticker: str, form: str, date: str, body: str) -> str:
+# ─── Analysis prompts ─────────────────────────────────────
+def build_prompt(ticker: str, form: str, date: str, body: str) -> str:
     base = f"{ticker} — {form} ({date})\n\n{body}\n\n"
     if form == "10-K":
         return base + (
-            "Analyze the following:\n"
+            "Analyze:\n"
             "1. 📌 Business model & competitive advantage\n"
             "2. ⚠️ Top 3 critical risks\n"
             "3. 💰 Financial highlights (revenue, margins, growth)\n"
@@ -169,175 +196,442 @@ def _prompt(ticker: str, form: str, date: str, body: str) -> str:
         )
     if form == "10-Q":
         return base + (
-            "Analyze the following:\n"
+            "Analyze:\n"
             "1. 📊 Quarter performance vs prior quarter\n"
-            "2. 🔑 3 key messages from management\n"
+            "2. 🔑 3 key management messages\n"
             "3. ⚠️ Notable changes or concerns\n"
             "4. 👀 3 factors to watch next quarter"
         )
-    return base + (
-        "Analyze the following:\n"
-        "1. 📣 What happened? (summary)\n"
-        "2. 📈 Impact on stock / business\n"
-        "3. 🚨 Does this require immediate attention?"
-    )
-
-# ─── SEC scan ─────────────────────────────────────────────
-def run_sec():
-    set_identity(EDGAR_IDENTITY)
-    cache = load_cache()
-    cutoff = datetime.now() - timedelta(days=DAYS_LOOKBACK)
-    found = []
-
-    tg_send("🔍 *SEC scan started...*\n`" + "  ".join(TICKERS) + "`")
-
-    for ticker in TICKERS:
-        try:
-            company = Company(ticker)
-            for form in FILING_TYPES:
-                try:
-                    latest = company.get_filings(form=form).latest(1)
-                    if not latest:
-                        continue
-                    d = latest.filing_date
-                    if hasattr(d, "date"):
-                        d = d.date()
-                    date_str = str(d)
-                    if datetime.combine(d, datetime.min.time()) < cutoff:
-                        continue
-                    if not is_new(cache, ticker, form, date_str):
-                        continue
-                    log.info(f"New: {ticker} {form} {date_str}")
-                    found.append((ticker, form, date_str, latest.text()))
-                    time.sleep(1)
-                except Exception as e:
-                    log.error(f"{ticker} {form}: {e}")
-        except Exception as e:
-            log.error(f"{ticker}: {e}")
-
-    if not found:
-        tg_send("✅ *SEC: No new filings found.*")
-        return
-
-    tg_send(f"📬 *{len(found)} new filing(s) found — analyzing...*")
-
-    for ticker, form, date, text in found:
-        body = prepare(text, form)
-        analysis = llm(_prompt(ticker, form, date, body))
-        tg_send(
-            f"🏢 *{ticker} — {form}*\n"
-            f"📅 {date}\n\n"
-            f"{analysis}\n\n{'─'*28}"
-        )
-        cache = load_cache()
-        mark_done(cache, ticker, form, date)
-        save_cache(cache)
-        time.sleep(5)  # rate limit buffer between filings
-
-    tg_send("✅ *SEC analysis complete.*\n_This is not investment advice._")
-
-# ─── Insider trading (Form 4) ─────────────────────────────
-def run_insider():
-    set_identity(EDGAR_IDENTITY)
-    cache = load_cache()
-    cutoff = datetime.now() - timedelta(days=30)
-
-    tg_send("🔍 *Insider trading scan started...*")
-
-    by_ticker: dict = {}
-    for ticker in TICKERS:
-        try:
-            company = Company(ticker)
-            filings = company.get_filings(form="4").latest(5)
-            if not filings:
-                continue
-            filing_list = list(filings) if hasattr(filings, "__iter__") else [filings]
-            for f in filing_list:
-                d = f.filing_date
-                if hasattr(d, "date"):
-                    d = d.date()
-                date_str = str(d)
-                if datetime.combine(d, datetime.min.time()) < cutoff:
-                    continue
-                if not is_new(cache, ticker, "form4", date_str):
-                    continue
-                by_ticker.setdefault(ticker, []).append((date_str, f.text()[:6000]))
-                time.sleep(0.5)
-        except Exception as e:
-            log.error(f"Insider {ticker}: {e}")
-
-    if not by_ticker:
-        tg_send("✅ *Insider: No new Form 4 filings in the last 30 days.*")
-        return
-
-    total = sum(len(v) for v in by_ticker.values())
-    tg_send(f"📬 *{total} new Form 4 filing(s) — analyzing...*")
-
-    for ticker, items in by_ticker.items():
-        combined = "\n\n---\n\n".join(f"[{d}]\n{t}" for d, t in items)
-        analysis = llm(
-            f"{ticker} — Form 4 Insider Transactions (Last 30 days)\n\n"
-            f"{combined[:12000]}\n\n"
-            "Analyze the following:\n"
+    if form in ("4", "144"):
+        return base + (
+            "Analyze:\n"
             "1. 👤 Who transacted? (name and title)\n"
             "2. 📈 Buy or sell? Quantity and estimated value\n"
-            "3. 🔍 Overall insider sentiment: Bullish / Bearish / Neutral\n"
+            "3. 🔍 Insider sentiment: Bullish / Bearish / Neutral\n"
             "4. 💡 What does this signal for investors?"
         )
-        tg_send(
-            f"🔐 *{ticker} — Insider Trading*\n\n"
-            f"{analysis}\n\n{'─'*28}"
+    if form in ("SC 13G", "SC 13D"):
+        return base + (
+            "Analyze:\n"
+            "1. 🏦 Who is the major shareholder?\n"
+            "2. 📊 Stake size and change\n"
+            "3. 🎯 Passive or activist intent?\n"
+            "4. 💡 Implications for minority investors"
         )
-        cache = load_cache()
-        for date_str, _ in items:
-            mark_done(cache, ticker, "form4", date_str)
-        save_cache(cache)
+    if form in ("S-1", "424B4"):
+        return base + (
+            "Analyze:\n"
+            "1. 📌 Business overview & IPO rationale\n"
+            "2. 💰 Use of proceeds\n"
+            "3. ⚠️ Key risk factors\n"
+            "4. 🎯 Investor attractiveness: HIGH / MEDIUM / LOW"
+        )
+    if form == "DEF 14A":
+        return base + (
+            "Analyze:\n"
+            "1. 🗳️ Key votes on the agenda\n"
+            "2. 💼 Executive compensation — reasonable?\n"
+            "3. ⚠️ Any controversial proposals?\n"
+            "4. 💡 Recommended shareholder stance"
+        )
+    return base + (
+        "Analyze:\n"
+        "1. 📣 What happened? (summary)\n"
+        "2. 📈 Impact on stock / business\n"
+        "3. 🚨 Requires immediate attention?"
+    )
+
+# ─── Core scan logic ──────────────────────────────────────
+def scan_ticker_forms(ticker: str, forms: list, use_cache: bool, save: bool):
+    cfg   = get_cfg()
+    cache = load_cache()
+    cutoff = datetime.now() - timedelta(days=cfg["days_lookback"])
+    found  = []
+
+    set_identity(EDGAR_IDENTITY)
+    try:
+        company = Company(ticker)
+        for form in forms:
+            try:
+                latest = company.get_filings(form=form).latest(1)
+                if not latest: continue
+                d = latest.filing_date
+                if hasattr(d, "date"): d = d.date()
+                ds = str(d)
+                if datetime.combine(d, datetime.min.time()) < cutoff: continue
+                if use_cache and not is_new(cache, ticker, form, ds): continue
+                found.append((form, ds, latest.text()))
+                time.sleep(1)
+            except Exception as e:
+                log.error(f"{ticker} {form}: {e}")
+    except Exception as e:
+        tg(f"❌ *{ticker}* not found: `{e}`"); return
+
+    if not found:
+        tg(f"✅ *{ticker}*: No new filings found.")
+        return
+
+    tg(f"📬 *{ticker}* — {len(found)} filing(s) found, analyzing...")
+    for form, date, text in found:
+        body     = prepare(text, form, cfg["max_chars"])
+        analysis = llm(build_prompt(ticker, form, date, body), cfg["model"])
+        tg(f"🏢 *{ticker} — {form}*\n📅 {date}\n\n{analysis}\n\n{'─'*28}")
+        if save:
+            c = load_cache(); mark_done(c, ticker, form, date); save_cache(c)
         time.sleep(5)
 
-    tg_send("✅ *Insider analysis complete.*")
+# ─── High-level scan commands ─────────────────────────────
+def cmd_sec(forms_override=None):
+    cfg   = get_cfg()
+    lst   = cfg["tickers"]
+    forms = forms_override or cfg["default_forms"]
+    if not lst: tg("ℹ️ Watchlist is empty. Add tickers with `/addticker AAPL`."); return
+    tg("🔍 *SEC scan started...*\n`" + "  ".join(lst) + "`\n"
+       f"Forms: `{'  '.join(forms)}`")
+    for ticker in lst:
+        scan_ticker_forms(ticker, forms, use_cache=True, save=True)
+        time.sleep(2)
+    tg("✅ *Scan complete.*\n_Not investment advice._")
+
+def cmd_insider():
+    cfg = get_cfg()
+    lst = cfg["tickers"]
+    if not lst: tg("ℹ️ Watchlist is empty."); return
+    tg("🔍 *Insider scan started...*")
+    for ticker in lst:
+        scan_ticker_forms(ticker, ["4"], use_cache=True, save=True)
+        time.sleep(2)
+    tg("✅ *Insider scan complete.*")
+
+def cmd_scanticker(parts: list):
+    # /scanticker AAPL [form1 form2 ...]
+    if len(parts) < 2:
+        tg("Usage: `/scanticker AAPL` or `/scanticker AAPL 10-K 4`"); return
+    ticker = parts[1].upper()
+    if len(parts) >= 3:
+        raw_forms = [p.upper() for p in parts[2:]]
+        forms = []
+        for f in raw_forms:
+            matched = next((k for k in FORMS if k.upper() == f or k.replace(" ","").upper() == f.replace(" ","")), None)
+            if matched: forms.append(matched)
+            else: tg(f"⚠️ Unknown form `{f}` — skipped.")
+        if not forms: tg("No valid forms provided."); return
+    else:
+        forms = get_cfg()["default_forms"]
+    tg(f"🔍 On-demand scan: *{ticker}* | Forms: `{'  '.join(forms)}`\n_(not added to watchlist)_")
+    scan_ticker_forms(ticker, forms, use_cache=False, save=False)
+    tg(f"✅ *{ticker}* on-demand scan complete.\n_Not investment advice._")
+
+# ─── Ticker management ────────────────────────────────────
+def cmd_addticker(parts: list) -> str:
+    if len(parts) < 2: return "Usage: `/addticker AAPL` or `/addticker AAPL MSFT NVDA`"
+    cfg = get_cfg()
+    added, already = [], []
+    for raw in parts[1:]:
+        t = raw.upper().strip()
+        if t in cfg["tickers"]: already.append(t)
+        else: cfg["tickers"].append(t); added.append(t)
+    save_cfg(cfg)
+    lines = []
+    if added:   lines.append("✅ Added: " + "  ".join(f"`{t}`" for t in added))
+    if already: lines.append("ℹ️ Already tracked: " + "  ".join(f"`{t}`" for t in already))
+    return "\n".join(lines)
+
+def cmd_removeticker(parts: list) -> str:
+    if len(parts) < 2: return "Usage: `/removeticker AAPL`"
+    cfg = get_cfg()
+    removed, notfound = [], []
+    for raw in parts[1:]:
+        t = raw.upper().strip()
+        if t in cfg["tickers"]: cfg["tickers"].remove(t); removed.append(t)
+        else: notfound.append(t)
+    save_cfg(cfg)
+    lines = []
+    if removed:  lines.append("🗑 Removed: " + "  ".join(f"`{t}`" for t in removed))
+    if notfound: lines.append("ℹ️ Not found: " + "  ".join(f"`{t}`" for t in notfound))
+    return "\n".join(lines)
+
+def cmd_listtickers() -> str:
+    cfg = get_cfg()
+    lst = cfg["tickers"]
+    if not lst: return "📋 Watchlist is empty.\nAdd with `/addticker AAPL`"
+    return "📋 *Watchlist (" + str(len(lst)) + " tickers)*\n" + \
+           "\n".join(f"  • `{t}`" for t in lst)
+
+# ─── Form management ──────────────────────────────────────
+def cmd_listforms() -> str:
+    cfg     = get_cfg()
+    active  = cfg["default_forms"]
+    cats = [
+        ("📄 Periodic Reports", ["10-K","10-Q","8-K"]),
+        ("🔐 Insider & Ownership", ["4","144","SC 13G","SC 13D"]),
+        ("🚀 Offerings", ["S-1","424B4"]),
+        ("🌍 Foreign Issuers", ["20-F","6-K"]),
+        ("📜 Other", ["DEF 14A","11-K"]),
+    ]
+    lines = ["📋 *Supported Form Types*\n"]
+    for cat, flist in cats:
+        lines.append(f"*{cat}*")
+        for f in flist:
+            mark = "✅" if f in active else "  "
+            lines.append(f"  {mark} `{f}` — {FORMS[f]}")
+        lines.append("")
+    lines.append(f"*Active in default scan:* `{'  '.join(active)}`")
+    lines.append("\n`/addform 10-K` · `/removeform 8-K`")
+    return "\n".join(lines)
+
+def cmd_addform(parts: list) -> str:
+    if len(parts) < 2: return "Usage: `/addform SC 13G` or `/addform S-1`"
+    raw   = " ".join(parts[1:]).upper()
+    match = next((k for k in FORMS if k.upper() == raw or k.replace(" ","").upper() == raw.replace(" ","")), None)
+    if not match: return f"❌ Unknown form `{raw}`.\nSend `/listforms` to see options."
+    cfg = get_cfg()
+    if match in cfg["default_forms"]: return f"ℹ️ `{match}` is already in default forms."
+    cfg["default_forms"].append(match); save_cfg(cfg)
+    return f"✅ `{match}` added to default scan forms."
+
+def cmd_removeform(parts: list) -> str:
+    if len(parts) < 2: return "Usage: `/removeform 8-K`"
+    raw   = " ".join(parts[1:]).upper()
+    match = next((k for k in FORMS if k.upper() == raw or k.replace(" ","").upper() == raw.replace(" ","")), None)
+    if not match: return f"❌ Unknown form `{raw}`."
+    cfg = get_cfg()
+    if match not in cfg["default_forms"]: return f"ℹ️ `{match}` is not in default forms."
+    cfg["default_forms"].remove(match); save_cfg(cfg)
+    return f"🗑 `{match}` removed from default scan forms."
+
+# ─── Settings ─────────────────────────────────────────────
+def cmd_settings() -> str:
+    cfg = get_cfg()
+    return (
+        "⚙️ *Current Settings*\n\n"
+        f"🤖 Model      : `{cfg['model']}`\n"
+        f"📅 Lookback   : `{cfg['days_lookback']} days`\n"
+        f"📝 Max chars  : `{cfg['max_chars']}`\n"
+        f"📋 Forms      : `{'  '.join(cfg['default_forms'])}`\n"
+        f"🏢 Tickers    : `{len(cfg['tickers'])} ticker(s)`"
+        + (f" — `{'  '.join(cfg['tickers'])}`" if cfg["tickers"] else "")
+        + "\n\n"
+        "`/setmodel` · `/setlookback` · `/setchars`"
+    )
+
+def cmd_setmodel(parts: list) -> str:
+    if len(parts) < 2:
+        return (
+            "Usage: `/setmodel <model>`\n\nFree models:\n"
+            "`meta-llama/llama-3.3-70b-instruct:free`\n"
+            "`google/gemma-3-27b-it:free`\n"
+            "`deepseek/deepseek-chat-v3-0324:free`"
+        )
+    model = " ".join(parts[1:])
+    update_cfg(model=model)
+    return f"✅ Model set to:\n`{model}`"
+
+def cmd_setlookback(parts: list) -> str:
+    if len(parts) < 2: return "Usage: `/setlookback 60`"
+    try:
+        n = int(parts[1])
+        if not 1 <= n <= 365: raise ValueError
+        update_cfg(days_lookback=n)
+        return f"✅ Lookback period set to `{n} days`."
+    except ValueError:
+        return "❌ Please provide a number between 1 and 365."
+
+def cmd_setchars(parts: list) -> str:
+    if len(parts) < 2: return "Usage: `/setchars 15000`"
+    try:
+        n = int(parts[1])
+        if not 1000 <= n <= 50000: raise ValueError
+        update_cfg(max_chars=n)
+        return f"✅ Max chars set to `{n}`."
+    except ValueError:
+        return "❌ Please provide a number between 1000 and 50000."
+
+# ─── First-run wizard ─────────────────────────────────────
+WIZARD: dict = {}  # in-memory wizard state
+
+FORMS_MENU = (
+    "📋 *Step 1 / 2 — Choose default form types*\n\n"
+    "*Periodic Reports*\n"
+    "  `10-K`    Annual report\n"
+    "  `10-Q`    Quarterly report\n"
+    "  `8-K`     Current events\n\n"
+    "*Insider & Ownership*\n"
+    "  `4`       Insider buy/sell\n"
+    "  `144`     Restricted stock sale\n"
+    "  `SC 13G`  Passive major shareholder\n"
+    "  `SC 13D`  Active major shareholder\n\n"
+    "*Offerings*\n"
+    "  `S-1`     IPO registration\n"
+    "  `424B4`   Prospectus\n\n"
+    "*Foreign Issuers*\n"
+    "  `20-F`    Foreign annual\n"
+    "  `6-K`     Foreign current\n\n"
+    "*Other*\n"
+    "  `DEF 14A` Proxy statement\n"
+    "  `11-K`    Retirement plan\n\n"
+    f"Default recommendation: `10-K  10-Q  8-K  4`\n\n"
+    "✅ `/usedefaults` — use recommended\n"
+    "✏️ `/setforms 10-K 10-Q 8-K 4 SC 13G` — custom selection"
+)
+
+TICKERS_MENU = (
+    "📋 *Step 2 / 2 — Add your first tickers*\n\n"
+    "Examples:\n"
+    "`/addticker AAPL`\n"
+    "`/addticker MU GOOG ASML NVDA`\n\n"
+    "⏭ `/skip` — skip for now (add later anytime)"
+)
+
+def start_wizard():
+    WIZARD["step"] = "forms"
+    tg(
+        "👋 *Welcome to SEC Analyzer Bot!*\n\n"
+        "No configuration found — let's set things up.\n"
+        "This takes about 1 minute.\n\n"
+        + FORMS_MENU
+    )
+
+def wizard_handle(text: str, parts: list) -> bool:
+    """Returns True if input was consumed by the wizard."""
+    step = WIZARD.get("step")
+    if not step:
+        return False
+
+    if step == "forms":
+        if text == "/usedefaults":
+            update_cfg(default_forms=DEFAULT_FORMS, first_run=False)
+            WIZARD["step"] = "tickers"
+            tg(f"✅ Default forms set: `{'  '.join(DEFAULT_FORMS)}`\n\n" + TICKERS_MENU)
+            return True
+        if parts[0].lower() == "/setforms" and len(parts) >= 2:
+            raw   = [p.upper() for p in parts[1:]]
+            valid = []
+            for f in raw:
+                m = next((k for k in FORMS if k.upper() == f or k.replace(" ","").upper() == f.replace(" ","")), None)
+                if m: valid.append(m)
+                else: tg(f"⚠️ Unknown form `{f}` — skipped.")
+            if not valid:
+                tg("❌ No valid forms. " + FORMS_MENU); return True
+            update_cfg(default_forms=valid, first_run=False)
+            WIZARD["step"] = "tickers"
+            tg(f"✅ Forms set: `{'  '.join(valid)}`\n\n" + TICKERS_MENU)
+            return True
+        tg("Please use `/usedefaults` or `/setforms 10-K 10-Q 8-K 4`")
+        return True
+
+    if step == "tickers":
+        if text == "/skip":
+            WIZARD.pop("step", None)
+            tg(
+                "✅ *Setup complete!*\n\n"
+                "Add tickers anytime with `/addticker AAPL`\n"
+                "Send `/help` to see all commands."
+            )
+            return True
+        if parts[0].lower() == "/addticker" and len(parts) >= 2:
+            result = cmd_addticker(parts)
+            WIZARD.pop("step", None)
+            tg(result + "\n\n✅ *Setup complete!*\nSend `/help` to see all commands.")
+            return True
+        tg("Use `/addticker AAPL` or `/skip`")
+        return True
+
+    return False
 
 # ─── Help ─────────────────────────────────────────────────
 def help_msg() -> str:
+    cfg = get_cfg()
     return (
-        "🤖 *SEC Analyzer AI*\n\n"
-        "*SEC Filings:*\n"
-        "`Any news?` · `Check` · `Scan` · `/sec`\n"
-        "→ Scans 10-K, 10-Q, 8-K\n\n"
-        "*Insider Trading:*\n"
-        "`Insider` · `/insider`\n"
-        "→ Analyzes Form 4 transactions\n\n"
-        "*Everything:*\n"
-        "`Check all` · `/all`\n"
-        "→ SEC filings + Insider combined\n\n"
-        f"*Tracked tickers:*\n`{'  '.join(TICKERS)}`"
+        "🤖 *SEC Analyzer Bot*\n\n"
+        "*Scans:*\n"
+        "`Any news?` · `Check` · `/sec` → full watchlist scan\n"
+        "`Insider` · `/insider` → Form 4 only\n"
+        "`Check all` · `/all` → SEC + Insider\n\n"
+        "*On-demand:*\n"
+        "`/scanticker AAPL` → scan, no watchlist add\n"
+        "`/scanticker AAPL 10-K 4` → specific forms\n\n"
+        "*Tickers:*\n"
+        "`/addticker AAPL MSFT` · `/removeticker AAPL`\n"
+        "`/listtickers`\n\n"
+        "*Forms:*\n"
+        "`/listforms` → all supported + active\n"
+        "`/addform SC 13G` · `/removeform 8-K`\n\n"
+        "*Settings:*\n"
+        "`/settings`\n"
+        "`/setmodel <model>` · `/setlookback 60` · `/setchars 15000`\n\n"
+        f"*Active forms:* `{'  '.join(cfg['default_forms'])}`\n"
+        f"*Tickers:* `{len(cfg['tickers'])}` tracked"
     )
 
 # ─── Main loop ────────────────────────────────────────────
 def main():
     log.info("Bot started.")
-    tg_send("🤖 *SEC Analyzer is online.*\nSend `/help` for available commands.")
+    cfg = get_cfg()
+    if cfg.get("first_run", True):
+        start_wizard()
+    else:
+        tg("🤖 *SEC Analyzer is online.*\nSend `/help` for commands.")
 
     offset = 0
     while True:
         updates = get_updates(offset)
-        for update in updates:
-            offset = update["update_id"] + 1
-            msg = update.get("message", {})
+        for upd in updates:
+            offset = upd["update_id"] + 1
+            msg     = upd.get("message", {})
             chat_id = str(msg.get("chat", {}).get("id", ""))
-            text = msg.get("text", "").lower().strip()
+            raw     = msg.get("text", "").strip()
+            text    = raw.lower()
+            parts   = raw.split()
+            cmd     = parts[0].lower() if parts else ""
 
             if chat_id != str(TELEGRAM_CHAT_ID):
                 continue
 
-            if text in CMD_HELP:
-                tg_send(help_msg())
-            elif any(t in text for t in CMD_ALL):
-                run_sec()
-                run_insider()
-            elif any(t in text for t in CMD_INSIDER):
-                run_insider()
-            elif any(t in text for t in CMD_SEC):
-                run_sec()
+            if wizard_handle(text, parts):
+                continue
+
+            # ── Ticker management ──
+            if cmd == "/addticker":
+                tg(cmd_addticker(parts))
+            elif cmd == "/removeticker":
+                tg(cmd_removeticker(parts))
+            elif cmd == "/listtickers":
+                tg(cmd_listtickers())
+
+            # ── Form management ──
+            elif cmd == "/listforms":
+                tg(cmd_listforms())
+            elif cmd == "/addform":
+                tg(cmd_addform(parts))
+            elif cmd == "/removeform":
+                tg(cmd_removeform(parts))
+
+            # ── Settings ──
+            elif cmd == "/settings":
+                tg(cmd_settings())
+            elif cmd == "/setmodel":
+                tg(cmd_setmodel(parts))
+            elif cmd == "/setlookback":
+                tg(cmd_setlookback(parts))
+            elif cmd == "/setchars":
+                tg(cmd_setchars(parts))
+
+            # ── On-demand scan ──
+            elif cmd == "/scanticker":
+                cmd_scanticker(parts)
+
+            # ── Help ──
+            elif text in ["/start", "/help"]:
+                tg(help_msg())
+
+            # ── Scans ──
+            elif any(t in text for t in ["check all", "scan all", "everything", "/all"]):
+                cmd_sec(); cmd_insider()
+            elif any(t in text for t in ["insider", "form4", "/insider", "/form4"]):
+                cmd_insider()
+            elif any(t in text for t in ["any news", "check", "scan", "sec", "filings", "/sec", "/check", "/scan"]):
+                cmd_sec()
 
         time.sleep(1)
 
