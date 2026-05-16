@@ -1,0 +1,13 @@
+# Core runtime dependencies.
+# Pinned to minor-major bounds known to work; minor bumps are safe.
+edgartools>=3.0,<5.0      # SEC EDGAR client (Company, get_filings, set_identity)
+requests>=2.28,<3.0       # Telegram + OpenRouter + Stooq HTTP
+tzdata>=2024.1            # Required on Termux/Android for zoneinfo lookups
+
+# Optional — only needed for webhook mode (/setwebhook).
+# Uncomment if you want webhook delivery instead of long polling.
+# flask>=3.0,<4.0
+
+# Dev-only — run tests with `python -m pytest tests/ -q`.
+# Move to a separate requirements-dev.txt if you prefer a slimmer prod install.
+pytest>=8.0,<10.0
