@@ -1,14 +1,19 @@
 # config.py — SEC Analyzer
-# Only secrets live here. Everything else is managed via Telegram.
+# Only secrets live here. Everything else (tickers, forms, model, schedule,
+# language, custom prompts, …) is managed live via Telegram commands and
+# persisted in ~/sec-analyzer/bot_config.json — no code edits required.
 
-# SEC EDGAR requires a name and email in the User-Agent header.
-EDGAR_IDENTITY     = "Your Name yourname@email.com"
+# ─── EDGAR Identity (required) ────────────────────────────
+# SEC requires "Name email@domain.com" in the User-Agent header.
+# The bot validates this at startup and refuses to run on the placeholder.
+EDGAR_IDENTITY = "Your Name yourname@email.com"
 
-# OpenRouter API key — free at openrouter.ai → Keys → Create Key
+# ─── OpenRouter API (required) ────────────────────────────
+# Free key at: openrouter.ai → Keys → Create Key
 OPENROUTER_API_KEY = "sk-or-v1-YOUR_KEY_HERE"
 
-# Telegram bot token — from @BotFather → /newbot
+# ─── Telegram (required) ──────────────────────────────────
+# Bot token : @BotFather → /newbot
+# Chat ID   : @userinfobot → /start
 TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"
-
-# Your Telegram user ID — from @userinfobot → /start
 TELEGRAM_CHAT_ID   = "YOUR_CHAT_ID"
