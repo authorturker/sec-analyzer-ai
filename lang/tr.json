@@ -47,6 +47,17 @@
   "sentiment_no_transactions": "✅ *Son 30 günde insider işlem bulunamadı.*",
   "sentiment_score_header": "🔐 *Portföy Insider Sentiment Skoru*\n📅 Son 30 gün — {count} şirket\n\n{signals}\n\n{sep}\n📊 *Portföy Özeti:*\n{summary}",
 
+  "yfinance_missing": "❌ `{cmd}` için opsiyonel `yfinance` paketi gerekli.\nKurulum: `pip install yfinance`",
+  "checkprice_usage": "Kullanım: `/checkprice HISSE [gün]`\nÖrnek: `/checkprice AAPL 30` (varsayılan 7 gün, 1-365 arası)",
+  "checkprice_no_data": "ℹ️ *{ticker}* için son {days} günde fiyat verisi yok.",
+  "checkprice_fetch_error": "❌ *{ticker}* fiyatları çekilemedi (ağ veya rate limit).",
+  "checkprice_block": "💹 *{ticker}* — son {days} gün ({count} işlem günü)\n{emoji} *{pct}%* değişim\n📅 {start_date}: açılış `{start_open}`\n📅 {end_date}: kapanış `{end_close}`\n📊 yüksek `{high}` · düşük `{low}`",
+  "checknews_usage": "Kullanım: `/checknews HISSE [adet]`\nÖrnek: `/checknews AAPL 10` (varsayılan 5, maks 20)",
+  "checknews_no_data": "ℹ️ *{ticker}* için son haber yok.",
+  "checknews_fetch_error": "❌ *{ticker}* haberleri çekilemedi (ağ veya rate limit).",
+  "checknews_header": "📰 *{ticker}* — son {count} başlık",
+  "checknews_item": "• [{title}]({url})\n  _{provider} · {date}_",
+
   "compare_usage": "Kullanım: `/compare AAPL MSFT [FORM]`\nFORM varsayılan `10-K`.\nÖrnek: `/compare AAPL MSFT 10-Q`",
   "compare_same_ticker": "❌ İki farklı hisse ver.",
   "compare_started": "🆚 *{a} vs {b} karşılaştırılıyor* — form `{form}`\nSon dosyalar çekiliyor...",
@@ -191,5 +202,5 @@
   "report_footer": "*Bu rapor otomatik üretilmiştir. Yatırım tavsiyesi değildir.*",
   "report_caption": "📋 SEC Analiz Raporu — {date}",
 
-  "help_block": "🤖 *SEC Analizci Bot v2.4*\n\n*Taramalar:*\n`Any news?` · `Check` · `/sec`\n`Insider` · `/insider` · `Check all` · `/all`\n`/sentiment` — portföy insider skoru\n`/sentiment trend [gün]` — N gün öncesine göre değişim\n\n*Anlık tarama:*\n`/scanticker AAPL` · `/scanticker AAPL 10-K 4`\n`/compare AAPL MSFT 10-K` — yan yana karşılaştır\n\n*Hisseler:*\n`/addticker AAPL MSFT` · `/removeticker AAPL` · `/listtickers`\n\n*Gruplar:*\n`/addgroup tech AAPL MSFT` · `/removegroup tech` · `/listgroups`\n`/scangroup tech` · `/scangroup tech 10-K 4`\n\n*Formlar:*\n`/listforms` · `/addform SC 13G` · `/removeform 8-K`\n\n*Özel Promptlar:*\n`/setprompt 10-K <metin>` · `/getprompt 10-K`\n`/resetprompt 10-K` · `/listprompts`\n\n*Zamanlama:*\n`/setschedule 08:00` · `/setschedule off`\n`/alarm` · `/alarm off`\n`/digest` · `/digest now` · `/digest off`\n\n*Raporlar:*\n`/report` — bu haftanın analizlerini .md dosyası olarak gönder\n\n*Dil:*\n`/setlang en` · `/setlang tr`\n\n*Webhook:*\n`/setwebhook <url>` · `/delwebhook`\n\n`/settings` · `/status`\n`/setmodel` · `/setlookback 60` · `/setchars 15000`\n`/priceaction on|off` · `/setlookforward 5`\n\n*Aktif formlar:* `{forms}`\n*Takip edilen:* `{ticker_count}` hisse\n*Dil:* `{language}`"
+  "help_block": "🤖 *SEC Analizci Bot v2.4*\n\n*Taramalar:*\n`Any news?` · `Check` · `/sec`\n`Insider` · `/insider` · `Check all` · `/all`\n`/sentiment` — portföy insider skoru\n`/sentiment trend [gün]` — N gün öncesine göre değişim\n\n*Anlık tarama:*\n`/scanticker AAPL` · `/scanticker AAPL 10-K 4`\n`/compare AAPL MSFT 10-K` — yan yana karşılaştır\n`/checkprice AAPL [gün]` · `/checknews AAPL [adet]`\n\n*Hisseler:*\n`/addticker AAPL MSFT` · `/removeticker AAPL` · `/listtickers`\n\n*Gruplar:*\n`/addgroup tech AAPL MSFT` · `/removegroup tech` · `/listgroups`\n`/scangroup tech` · `/scangroup tech 10-K 4`\n\n*Formlar:*\n`/listforms` · `/addform SC 13G` · `/removeform 8-K`\n\n*Özel Promptlar:*\n`/setprompt 10-K <metin>` · `/getprompt 10-K`\n`/resetprompt 10-K` · `/listprompts`\n\n*Zamanlama:*\n`/setschedule 08:00` · `/setschedule off`\n`/alarm` · `/alarm off`\n`/digest` · `/digest now` · `/digest off`\n\n*Raporlar:*\n`/report` — bu haftanın analizlerini .md dosyası olarak gönder\n\n*Dil:*\n`/setlang en` · `/setlang tr`\n\n*Webhook:*\n`/setwebhook <url>` · `/delwebhook`\n\n`/settings` · `/status`\n`/setmodel` · `/setlookback 60` · `/setchars 15000`\n`/priceaction on|off` · `/setlookforward 5`\n\n*Aktif formlar:* `{forms}`\n*Takip edilen:* `{ticker_count}` hisse\n*Dil:* `{language}`"
 }

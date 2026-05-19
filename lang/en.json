@@ -47,6 +47,17 @@
   "sentiment_no_transactions": "✅ *No insider transactions found in the last 30 days.*",
   "sentiment_score_header": "🔐 *Portfolio Insider Sentiment Score*\n📅 Last 30 days — {count} company(ies)\n\n{signals}\n\n{sep}\n📊 *Portfolio Summary:*\n{summary}",
 
+  "yfinance_missing": "❌ `{cmd}` requires the optional `yfinance` package.\nInstall it with: `pip install yfinance`",
+  "checkprice_usage": "Usage: `/checkprice TICKER [days]`\nExample: `/checkprice AAPL 30` (default 7 days, range 1-365)",
+  "checkprice_no_data": "ℹ️ No price data for *{ticker}* in the last {days} day(s).",
+  "checkprice_fetch_error": "❌ Could not fetch prices for *{ticker}* (network or rate limit).",
+  "checkprice_block": "💹 *{ticker}* — last {days} day(s) ({count} trading days)\n{emoji} *{pct}%* change\n📅 {start_date}: open `{start_open}`\n📅 {end_date}: close `{end_close}`\n📊 high `{high}` · low `{low}`",
+  "checknews_usage": "Usage: `/checknews TICKER [count]`\nExample: `/checknews AAPL 10` (default 5, max 20)",
+  "checknews_no_data": "ℹ️ No recent news for *{ticker}*.",
+  "checknews_fetch_error": "❌ Could not fetch news for *{ticker}* (network or rate limit).",
+  "checknews_header": "📰 *{ticker}* — {count} recent headline(s)",
+  "checknews_item": "• [{title}]({url})\n  _{provider} · {date}_",
+
   "compare_usage": "Usage: `/compare AAPL MSFT [FORM]`\nFORM defaults to `10-K`.\nExample: `/compare AAPL MSFT 10-Q`",
   "compare_same_ticker": "❌ Pass two different tickers.",
   "compare_started": "🆚 *Comparing {a} vs {b}* — form `{form}`\nFetching latest filings...",
@@ -191,5 +202,5 @@
   "report_footer": "*This report was generated automatically. Not investment advice.*",
   "report_caption": "📋 SEC Analysis Report — {date}",
 
-  "help_block": "🤖 *SEC Analyzer Bot v2.4*\n\n*Scans:*\n`Any news?` · `Check` · `/sec`\n`Insider` · `/insider` · `Check all` · `/all`\n`/sentiment` — portfolio insider score\n`/sentiment trend [days]` — sentiment shift vs N days ago\n\n*On-demand:*\n`/scanticker AAPL` · `/scanticker AAPL 10-K 4`\n`/compare AAPL MSFT 10-K` — side-by-side\n\n*Tickers:*\n`/addticker AAPL MSFT` · `/removeticker AAPL` · `/listtickers`\n\n*Groups:*\n`/addgroup tech AAPL MSFT` · `/removegroup tech` · `/listgroups`\n`/scangroup tech` · `/scangroup tech 10-K 4`\n\n*Forms:*\n`/listforms` · `/addform SC 13G` · `/removeform 8-K`\n\n*Custom Prompts:*\n`/setprompt 10-K <text>` · `/getprompt 10-K`\n`/resetprompt 10-K` · `/listprompts`\n\n*Schedule:*\n`/setschedule 08:00` · `/setschedule off`\n`/alarm` · `/alarm off`\n`/digest` · `/digest now` · `/digest off`\n\n*Reports:*\n`/report` — send this week's analyses as .md file\n\n*Language:*\n`/setlang en` · `/setlang tr`\n\n*Webhook:*\n`/setwebhook <url>` · `/delwebhook`\n\n`/settings` · `/status`\n`/setmodel` · `/setlookback 60` · `/setchars 15000`\n`/priceaction on|off` · `/setlookforward 5`\n\n*Active forms:* `{forms}`\n*Tracking:* `{ticker_count}` ticker(s)\n*Language:* `{language}`"
+  "help_block": "🤖 *SEC Analyzer Bot v2.4*\n\n*Scans:*\n`Any news?` · `Check` · `/sec`\n`Insider` · `/insider` · `Check all` · `/all`\n`/sentiment` — portfolio insider score\n`/sentiment trend [days]` — sentiment shift vs N days ago\n\n*On-demand:*\n`/scanticker AAPL` · `/scanticker AAPL 10-K 4`\n`/compare AAPL MSFT 10-K` — side-by-side\n`/checkprice AAPL [days]` · `/checknews AAPL [count]`\n\n*Tickers:*\n`/addticker AAPL MSFT` · `/removeticker AAPL` · `/listtickers`\n\n*Groups:*\n`/addgroup tech AAPL MSFT` · `/removegroup tech` · `/listgroups`\n`/scangroup tech` · `/scangroup tech 10-K 4`\n\n*Forms:*\n`/listforms` · `/addform SC 13G` · `/removeform 8-K`\n\n*Custom Prompts:*\n`/setprompt 10-K <text>` · `/getprompt 10-K`\n`/resetprompt 10-K` · `/listprompts`\n\n*Schedule:*\n`/setschedule 08:00` · `/setschedule off`\n`/alarm` · `/alarm off`\n`/digest` · `/digest now` · `/digest off`\n\n*Reports:*\n`/report` — send this week's analyses as .md file\n\n*Language:*\n`/setlang en` · `/setlang tr`\n\n*Webhook:*\n`/setwebhook <url>` · `/delwebhook`\n\n`/settings` · `/status`\n`/setmodel` · `/setlookback 60` · `/setchars 15000`\n`/priceaction on|off` · `/setlookforward 5`\n\n*Active forms:* `{forms}`\n*Tracking:* `{ticker_count}` ticker(s)\n*Language:* `{language}`"
 }
