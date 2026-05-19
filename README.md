@@ -117,7 +117,6 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 ---
 
 ## 💬 Commands
-
 ### Scans
 | Command | Action |
 |---|---|
@@ -129,6 +128,8 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 | `/scanticker AAPL` | Scan single ticker, default forms, not added to watchlist |
 | `/scanticker AAPL 10-K 4` | Scan single ticker with specific forms |
 | `/compare AAPL MSFT [FORM]` | Side-by-side comparison (default form: 10-K) |
+| `/checkprice AAPL [days]` | Last-N-day price summary — change, open/close, high/low (default 7) |
+| `/checknews AAPL [count]` | Recent Yahoo Finance headlines + publisher links (default 5, max 20) |
 
 ### Ticker Management
 | Command | Action |
@@ -166,7 +167,7 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 | Command | Action |
 |---|---|
 | `/report` | Send this week's full analyses as a `.md` file |
-| (inline button after each analysis) | Receive the raw filing as a `.txt` |
+| *(inline button after analysis)* | Receive the raw filing as a `.txt` |
 
 ### Scheduling & Alerts
 | Command | Action |
@@ -179,16 +180,11 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 | `/digest now` | Send digest immediately |
 | `/digest off` | Disable weekly digest |
 
-### Language
+### Language & Webhook
 | Command | Action |
 |---|---|
-| `/setlang en` | Switch UI + LLM-output language to English |
-| `/setlang tr` | Switch UI + LLM-output language to Turkish |
-
-### Webhook
-| Command | Action |
-|---|---|
-| `/setwebhook <url>` | Switch to webhook mode (requires public URL + `pip install flask`) |
+| `/setlang en` / `/setlang tr` | Switch UI + LLM-output language |
+| `/setwebhook <url>` | Switch to webhook mode (requires Flask + public URL) |
 | `/delwebhook` | Switch back to polling mode |
 
 ### Settings & Status
