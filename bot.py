@@ -1251,6 +1251,38 @@ def scan_ticker(ticker: str, forms: list,
     status_set(last_scan=datetime.now().isoformat())
     return True
 
+def probe_new_filings_for_watchlist(form_override: list | None = None) -> bool:
+    """
+    Probe-only existence check for the hourly alarm.
+
+    Asks EDGAR whether the watchlist has any new (cache-filtered, lookback-
+    windowed) filings. Returns True on the FIRST hit (short-circuits) so it
+    does at most one EDGAR call per ticker until something is found.
+
+    Side-effect-free: does NOT call the LLM, does NOT write to cache,
+    does NOT touch weekly_log or previous_filings. The user sees only the
+    'Alert' message and must run /check (or `Check`) manually to actually
+    analyze the new filings — which keeps LLM quota under the user's
+    control instead of burning it silently in the background.
+    """
+    cfg = get_cfg()
+    items = cfg["tickers"]
+    if not items:
+        return False
+    forms = form_override or cfg["default_forms"]
+    cache_dict = load_cache()
+    lookback = cfg["days_lookback"]
+    for ticker in items:
+        rows = fetch_new_filings(
+            ticker, forms, lookback,
+            cache_dict=cache_dict, use_cache=True,
+            quiet=True,
+        )
+        if rows:
+            return True
+        time.sleep(1)
+    return False
+
 # ─── Top-level scan commands ──────────────────────────────
 def cmd_sec(form_override=None, quiet=False):
     cfg    = get_cfg()
@@ -1947,12 +1979,14 @@ def background_thread():
                     tg(t("scheduled_scan_starting", time=schedule_str))
                     cmd_sec(quiet=False)
 
-        # Hourly alarm
+        # Hourly alarm — PROBE ONLY. Existence check that does not touch the
+        # cache, the LLM, or weekly_log. The user runs /check manually after
+        # seeing the alert. Prevents the old bug where the alarm silently
+        # processed filings and the subsequent /check returned "no new filings".
         if cfg.get("alarm_on"):
             if (now - last_alarm_check).total_seconds() >= 3600:
-                log.info("Alarm: hourly check")
-                any_found = cmd_sec(quiet=True)
-                if any_found:
+                log.info("Alarm: hourly probe")
+                if probe_new_filings_for_watchlist():
                     tg(t("alert_new_filing"))
                 last_alarm_check = now
                 status_set(last_alarm=now.isoformat())
