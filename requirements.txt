@@ -8,6 +8,10 @@ tzdata>=2024.1            # Required on Termux/Android for zoneinfo lookups
 # Uncomment if you want webhook delivery instead of long polling.
 # flask>=3.0,<4.0
 
+# Optional — only needed for /checkprice and /checknews commands.
+# Adds ~50 MB (pandas + numpy + curl_cffi); skip on tight Termux installs.
+# yfinance>=0.2,<2.0
+
 # Dev-only — run tests with `python -m pytest tests/ -q`.
 # Move to a separate requirements-dev.txt if you prefer a slimmer prod install.
 pytest>=8.0,<10.0

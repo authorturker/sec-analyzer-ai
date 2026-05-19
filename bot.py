@@ -27,6 +27,13 @@ try:
 except ImportError:
     FLASK_OK = False
 
+# yfinance — for /checkprice and /checknews (optional)
+try:
+    import yfinance as yf
+    YF_OK = True
+except ImportError:
+    YF_OK = False
+
 from config import (
     EDGAR_IDENTITY, OPENROUTER_API_KEY,
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
@@ -459,6 +466,128 @@ def compute_price_snippet(ticker: str, filing_date: str) -> str:
     cache[cache_k] = change
     save_price_cache(cache)
     return _format_price_snippet(change)
+
+# ─── /checkprice + /checknews (E5, yfinance-backed) ───────
+# yfinance is optional — if not installed, both commands return a clear
+# error message instead of crashing. All formatting helpers are PURE
+# so they can be unit-tested with synthetic data (no network).
+
+def _format_price_check(ticker: str, days: int, rows: list) -> str:
+    """
+    PURE: render the /checkprice block.
+    rows: list[(date_str, open, high, low, close)] sorted ascending.
+    """
+    if not rows:
+        return t("checkprice_no_data", ticker=ticker, days=days)
+    first = rows[0]
+    last  = rows[-1]
+    start_open = first[1]
+    end_close  = last[4]
+    pct = ((end_close - start_open) / start_open * 100.0) if start_open else 0.0
+    emoji = "📈" if pct >= 0 else "📉"
+    high_all = max(r[2] for r in rows)
+    low_all  = min(r[3] for r in rows)
+    return t("checkprice_block",
+             ticker=ticker, days=days, count=len(rows),
+             emoji=emoji, pct=f"{pct:+.2f}",
+             start_date=first[0], start_open=f"{start_open:.2f}",
+             end_date=last[0],    end_close=f"{end_close:.2f}",
+             high=f"{high_all:.2f}", low=f"{low_all:.2f}")
+
+def _news_extract(item: dict) -> dict:
+    """PURE: normalize one yfinance news item into a flat dict."""
+    c = (item or {}).get("content") or {}
+    canonical = (c.get("canonicalUrl") or {}).get("url")
+    fallback  = (c.get("clickThroughUrl") or {}).get("url")
+    return {
+        "title":     c.get("title")    or "(no title)",
+        "url":       canonical or fallback or "",
+        "provider":  (c.get("provider") or {}).get("displayName", ""),
+        "date":      (c.get("pubDate")  or "")[:10],   # YYYY-MM-DD
+    }
+
+def _format_news_list(ticker: str, items: list, count: int) -> str:
+    """PURE: render the /checknews block. items: raw yfinance news list."""
+    if not items:
+        return t("checknews_no_data", ticker=ticker)
+    items = items[:count]
+    lines = [t("checknews_header", ticker=ticker, count=len(items))]
+    for raw in items:
+        n = _news_extract(raw)
+        lines.append(t("checknews_item",
+                       title=n["title"], url=n["url"],
+                       provider=n["provider"], date=n["date"]))
+    return "\n".join(lines)
+
+def fetch_yfinance_history(ticker: str, days: int) -> list | None:
+    """IO: returns rows sorted ascending or None on failure."""
+    if not YF_OK:
+        return None
+    try:
+        h = yf.Ticker(ticker).history(period=f"{days}d")
+        if h is None or h.empty:
+            return []
+        rows = []
+        for idx, r in h.iterrows():
+            rows.append((
+                idx.strftime("%Y-%m-%d"),
+                float(r["Open"]), float(r["High"]),
+                float(r["Low"]),  float(r["Close"]),
+            ))
+        return rows
+    except Exception as e:
+        log.error(f"yfinance history {ticker}: {e}")
+        return None
+
+def fetch_yfinance_news(ticker: str) -> list | None:
+    """IO: returns raw news list or None on failure."""
+    if not YF_OK:
+        return None
+    try:
+        return yf.Ticker(ticker).news or []
+    except Exception as e:
+        log.error(f"yfinance news {ticker}: {e}")
+        return None
+
+def cmd_checkprice(parts: list):
+    """Usage: /checkprice TICKER [days]   — default 7 days, range 1-365."""
+    if len(parts) < 2:
+        tg(t("checkprice_usage")); return
+    if not YF_OK:
+        tg(t("yfinance_missing", cmd="/checkprice")); return
+    ticker = parts[1].upper().strip()
+    days = 7
+    if len(parts) >= 3:
+        try:
+            n = int(parts[2])
+            if 1 <= n <= 365:
+                days = n
+        except ValueError:
+            pass
+    rows = fetch_yfinance_history(ticker, days)
+    if rows is None:
+        tg(t("checkprice_fetch_error", ticker=ticker)); return
+    tg(_format_price_check(ticker, days, rows))
+
+def cmd_checknews(parts: list):
+    """Usage: /checknews TICKER [count]   — default 5 headlines, max 20."""
+    if len(parts) < 2:
+        tg(t("checknews_usage")); return
+    if not YF_OK:
+        tg(t("yfinance_missing", cmd="/checknews")); return
+    ticker = parts[1].upper().strip()
+    count = 5
+    if len(parts) >= 3:
+        try:
+            n = int(parts[2])
+            if 1 <= n <= 20:
+                count = n
+        except ValueError:
+            pass
+    items = fetch_yfinance_news(ticker)
+    if items is None:
+        tg(t("checknews_fetch_error", ticker=ticker)); return
+    tg(_format_news_list(ticker, items, count))
 
 # ─── Sentiment history (E3) ───────────────────────────────
 # Layout: {"AAPL": [{"date": "YYYY-MM-DD", "label": "bullish|bearish|neutral|unknown",
@@ -2019,6 +2148,8 @@ def _process_update(upd: dict):
     # On-demand scan
     elif komut == "/scanticker":     cmd_scanticker(parts)
     elif komut == "/compare":        cmd_compare(parts)
+    elif komut == "/checkprice":     cmd_checkprice(parts)
+    elif komut == "/checknews":      cmd_checknews(parts)
     # Help
     elif text in ["/start", "/help"]:
         tg(help_msg())
