@@ -1,0 +1,55 @@
+# ─── Python cache & build ─────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# ─── Test / type-check caches ─────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# ─── Virtual environments ─────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ─── IDE / editor ─────────────────────────────────────────
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ─── Bot runtime data (DO NOT COMMIT) ─────────────────────
+# These live in ~/sec-analyzer/ on the user's machine.
+# If your working directory ever ends up containing them, ignore them.
+bot_config.json
+cache.json
+weekly_log.json
+sentiment_history.json
+price_cache.json
+reports/
+previous_filings/
+*.log
+
+# ─── Secrets ──────────────────────────────────────────────
+# config.py is committed as a TEMPLATE with placeholder values only.
+# If you accidentally fill it with real keys, uncomment the next line:
+# config.py
+.env
+.env.local
+*.pem
