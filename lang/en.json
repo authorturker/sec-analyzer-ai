@@ -6,6 +6,7 @@
   },
 
   "view_original_button": "📄 View original filing",
+  "md_report_button": "📄 .md report",
   "preparing_document": "Preparing document...",
   "raw_filing_not_found": "⚠️ Raw filing not found — bot may have been restarted.",
   "raw_filing_caption": "📄 *{ticker} — {form}* ({date})\nRaw SEC filing without AI analysis.",
@@ -29,10 +30,24 @@
   "sec_scan_started": "🔍 *SEC scan started...*\n`{tickers}`\nForms: `{forms}`",
   "insider_scan_started": "🔍 *Insider scan started...*",
   "insider_scan_complete": "✅ *Insider scan complete.*",
-  "ticker_not_found": "❌ *{ticker}* not found: `{error}`",
+  "fetch_error_timeout": "⏱ *{ticker}*: request timed out — SEC server may be slow. Try again shortly.",
+  "fetch_error_rate_limit": "🚦 *{ticker}*: rate limit hit — please wait a minute and retry.",
+  "fetch_error_network": "🌐 *{ticker}*: network error reaching SEC EDGAR. Check your connection.",
+  "fetch_error_not_found": "🔍 *{ticker}*: ticker not found on SEC EDGAR — check the symbol.",
+  "fetch_error_unknown": "❌ *{ticker}*: unexpected error fetching filings. Check the logs.",
   "no_new_filings": "✅ *{ticker}*: No new filings found.",
   "new_filings_found": "📬 *{ticker}* — {count} new filing(s) found, analyzing...",
   "alert_new_filing": "🔔 *Alert: New SEC filing detected!*\nSend `Check` for details.",
+  "background_error": "⚠️ A background task hit an error. The bot is still running — check the logs.",
+  "update_error": "⚠️ Couldn't process that — something went wrong. Please try again.",
+  "alarm_alert_header": "🔔 *New SEC filings detected* — {count} total\nTap to analyze:",
+  "alarm_alert_line": "• *{ticker}* — {form} ({date})",
+  "alarm_btn_one": "🔍 {ticker} {form}",
+  "alarm_btn_all": "🔍 Analyze all",
+  "alarm_analyzing": "Analyzing {ticker}…",
+  "alarm_analyzing_all": "Analyzing all filings…",
+  "alarm_already_done": "Already analyzed.",
+  "alarm_expired": "This alert has expired — run /check instead.",
   "scheduled_scan_starting": "⏰ *Scheduled scan starting ({time})...*",
   "analysis_msg_header": "🏢 *{ticker} — {form}*\n📅 {date}",
   "risk_factor_changes_header": "📊 *Risk Factor Changes:*",
@@ -73,6 +88,9 @@
   "trend_shift_bullish": "*shifted bullish*",
   "trend_shift_bearish": "*shifted bearish*",
   "trend_shift_neutral": "*shifted neutral*",
+
+  "ticker_invalid": "❌ Invalid ticker symbol(s): {tickers}",
+  "group_no_valid_tickers": "❌ No valid ticker symbols provided for group `{name}`.",
 
   "addticker_usage": "Usage: `/addticker AAPL` or `/addticker AAPL MSFT NVDA`",
   "ticker_added": "✅ Added: {tickers}",
@@ -137,6 +155,23 @@
   "listprompts_empty": "ℹ️ No custom prompts defined.\nAdd one with `/setprompt 10-K <text>`.",
   "listprompts_title": "📝 *Custom Prompts:*\n",
 
+  "cmd_desc_check":        "Scan watchlist for new SEC filings",
+  "cmd_desc_insider":      "Scan for insider transactions (Form 4)",
+  "cmd_desc_scanticker":   "On-demand scan: /scanticker AAPL",
+  "cmd_desc_compare":      "Compare two tickers side-by-side",
+  "cmd_desc_sentiment":    "Portfolio insider sentiment score",
+  "cmd_desc_checkprice":   "Recent price action for a ticker",
+  "cmd_desc_checknews":    "Latest news headlines for a ticker",
+  "cmd_desc_listtickers":  "Show your watchlist",
+  "cmd_desc_addticker":    "Add ticker(s) to watchlist",
+  "cmd_desc_removeticker": "Remove a ticker from watchlist",
+  "cmd_desc_listforms":    "List supported SEC form types",
+  "cmd_desc_report":       "Send this week's analyses as .md",
+  "cmd_desc_export":       "Export weekly log as CSV",
+  "cmd_desc_settings":     "Show current bot settings",
+  "cmd_desc_status":       "Show bot status and error counts",
+  "cmd_desc_help":         "Show all available commands",
+
   "settings_block": "⚙️ *Current Settings*\n\n🤖 Model          : `{model}`\n📅 Lookback       : `{lookback} days`\n📝 Max chars      : `{max_chars}`\n📋 Forms          : `{forms}`\n🏢 Tickers        : `{ticker_count} ticker(s)`{ticker_list}\n🌐 Language       : `{language}`\n⏰ Schedule       : `{schedule}`\n🔔 Filing alarm   : `{alarm}`\n📊 Weekly digest  : `{digest}`\n✏️ Custom prompts : `{prompt_count} form(s)`\n\n`/setmodel` · `/setlookback` · `/setchars`\n`/setschedule` · `/alarm` · `/digest` · `/status` · `/setlang`",
 
   "status_block": "📡 *Bot Status*\n\n⏱ Uptime         : `{uptime}`\n🔄 Last update    : `{last_update}`\n🔍 Last scan      : `{last_scan}`\n🔔 Last alarm chk : `{last_alarm}`\n📊 Total analyzed : `{total_analyzed}`\n\n❗ Telegram errors: `{tg_errors}`\n❗ OpenRouter errs: `{or_errors}`\n\n🌐 Language         : `{language}`\n⏰ Schedule         : `{schedule}`\n🔔 Alarm            : `{alarm}`\n📊 Weekly digest    : `{digest}`\n🏢 Tracking       : `{ticker_count} ticker(s)`",
@@ -186,7 +221,7 @@
 
   "wizard_lang_menu": "👋 *Welcome / Hoş geldin!*\n\nPlease pick a language / Lütfen bir dil seç:\n\n🇬🇧 `/lang en` — English\n🇹🇷 `/lang tr` — Türkçe",
   "wizard_lang_unknown": "Use `/lang en` or `/lang tr` / `/lang en` veya `/lang tr` kullan",
-  "wizard_welcome": "👋 *Welcome to SEC Analyzer Bot v2.4!*\n\nNo config found — let's set things up.\n\n",
+  "wizard_welcome": "👋 *Welcome to SEC Analyzer Bot v3.0!*\n\nNo config found — let's set things up.\n\n",
   "wizard_form_menu": "📋 *Step 2 / 3 — Choose default form types*\n\n*Periodic Reports*\n  `10-K` Annual · `10-Q` Quarterly · `8-K` Current\n\n*Insider & Ownership*\n  `4` Insider transactions · `144` Restricted sale\n  `SC 13G` Passive >5% · `SC 13D` Active >5%\n\n*Offerings*\n  `S-1` IPO · `424B4` Prospectus\n\n*Foreign Issuers*\n  `20-F` Annual · `6-K` Current\n\n*Other*\n  `DEF 14A` Proxy · `11-K` Retirement plan\n\nRecommended: `10-K  10-Q  8-K  4`\n\n✅ `/usedefaults` · ✏️ `/setforms 10-K 10-Q 8-K 4 SC 13G`",
   "wizard_ticker_menu": "📋 *Step 3 / 3 — Add your first tickers*\n\n`/addticker AAPL MSFT NVDA`\n\n⏭ `/skip` — skip for now",
   "wizard_complete": "✅ *Setup complete!*\nType `/help` to see all commands.",
@@ -195,12 +230,15 @@
   "wizard_no_valid_forms": "❌ No valid forms.\n",
   "wizard_forms_set": "✅ Forms: `{forms}`\n\n",
 
-  "bot_active": "🤖 *SEC Analyzer Bot v2.4 active.*\nType `/help` for commands.",
+  "bot_active": "🤖 *SEC Analyzer Bot v3.0 active.*\nType `/help` for commands.",
+
+  "export_no_data": "ℹ️ No filings to export — nothing analyzed this week yet.",
+  "export_caption": "📊 SEC weekly log — {count} filing(s)",
 
   "report_no_data": "ℹ️ No filings analyzed this week yet.",
   "report_md_title": "# 📊 SEC Analysis Report\n**Period:** {start} — {end}\n**Total:** {count} filing(s) analyzed\n**Generated:** {generated}\n\n---\n",
   "report_footer": "*This report was generated automatically. Not investment advice.*",
   "report_caption": "📋 SEC Analysis Report — {date}",
 
-  "help_block": "🤖 *SEC Analyzer Bot v2.4*\n\n*Scans:*\n`Any news?` · `Check` · `/sec`\n`Insider` · `/insider` · `Check all` · `/all`\n`/sentiment` — portfolio insider score\n`/sentiment trend [days]` — sentiment shift vs N days ago\n\n*On-demand:*\n`/scanticker AAPL` · `/scanticker AAPL 10-K 4`\n`/compare AAPL MSFT 10-K` — side-by-side\n`/checkprice AAPL [days]` · `/checknews AAPL [count]`\n\n*Tickers:*\n`/addticker AAPL MSFT` · `/removeticker AAPL` · `/listtickers`\n\n*Groups:*\n`/addgroup tech AAPL MSFT` · `/removegroup tech` · `/listgroups`\n`/scangroup tech` · `/scangroup tech 10-K 4`\n\n*Forms:*\n`/listforms` · `/addform SC 13G` · `/removeform 8-K`\n\n*Custom Prompts:*\n`/setprompt 10-K <text>` · `/getprompt 10-K`\n`/resetprompt 10-K` · `/listprompts`\n\n*Schedule:*\n`/setschedule 08:00` · `/setschedule off`\n`/alarm` · `/alarm off`\n`/digest` · `/digest now` · `/digest off`\n\n*Reports:*\n`/report` — send this week's analyses as .md file\n\n*Language:*\n`/setlang en` · `/setlang tr`\n\n*Webhook:*\n`/setwebhook <url>` · `/delwebhook`\n\n`/settings` · `/status`\n`/setmodel` · `/setlookback 60` · `/setchars 15000`\n`/priceaction on|off` · `/setlookforward 5`\n\n*Active forms:* `{forms}`\n*Tracking:* `{ticker_count}` ticker(s)\n*Language:* `{language}`"
+  "help_block": "🤖 *SEC Analyzer Bot v3.0*\n\n*Scans:*\n`Any news?` · `Check` · `/sec`\n`Insider` · `/insider` · `Check all` · `/all`\n`/sentiment` — portfolio insider score\n`/sentiment trend [days]` — sentiment shift vs N days ago\n\n*On-demand:*\n`/scanticker AAPL` · `/scanticker AAPL 10-K 4`\n`/compare AAPL MSFT 10-K` — side-by-side\n`/checkprice AAPL [days]` · `/checknews AAPL [count]`\n\n*Tickers:*\n`/addticker AAPL MSFT` · `/removeticker AAPL` · `/listtickers`\n\n*Groups:*\n`/addgroup tech AAPL MSFT` · `/removegroup tech` · `/listgroups`\n`/scangroup tech` · `/scangroup tech 10-K 4`\n\n*Forms:*\n`/listforms` · `/addform SC 13G` · `/removeform 8-K`\n\n*Custom Prompts:*\n`/setprompt 10-K <text>` · `/getprompt 10-K`\n`/resetprompt 10-K` · `/listprompts`\n\n*Schedule:*\n`/setschedule 08:00` · `/setschedule off`\n`/alarm` · `/alarm off`\n`/digest` · `/digest now` · `/digest off`\n\n*Reports:*\n`/report` — send this week's analyses as .md file\n\n*Language:*\n`/setlang en` · `/setlang tr`\n\n*Webhook:*\n`/setwebhook <url>` · `/delwebhook`\n\n`/settings` · `/status`\n`/setmodel` · `/setlookback 60` · `/setchars 15000`\n`/priceaction on|off` · `/setlookforward 5`\n\n*Active forms:* `{forms}`\n*Tracking:* `{ticker_count}` ticker(s)\n*Language:* `{language}`"
 }
