@@ -1,17 +1,14 @@
 """
-SEC Analyzer Bot v2.5 — Telegram (multi-language)
+SEC Analyzer Bot v3.0 — Telegram (multi-language)
 
 Single-codebase replacement for bot_en.py + bot_tr.py.
 - i18n: lang/en.json (default) + lang/tr.json, switch with /setlang.
 - Thread-safe state (raw filing store, status dict).
 - scan_ticker split into pure-ish helpers (fetch / analyze / render / send).
-- Includes all v2.4 features:
-    8.  Connection health monitoring + /status
-    9.  Smart retry with exponential backoff
-    12. Markdown report export + inline original document button
+- 8-K EX-99.* exhibit collection, full network I/O hardening, 327 tests.
 """
 
-import copy, time, json, logging, hashlib, threading, io, uuid
+import copy, csv, os, time, json, logging, hashlib, threading, io, uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -72,6 +69,7 @@ _raw_filings_lock    = threading.Lock()
 _lang_lock   = threading.Lock()
 _sent_lock   = threading.Lock()     # sentiment_history.json
 _price_lock  = threading.Lock()     # price_cache.json
+_alarm_lock  = threading.Lock()     # _pending_alarms (interactive alarm)
 _stop_event  = threading.Event()
 
 # ─── Status dict (thread-safe via _status_lock) ────────────
@@ -116,14 +114,24 @@ def last_scan_dt() -> datetime | None:
 _raw_filings: dict = {}    # uuid_key → {"ticker", "form", "tarih", "metin"}
 
 def _raw_cap() -> int:
-    """Return the configured cap on _raw_filings entries (0 = unlimited)."""
-    return int(get_cfg().get("raw_max", 0) or 0)
+    """Return the configured cap on _raw_filings entries (0 = unlimited).
 
-def store_raw_filing(ticker: str, form: str, date_str: str, text: str) -> str:
-    """Store a raw filing and return its short uuid key.
+    Uses get_cfg_value() — single key read under _cfg_lock, no deep-copy.
+    _raw_filings itself is guarded by _raw_lock (distinct from _cfg_lock),
+    so callers must not hold _raw_lock when calling this.
+    """
+    return int(get_cfg_value("raw_max", 0) or 0)
 
-    If raw_max > 0, oldest entries are evicted FIFO to keep the store
-    within that bound. raw_max = 0 means unlimited (default).
+def store_raw_filing(ticker: str, form: str, date_str: str, text: str,
+                     analysis: str = "", diff: str = "") -> str:
+    """Store a raw filing (+ its analysis) and return a short uuid key.
+
+    The entry feeds two inline buttons on the analysis message:
+      * 'view original' — the raw filing text (`metin`)
+      * '.md report'    — the analysis rendered as Markdown (`analysis`/`diff`)
+
+    If raw_max > 0 (default 100), oldest entries are evicted FIFO to keep
+    the store within that bound. raw_max = 0 means unlimited.
     """
     raw_key = uuid.uuid4().hex[:16]
     cap = _raw_cap()
@@ -131,6 +139,7 @@ def store_raw_filing(ticker: str, form: str, date_str: str, text: str) -> str:
         _raw_filings[raw_key] = {
             "ticker": ticker, "form": form,
             "tarih": date_str, "metin": text,
+            "analysis": analysis, "diff": diff,
         }
         if cap > 0:
             while len(_raw_filings) > cap:
@@ -141,6 +150,36 @@ def store_raw_filing(ticker: str, form: str, date_str: str, text: str) -> str:
 def get_raw_filing(raw_key: str) -> dict | None:
     with _raw_filings_lock:
         return _raw_filings.get(raw_key)
+
+# ─── Pending alarm hits (Item 4) ──────────────────────────
+# The interactive alarm lists new filings with inline buttons. Telegram
+# callback_data is capped at 64 bytes, so the hit list is parked here under
+# a short token; buttons reference it by token + index. In-memory only —
+# a bot restart invalidates outstanding alert buttons (they say "expired").
+_pending_alarms: dict = {}     # token → {"hits": [(ticker,form,date)], "done": set()}
+
+def register_alarm_hits(hits: list) -> str:
+    """Park an alarm hit list under a fresh token (FIFO-capped at 50)."""
+    token = uuid.uuid4().hex[:12]
+    with _alarm_lock:
+        _pending_alarms[token] = {"hits": list(hits), "done": set()}
+        while len(_pending_alarms) > 50:
+            _pending_alarms.pop(next(iter(_pending_alarms)))
+    return token
+
+def get_alarm_hits(token: str) -> dict | None:
+    with _alarm_lock:
+        entry = _pending_alarms.get(token)
+        if entry is None:
+            return None
+        # Return a shallow copy so callers can read without holding the lock.
+        return {"hits": list(entry["hits"]), "done": set(entry["done"])}
+
+def mark_alarm_done(token: str, idx: int):
+    with _alarm_lock:
+        entry = _pending_alarms.get(token)
+        if entry is not None:
+            entry["done"].add(idx)
 
 # Webhook state (set by main())
 _webhook_active = False
@@ -205,7 +244,7 @@ _CFG_DEFAULTS = {
     "weekly_digest":   True,
     "custom_prompts":  {},
     "language":        DEFAULT_LANG,
-    "raw_max":         0,           # 0 = unlimited raw-filing cache
+    "raw_max":         100,         # FIFO cap on raw-filing store (0 = unlimited)
     "cache_max_age_days": 365,      # auto-prune cache entries older than this
     "groups":          {},          # named ticker groups: {"tech": ["AAPL", "MSFT"]}
     "price_action_enabled":   True, # show price change after filing date
@@ -219,21 +258,66 @@ def _apply_defaults(cfg: dict) -> dict:
         cfg.setdefault(k, copy.deepcopy(v))
     return cfg
 
+# ─── JSON IO — atomic write + corruption-safe read ────────
+# Every runtime JSON file (config, cache, price cache, sentiment history,
+# weekly log) goes through these two helpers:
+#   * _atomic_write_json — writes a .tmp sibling then os.replace()s it into
+#     place. os.replace is atomic on POSIX, so a crash mid-write can never
+#     leave a half-written, unparseable file.
+#   * _read_json — on a JSONDecodeError, backs the bad file up to
+#     <name>.corrupt and logs it, instead of silently returning {} (which
+#     would let the next save overwrite — and permanently destroy — the
+#     corrupted-but-possibly-recoverable data).
+# Callers still hold their own locks; these helpers do no locking.
+
+def _atomic_write_json(path: Path, data) -> None:
+    """Write `data` as JSON atomically (temp file + os.replace).
+
+    Uses a per-thread unique .tmp name so concurrent calls (even without an
+    external lock) cannot clobber each other's temp files.
+    """
+    tmp = path.parent / (f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as e:
+        log.error(f"_atomic_write_json failed for {path.name}: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+def _read_json(path: Path, default):
+    """Read JSON from `path`. Missing → default. Corrupt → back up + default."""
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        backup = path.parent / (path.name + ".corrupt")
+        try:
+            path.replace(backup)
+            log.error(f"Corrupt JSON: {path.name} → backed up as {backup.name} ({e})")
+        except OSError as be:
+            log.error(f"Corrupt JSON: {path.name} — backup failed: {be}")
+        return default
+    except OSError as e:
+        log.error(f"Cannot read {path.name}: {e}")
+        return default
+
 def _load_cfg_locked() -> dict:
     """Caller must hold _cfg_lock. Returns the live cache (initialized on first call)."""
     global _cfg_cache
     if _cfg_cache is None:
-        try:
-            data = json.loads(CONFIG_FILE.read_text())
-        except Exception:
-            data = {}
+        data = _read_json(CONFIG_FILE, {})
         _cfg_cache = _apply_defaults(data if isinstance(data, dict) else {})
     return _cfg_cache
 
 def _save_cfg_locked():
     """Caller must hold _cfg_lock. Persist cache to disk."""
     if _cfg_cache is not None:
-        CONFIG_FILE.write_text(json.dumps(_cfg_cache, indent=2))
+        _atomic_write_json(CONFIG_FILE, _cfg_cache)
 
 def get_cfg() -> dict:
     """Return a deep copy of the config. Safe to read or mutate locally
@@ -259,6 +343,11 @@ def mutate_cfg(fn) -> dict:
 def update_cfg(**kwargs) -> dict:
     """Set top-level keys atomically. Convenience wrapper over mutate_cfg."""
     return mutate_cfg(lambda c: c.update(kwargs))
+
+def get_cfg_value(key: str, default=None):
+    """Read a single top-level config key under _cfg_lock — no deep-copy overhead."""
+    with _cfg_lock:
+        return _load_cfg_locked().get(key, default)
 
 # ─── i18n ─────────────────────────────────────────────────
 _lang_cache: dict = {}        # code → full strings dict
@@ -314,6 +403,80 @@ def form_desc(form: str) -> str:
     """Localized description for a form code."""
     return t(f"form_desc_{form}")
 
+# ─── Error classification (U3) ────────────────────────────
+# Raw exception strings are noisy and occasionally leak internals into the
+# chat (the old code sent `str(e)` straight to the user). classify_error
+# folds an exception into a small set of categories so the user sees a
+# calm, actionable message — while the full error still goes to the log.
+def classify_error(exc) -> str:
+    """PURE: map an exception to a coarse category.
+
+    Returns one of: 'timeout', 'rate_limit', 'network', 'not_found',
+    'unknown'. Inspects both the exception type and its message text, so it
+    works whether the caller raised a typed requests exception or a bare
+    Exception wrapping an HTTP/SDK error.
+    """
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "timeout"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "network"
+    msg = str(exc).lower()
+    if "429" in msg or "rate limit" in msg or "too many requests" in msg:
+        return "rate_limit"
+    if "timeout" in msg or "timed out" in msg:
+        return "timeout"
+    if any(s in msg for s in ("not found", "no matching", "no cik",
+                              "unknown ticker", "invalid ticker", "404")):
+        return "not_found"
+    if any(s in msg for s in ("connection", "network", "unreachable",
+                              "name resolution", "getaddrinfo", "dns",
+                              "temporary failure")):
+        return "network"
+    return "unknown"
+
+def friendly_fetch_error(ticker: str, exc) -> str:
+    """Localized, user-facing message for an EDGAR fetch failure — the raw
+    exception is kept out of the chat and only the category is shown."""
+    return t(f"fetch_error_{classify_error(exc)}", ticker=ticker)
+
+# ─── Retry / backoff (R5) ─────────────────────────────────
+# A single home for the exponential-backoff math and the generic retry
+# loop. Before R5 the formula `min(cap, base * 2**attempt)` was inlined in
+# six places with slightly different constants; now _backoff is the one
+# source of truth and retry() wraps the plain "try N times" loops.
+def _backoff(attempt: int, base: int, cap: int) -> int:
+    """PURE: exponential backoff delay — base * 2**attempt, capped at cap."""
+    return min(cap, base * (2 ** attempt))
+
+def retry(fn, *, attempts: int = 4, base: int = 5, cap: int = 120,
+          label: str = "operation", on_error=None):
+    """
+    Call `fn()` up to `attempts` times with exponential backoff between
+    failed attempts. Returns fn()'s value on the first success, or None if
+    every attempt raised.
+
+    `fn` signals a retryable failure by raising. `on_error(exc, attempt)`,
+    when given, runs after each failure (e.g. to bump an error counter).
+    The wait after attempt i is _backoff(i, base, cap) seconds; the final
+    attempt is not followed by a sleep.
+    """
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            if on_error is not None:
+                try:
+                    on_error(e, attempt)
+                except Exception:
+                    pass
+            last = attempt == attempts - 1
+            wait = _backoff(attempt, base, cap)
+            log.error(f"{label} (attempt {attempt+1}/{attempts}): {e}"
+                      + ("" if last else f" — waiting {wait}s"))
+            if not last:
+                time.sleep(wait)
+    return None
+
 # ─── Cache ────────────────────────────────────────────────
 # Cache layout: {md5(ticker_form_date): {"at": iso_timestamp}}.
 # `cache_max_age_days` (default 365) caps how long an entry survives;
@@ -322,14 +485,12 @@ CACHE_DEFAULT_MAX_AGE_DAYS = 365
 
 def load_cache() -> dict:
     with _cache_lock:
-        try:
-            return json.loads(CACHE_FILE.read_text())
-        except Exception:
-            return {}
+        data = _read_json(CACHE_FILE, {})
+        return data if isinstance(data, dict) else {}
 
 def save_cache(c: dict):
     with _cache_lock:
-        CACHE_FILE.write_text(json.dumps(c, indent=2))
+        _atomic_write_json(CACHE_FILE, c)
 
 def cache_key(*args) -> str:
     return hashlib.md5("_".join(str(a) for a in args).encode()).hexdigest()
@@ -414,25 +575,20 @@ def fetch_stooq_daily(ticker: str, start_date: str, end_date: str) -> str | None
         d1=start_date.replace("-", ""),
         d2=end_date.replace("-", ""),
     )
-    try:
+    def _call():
         r = requests.get(url, timeout=15)
-        if not r.ok:
-            return None
+        r.raise_for_status()
         return r.text
-    except Exception as e:
-        log.error(f"Stooq fetch {ticker}: {e}")
-        return None
+    return retry(_call, attempts=2, base=3, cap=15, label=f"Stooq {ticker}")
 
 def load_price_cache() -> dict:
     with _price_lock:
-        try:
-            return json.loads(PRICE_CACHE.read_text())
-        except Exception:
-            return {}
+        data = _read_json(PRICE_CACHE, {})
+        return data if isinstance(data, dict) else {}
 
 def save_price_cache(data: dict):
     with _price_lock:
-        PRICE_CACHE.write_text(json.dumps(data, indent=2))
+        _atomic_write_json(PRICE_CACHE, data)
 
 def compute_price_snippet(ticker: str, filing_date: str) -> str:
     """
@@ -523,31 +679,28 @@ def fetch_yfinance_history(ticker: str, days: int) -> list | None:
     """IO: returns rows sorted ascending or None on failure."""
     if not YF_OK:
         return None
-    try:
+    def _call():
         h = yf.Ticker(ticker).history(period=f"{days}d")
         if h is None or h.empty:
             return []
-        rows = []
-        for idx, r in h.iterrows():
-            rows.append((
-                idx.strftime("%Y-%m-%d"),
-                float(r["Open"]), float(r["High"]),
-                float(r["Low"]),  float(r["Close"]),
-            ))
-        return rows
-    except Exception as e:
-        log.error(f"yfinance history {ticker}: {e}")
-        return None
+        return [
+            (idx.strftime("%Y-%m-%d"),
+             float(r["Open"]), float(r["High"]),
+             float(r["Low"]),  float(r["Close"]))
+            for idx, r in h.iterrows()
+        ]
+    return retry(_call, attempts=3, base=5, cap=60,
+                 label=f"yfinance history {ticker}",
+                 on_error=lambda e, a: status_inc("yf_errors"))
 
 def fetch_yfinance_news(ticker: str) -> list | None:
     """IO: returns raw news list or None on failure."""
     if not YF_OK:
         return None
-    try:
-        return yf.Ticker(ticker).news or []
-    except Exception as e:
-        log.error(f"yfinance news {ticker}: {e}")
-        return None
+    return retry(lambda: yf.Ticker(ticker).news or [],
+                 attempts=3, base=5, cap=60,
+                 label=f"yfinance news {ticker}",
+                 on_error=lambda e, a: status_inc("yf_errors"))
 
 def cmd_checkprice(parts: list):
     """Usage: /checkprice TICKER [days]   — default 7 days, range 1-365."""
@@ -615,14 +768,12 @@ def parse_sentiment_signal(raw: str) -> tuple[str, str]:
 
 def load_sentiment_history() -> dict:
     with _sent_lock:
-        try:
-            return json.loads(SENT_HIST.read_text())
-        except Exception:
-            return {}
+        data = _read_json(SENT_HIST, {})
+        return data if isinstance(data, dict) else {}
 
 def save_sentiment_history(data: dict):
     with _sent_lock:
-        SENT_HIST.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        _atomic_write_json(SENT_HIST, data)
 
 def append_sentiment(ticker: str, raw: str, on_date: str | None = None):
     """Append one signal observation for a ticker. on_date defaults to today (YYYY-MM-DD)."""
@@ -667,30 +818,30 @@ def prune_cache_expired(max_age_days: int | None = None) -> int:
     return len(to_drop)
 
 # ─── Weekly log (for digest / report) ─────────────────────
+_WLOG_CAP = 500   # keep last N entries; independent of raw_max config
+
 def log_weekly(ticker: str, form: str, date_str: str, analysis: str):
     """Append a full analysis to the weekly log. Truncation happens at digest time."""
     with _wlog_lock:
-        try:
-            data = json.loads(WEEKLY_LOG.read_text()) if WEEKLY_LOG.exists() else []
-        except Exception:
+        data = _read_json(WEEKLY_LOG, [])
+        if not isinstance(data, list):
             data = []
         data.append({
             "ticker": ticker, "form": form, "tarih": date_str,
             "analiz": analysis,
             "ekleme": datetime.now().isoformat(),
         })
-        WEEKLY_LOG.write_text(json.dumps(data, indent=2))
+        data = data[-_WLOG_CAP:]
+        _atomic_write_json(WEEKLY_LOG, data)
 
 def get_weekly_log() -> list:
     with _wlog_lock:
-        try:
-            return json.loads(WEEKLY_LOG.read_text()) if WEEKLY_LOG.exists() else []
-        except Exception:
-            return []
+        data = _read_json(WEEKLY_LOG, [])
+        return data if isinstance(data, list) else []
 
 def clear_weekly_log():
     with _wlog_lock:
-        WEEKLY_LOG.write_text(json.dumps([], indent=2))
+        _atomic_write_json(WEEKLY_LOG, [])
 
 # ─── Previous filing storage (for risk diff) ──────────────
 def prev_path(ticker: str, form: str) -> Path:
@@ -711,17 +862,38 @@ def load_prev(ticker: str, form: str) -> str | None:
 
 # ─── Telegram ─────────────────────────────────────────────
 _TG = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+_TG_LIMIT = 4000
+
+def _split_message(text: str, limit: int = _TG_LIMIT) -> list:
+    """PURE: split text into Telegram-safe chunks (≤ limit chars).
+
+    Prefers newline boundaries; hard-splits any single line that itself
+    exceeds the limit so it never produces an oversized chunk.
+    """
+    parts: list = []
+    current = ""
+    for line in text.split("\n"):
+        if len(line) > limit:
+            # flush current buffer first
+            if current.strip():
+                parts.append(current)
+                current = ""
+            # hard-split the oversized line
+            for i in range(0, len(line), limit):
+                parts.append(line[i : i + limit])
+        elif current and len(current) + 1 + len(line) > limit:
+            parts.append(current)
+            current = line
+        else:
+            current = (current + "\n" + line) if current else line
+    if current.strip():
+        parts.append(current)
+    return parts
 
 def tg(text: str):
     """Send a Telegram message (chunked, exponential backoff, Markdown fallback)."""
-    parts, current = [], ""
-    for line in text.split("\n"):
-        if len(current) + len(line) + 1 > 4000:
-            parts.append(current); current = line
-        else:
-            current += "\n" + line
-    if current.strip(): parts.append(current)
-    for part in parts:
+    for part in _split_message(text):
+        sent = False
         for attempt in range(4):
             try:
                 r = requests.post(f"{_TG}/sendMessage", json={
@@ -744,33 +916,43 @@ def tg(text: str):
                     }, timeout=15)
                     if r2.ok:
                         status_reset_zero("tg_errors")
+                        sent = True
                     break
                 r.raise_for_status()
                 status_reset_zero("tg_errors")
+                sent = True
                 break
             except Exception as e:
                 status_inc("tg_errors")
-                wait_sec = min(60, 2 ** attempt * 3)
+                wait_sec = _backoff(attempt, 3, 60)
                 log.error(f"Telegram (attempt {attempt+1}): {e} — waiting {wait_sec}s")
                 time.sleep(wait_sec)
+        # [H7] A message that never reached Telegram used to vanish silently
+        # (only a log.error per attempt). Now total failure is loud: a
+        # CRITICAL log line + a stderr write so a Termux operator watching
+        # the console actually sees that delivery failed.
+        if not sent:
+            log.critical(f"Telegram message NOT delivered after 4 attempts: "
+                         f"{part.strip()[:80]!r}")
+            sys.stderr.write("[CRITICAL] Telegram delivery failed — "
+                             "message lost. Check network / bot token.\n")
         time.sleep(0.3)
 
 def tg_send_document(filename: str, content: str, caption: str = ""):
     """Send a document over Telegram (no temp file, BytesIO)."""
     url  = f"{_TG}/sendDocument"
-    data = content.encode("utf-8")
-    try:
+    raw  = content.encode("utf-8")
+    def _call():
         r = requests.post(url, data={
             "chat_id": TELEGRAM_CHAT_ID,
             "caption": caption[:1024] if caption else "",
             "parse_mode": "Markdown",
         }, files={
-            "document": (filename, io.BytesIO(data), "text/plain"),
+            "document": (filename, io.BytesIO(raw), "text/plain"),
         }, timeout=30)
-        if not r.ok:
-            log.error(f"Document send error: {r.status_code} {r.text[:200]}")
-    except Exception as e:
-        log.error(f"tg_send_document: {e}")
+        r.raise_for_status()
+    retry(_call, attempts=3, base=5, cap=30, label=f"tg_send_document:{filename}",
+          on_error=lambda e, a: status_inc("tg_errors"))
 
 def tg_answer_callback(callback_id: str, text: str = ""):
     """Acknowledge an inline-button callback (Telegram requirement)."""
@@ -782,17 +964,49 @@ def tg_answer_callback(callback_id: str, text: str = ""):
     except Exception as e:
         log.error(f"answerCallbackQuery: {e}")
 
+# ─── Bot command menu (U4) ────────────────────────────────
+_BOT_COMMANDS = [
+    ("check",        "cmd_desc_check"),
+    ("insider",      "cmd_desc_insider"),
+    ("scanticker",   "cmd_desc_scanticker"),
+    ("compare",      "cmd_desc_compare"),
+    ("sentiment",    "cmd_desc_sentiment"),
+    ("checkprice",   "cmd_desc_checkprice"),
+    ("checknews",    "cmd_desc_checknews"),
+    ("listtickers",  "cmd_desc_listtickers"),
+    ("addticker",    "cmd_desc_addticker"),
+    ("removeticker", "cmd_desc_removeticker"),
+    ("listforms",    "cmd_desc_listforms"),
+    ("report",       "cmd_desc_report"),
+    ("export",       "cmd_desc_export"),
+    ("settings",     "cmd_desc_settings"),
+    ("status",       "cmd_desc_status"),
+    ("help",         "cmd_desc_help"),
+]
+
+def register_bot_commands():
+    """Call Telegram setMyCommands so the '/' menu is populated."""
+    commands = [{"command": cmd, "description": t(key)} for cmd, key in _BOT_COMMANDS]
+    try:
+        r = requests.post(f"{_TG}/setMyCommands", json={"commands": commands}, timeout=10)
+        if r.ok:
+            log.info("setMyCommands: OK")
+        else:
+            log.warning(f"setMyCommands: {r.status_code} {r.text[:120]}")
+    except Exception as e:
+        log.warning(f"setMyCommands failed: {e}")
+
 def build_inline_button(raw_key: str) -> dict:
-    """Returns inline keyboard with 'view original filing' button."""
+    """Inline keyboard for an analysis message: view raw filing + get .md."""
     return {
-        "inline_keyboard": [[{
-            "text": t("view_original_button"),
-            "callback_data": f"raw:{raw_key}",
-        }]]
+        "inline_keyboard": [[
+            {"text": t("view_original_button"), "callback_data": f"raw:{raw_key}"},
+            {"text": t("md_report_button"),     "callback_data": f"md:{raw_key}"},
+        ]]
     }
 
-def tg_with_button(text: str, raw_key: str):
-    """Send a message together with an inline button on the last chunk."""
+def tg_with_keyboard(text: str, keyboard: dict | None):
+    """Send a (chunked) message; attach `keyboard` to the LAST chunk only."""
     parts, current = [], ""
     for line in text.split("\n"):
         if len(current) + len(line) + 1 > 4000:
@@ -808,19 +1022,37 @@ def tg_with_button(text: str, raw_key: str):
             "parse_mode": "Markdown",
             "disable_web_page_preview": True,
         }
-        if i == len(parts) - 1:
-            payload["reply_markup"] = build_inline_button(raw_key)
-        try:
-            r = requests.post(f"{_TG}/sendMessage", json=payload, timeout=15)
-            if r.status_code == 400:
-                payload.pop("parse_mode", None)
-                r2 = requests.post(f"{_TG}/sendMessage", json=payload, timeout=15)
+        if i == len(parts) - 1 and keyboard is not None:
+            payload["reply_markup"] = keyboard
+        def _send(p=dict(payload)):
+            r = requests.post(f"{_TG}/sendMessage", json=p, timeout=15)
+            if r.status_code == 400:           # Markdown parse error — plain fallback
+                p2 = {k: v for k, v in p.items() if k != "parse_mode"}
+                r2 = requests.post(f"{_TG}/sendMessage", json=p2, timeout=15)
                 r2.raise_for_status()
             else:
                 r.raise_for_status()
-        except Exception as e:
-            log.error(f"tg_with_button: {e}")
+        retry(_send, attempts=3, base=3, cap=30, label="tg_with_keyboard",
+              on_error=lambda e, a: status_inc("tg_errors"))
         time.sleep(0.3)
+
+def tg_with_button(text: str, raw_key: str):
+    """Send an analysis message with its inline buttons (view raw + .md)."""
+    tg_with_keyboard(text, build_inline_button(raw_key))
+
+def tg_edit_markup(chat_id, message_id, keyboard: dict | None):
+    """editMessageReplyMarkup — replace, or (keyboard=None) remove, a message's
+    inline keyboard. Used to retire alarm buttons once they are acted on."""
+    if chat_id is None or message_id is None:
+        return
+    payload: dict = {"chat_id": chat_id, "message_id": message_id}
+    if keyboard is not None:
+        payload["reply_markup"] = keyboard
+    # keyboard is None → reply_markup omitted → Telegram strips the keyboard.
+    try:
+        requests.post(f"{_TG}/editMessageReplyMarkup", json=payload, timeout=15)
+    except Exception as e:
+        log.error(f"tg_edit_markup: {e}")
 
 def send_raw_filing(callback_id: str, raw_key: str):
     """Send the stored raw filing as a .txt document."""
@@ -845,6 +1077,57 @@ def send_md_analysis(ticker: str, form: str, date_str: str,
     filename = f"{ticker}_{form.replace(' ','_')}_{date_str}_analysis.md"
     caption  = t("md_caption", ticker=ticker, form=form, date=date_str)
     tg_send_document(filename, content, caption)
+
+def send_md_for_key(callback_id: str, raw_key: str):
+    """Send the stored analysis as a .md file — triggered by the '.md' button.
+
+    The .md is no longer pushed automatically after every analysis; it is
+    produced on demand here from the data parked in the raw-filing store.
+    """
+    tg_answer_callback(callback_id, t("preparing_document"))
+    entry_data = get_raw_filing(raw_key)
+    if not entry_data:
+        tg(t("raw_filing_not_found"))
+        return
+    send_md_analysis(entry_data["ticker"], entry_data["form"],
+                     entry_data["tarih"],
+                     entry_data.get("analysis", ""),
+                     entry_data.get("diff", ""))
+
+# ─── Interactive alarm alert (Item 4) ─────────────────────
+def build_alarm_keyboard(token: str, hits: list, done: set) -> dict | None:
+    """
+    PURE: build the alarm message's inline keyboard.
+
+    One [🔍 TICKER FORM] button per not-yet-analyzed hit, plus an
+    [🔍 Analyze all] button when more than one remains. Returns None when
+    every hit is done — the caller then strips the keyboard entirely.
+    """
+    remaining = [i for i in range(len(hits)) if i not in done]
+    if not remaining:
+        return None
+    rows = []
+    for i in remaining:
+        ticker, form, _date = hits[i]
+        rows.append([{
+            "text": t("alarm_btn_one", ticker=ticker, form=form),
+            "callback_data": f"analyze:{token}:{i}",
+        }])
+    if len(remaining) > 1:
+        rows.append([{
+            "text": t("alarm_btn_all"),
+            "callback_data": f"analyzeall:{token}",
+        }])
+    return {"inline_keyboard": rows}
+
+def send_alarm_alert(hits: list):
+    """Send the interactive new-filing alert: a line per filing + buttons."""
+    token = register_alarm_hits(hits)
+    lines = [t("alarm_alert_header", count=len(hits))]
+    for ticker, form, date_str in hits:
+        lines.append(t("alarm_alert_line", ticker=ticker, form=form, date=date_str))
+    tg_with_keyboard("\n".join(lines),
+                     build_alarm_keyboard(token, hits, set()))
 
 # ─── Webhook mode ─────────────────────────────────────────
 def register_webhook(url: str) -> bool:
@@ -880,7 +1163,11 @@ def start_webhook_server(port: int, handle_update):
     def webhook_al():
         update = _flask_req.get_json(force=True)
         if update:
-            handle_update(update)
+            # [H7] Same per-update crash guard as the polling loop.
+            try:
+                handle_update(update)
+            except Exception as e:
+                log.exception(f"Webhook update processing failed: {e}")
         return "ok", 200
 
     log.info(f"Webhook server starting on port {port}...")
@@ -902,21 +1189,17 @@ def cmd_delwebhook() -> str:
     return t("webhook_deleted")
 
 def get_updates(offset: int) -> list:
-    """getUpdates — exponential backoff retry."""
-    for attempt in range(4):
-        try:
-            r = requests.get(f"{_TG}/getUpdates",
-                             params={"offset": offset, "timeout": 30}, timeout=35)
-            r.raise_for_status()
-            status_set(last_update=datetime.now().isoformat())
-            status_reset_zero("tg_errors")
-            return r.json().get("result", [])
-        except Exception as e:
-            status_inc("tg_errors")
-            wait_sec = min(120, 5 * 2 ** attempt)
-            log.error(f"getUpdates (attempt {attempt+1}): {e} — waiting {wait_sec}s")
-            time.sleep(wait_sec)
-    return []
+    """getUpdates — exponential backoff via retry()."""
+    def _call():
+        r = requests.get(f"{_TG}/getUpdates",
+                         params={"offset": offset, "timeout": 30}, timeout=35)
+        r.raise_for_status()
+        status_set(last_update=datetime.now().isoformat())
+        status_reset_zero("tg_errors")
+        return r.json().get("result", [])
+    result = retry(_call, attempts=4, base=5, cap=120, label="getUpdates",
+                   on_error=lambda e, a: status_inc("tg_errors"))
+    return result if result is not None else []
 
 # ─── OpenRouter LLM ───────────────────────────────────────
 _OR  = "https://openrouter.ai/api/v1/chat/completions"
@@ -937,8 +1220,13 @@ def system_message() -> str:
         f"Respond in {lang_name}."
     )
 
+_LLM_MAX_PROMPT = 30000   # generous cap — avoids false-positives on multi-source prompts
+
 def llm(istem: str, model: str) -> str:
     """OpenRouter LLM call — exponential backoff retry."""
+    if len(istem) > _LLM_MAX_PROMPT:
+        log.warning(f"LLM prompt clamped: {len(istem)} → {_LLM_MAX_PROMPT} chars")
+        istem = istem[:_LLM_MAX_PROMPT]
     payload = {
         "model": model,
         "messages": [
@@ -954,17 +1242,22 @@ def llm(istem: str, model: str) -> str:
                 wait_sec = min(180, 60 * (attempt + 1))
                 log.warning(f"Rate limit — waiting {wait_sec}s"); time.sleep(wait_sec); continue
             if r.status_code in (500, 502, 503, 504):
-                wait_sec = min(60, 10 * 2 ** attempt)
+                wait_sec = _backoff(attempt, 10, 60)
                 log.warning(f"OpenRouter {r.status_code} — waiting {wait_sec}s"); time.sleep(wait_sec); continue
             r.raise_for_status()
+            body = r.json()
+            choices = body.get("choices") or []
+            content = (choices[0].get("message", {}).get("content", "") if choices else "")
+            if not content:
+                raise ValueError(f"OpenRouter empty/malformed response: {str(body)[:120]}")
             status_reset_zero("or_errors")
-            return r.json()["choices"][0]["message"]["content"].strip()
+            return content.strip()
         except requests.exceptions.Timeout:
             wait_sec = min(60, 15 * (attempt + 1))
             log.error(f"LLM timeout (attempt {attempt+1}) — waiting {wait_sec}s"); time.sleep(wait_sec)
         except Exception as e:
             status_inc("or_errors")
-            wait_sec = min(60, 10 * 2 ** attempt)
+            wait_sec = _backoff(attempt, 10, 60)
             log.error(f"LLM error (attempt {attempt+1}): {e} — waiting {wait_sec}s"); time.sleep(wait_sec)
     return t("analysis_unavailable")
 
@@ -972,6 +1265,17 @@ def llm(istem: str, model: str) -> str:
 _SECTION_KEYWORDS = {
     "10-K": ["item 1.", "item 1a.", "item 7.", "item 8."],
     "10-Q": ["item 1.", "item 2.", "item 3."],
+    # Full standard 8-K item set (SEC rules; ABS 6.0x series omitted — equity-focused bot).
+    # Item 1.05 added: Material Cybersecurity Incidents (SEC rule, effective 2023).
+    "8-K": [
+        "item 1.01", "item 1.02", "item 1.03", "item 1.04", "item 1.05",
+        "item 2.01", "item 2.02", "item 2.03", "item 2.04", "item 2.05", "item 2.06",
+        "item 3.01", "item 3.02", "item 3.03",
+        "item 4.01", "item 4.02",
+        "item 5.01", "item 5.02", "item 5.03", "item 5.04", "item 5.05",
+        "item 5.06", "item 5.07", "item 5.08",
+        "item 7.01", "item 8.01", "item 9.01",
+    ],
 }
 
 def extract_section(text: str, form: str, max_k: int) -> str:
@@ -1084,10 +1388,75 @@ def build_prompt(ticker: str, form: str, date_str: str, body: str,
     base = f"{ticker} — {form} ({date_str})\n\n{body}\n\n"
     return base + (custom_prompt or PROMPTS.get(form, _PROMPT_DEFAULT))
 
+# ─── EDGAR Company cache ──────────────────────────────────
+# edgartools' Company() does a CIK lookup (network) on construction.
+# A Company object is just a CIK + metadata — filings are always fetched
+# fresh via .get_filings(), so the object is safe to cache for the whole
+# process lifetime. This turns N scans of the same ticker into 1 lookup.
+_company_cache: dict = {}
+_company_lock = threading.Lock()
+
+def get_company(ticker: str):
+    """Return a cached edgar Company for `ticker`, constructing it once.
+
+    The network construction runs OUTSIDE the lock — a rare race just
+    builds the object twice (both valid, last write wins). May raise on a
+    bad ticker / network failure; the caller's retry loop handles that.
+    Failures are never cached.
+    """
+    with _company_lock:
+        cached = _company_cache.get(ticker)
+    if cached is not None:
+        return cached
+    company = Company(ticker)            # network — may raise
+    with _company_lock:
+        _company_cache[ticker] = company
+    return company
+
 # ═══════════════════════════════════════════════════════════
 # Refactored scan pipeline — small composable functions.
 # Each step has a clear input/output contract for testability.
 # ═══════════════════════════════════════════════════════════
+
+def _collect_8k_text(filing) -> str:
+    """Collect primary 8-K doc text + EX-99.* attachment bodies.
+
+    edgartools API (confirmed from docs):
+      filing.attachments — iterable of attachment objects
+      att.document       — lowercase filename, e.g. "ex-99_1.htm"
+      att.text()         — plain-text content of that attachment
+
+    Falls back to primary-doc-only on AttributeError (old edgartools versions).
+    Never raises — caller always gets a string (possibly empty).
+    """
+    try:
+        primary = filing.text() or ""
+    except Exception as e:
+        log.warning(f"_collect_8k_text: filing.text() failed: {e}")
+        return ""
+
+    try:
+        attachments = filing.attachments
+    except AttributeError:
+        log.warning("_collect_8k_text: filing.attachments not available — primary doc only")
+        return primary
+
+    extra_parts: list = []
+    for att in attachments:
+        try:
+            doc_name = att.document or ""
+            if not doc_name.lower().startswith("ex-99"):
+                continue
+            att_text = att.text()
+            if not att_text:
+                log.warning(f"_collect_8k_text: attachment {doc_name!r} returned empty text — skipping")
+                continue
+            extra_parts.append(f"\n\n--- {doc_name} ---\n{att_text}")
+        except Exception as e:
+            log.warning(f"_collect_8k_text: attachment fetch error ({e}) — skipping")
+
+    return primary + "".join(extra_parts)
+
 
 def fetch_new_filings(ticker: str, forms: list, lookback_days: int,
                       cache_dict: dict | None = None,
@@ -1095,7 +1464,8 @@ def fetch_new_filings(ticker: str, forms: list, lookback_days: int,
                       quiet: bool = False,
                       *,
                       n_latest: int = 1,
-                      max_chars_per: int | None = None) -> list:
+                      max_chars_per: int | None = None,
+                      fetch_text: bool = True) -> list:
     """
     IO: fetch the latest filings from SEC EDGAR for `ticker` × `formlar`,
     filter by lookback window and (optionally) the cache.
@@ -1119,7 +1489,7 @@ def fetch_new_filings(ticker: str, forms: list, lookback_days: int,
 
     for edgar_deneme in range(3):
         try:
-            company = Company(ticker)
+            company = get_company(ticker)
             for form in forms:
                 for form_deneme in range(3):
                     try:
@@ -1136,27 +1506,40 @@ def fetch_new_filings(ticker: str, forms: list, lookback_days: int,
                             if (use_cache and cache_dict is not None
                                     and not is_new_in_cache(cache_dict, ticker, form, ds)):
                                 continue
-                            text = f.text()
-                            if max_chars_per is not None:
-                                text = text[:max_chars_per]
+                            if fetch_text:
+                                text = (_collect_8k_text(f) if form == "8-K"
+                                        else f.text())
+                                if not text:
+                                    log.warning(f"{ticker} {form} {ds}: text returned empty — skipping filing")
+                                    continue
+                                if max_chars_per is not None:
+                                    text = text[:max_chars_per]
+                            else:
+                                text = None
                             found.append((form, ds, text))
                             time.sleep(0.5)
                         break
                     except Exception as e:
-                        wait_sec = min(30, 5 * 2 ** form_deneme)
+                        wait_sec = _backoff(form_deneme, 5, 30)
                         log.error(f"{ticker} {form} (attempt {form_deneme+1}): {e} — waiting {wait_sec}s")
                         time.sleep(wait_sec)
             return found
         except Exception as e:
-            wait_sec = min(60, 10 * 2 ** edgar_deneme)
+            wait_sec = _backoff(edgar_deneme, 10, 60)
             log.error(f"{ticker} Company (attempt {edgar_deneme+1}): {e} — waiting {wait_sec}s")
             if edgar_deneme == 2:
                 if not quiet:
-                    tg(t("ticker_not_found", ticker=ticker, error=str(e)))
+                    tg(friendly_fetch_error(ticker, e))
                 return []
             time.sleep(wait_sec)
     return []
 
+
+# Form-sensitive char limits; unknown forms fall back to the global max_chars config.
+# 8-K gets a higher cap because substantive items often appear well past the first 10000 chars.
+_FORM_MAX_CHARS: dict = {
+    "8-K": 20000,   # bumped from 15000: press releases alone run 8-12K chars
+}
 
 def analyze_filing(ticker: str, form: str, date_str: str, text: str,
                    max_chars: int, model: str,
@@ -1166,7 +1549,8 @@ def analyze_filing(ticker: str, form: str, date_str: str, text: str,
 
     Returns: (analysis, diff). diff is "" for non-10-K/10-Q or no prior filing.
     """
-    body = extract_section(text, form, max_chars)
+    effective_max = _FORM_MAX_CHARS.get(form, max_chars)
+    body = extract_section(text, form, effective_max)
     custom  = custom_prompts.get(form, "")
     analysis = llm(build_prompt(ticker, form, date_str, body, custom), model)
     diff   = diff_analysis(ticker, form, text, model)
@@ -1194,11 +1578,14 @@ def send_filing_result(ticker: str, form: str, date_str: str, text: str,
                        analysis: str, diff: str, save_to_cache: bool, quiet: bool):
     """
     IO: persist artifacts and notify the user.
-    Steps: store raw + previous, send message+button, send .md file,
-    weekly log, update cache, bump counter.
+    Steps: store raw + analysis + previous, send message with inline
+    buttons, weekly log, update cache, bump counter.
+
+    The .md report is NOT pushed automatically — it is parked in the
+    raw-filing store and delivered on demand via the message's '.md' button.
     """
     save_prev(ticker, form, text)
-    raw_key = store_raw_filing(ticker, form, date_str, text)
+    raw_key = store_raw_filing(ticker, form, date_str, text, analysis, diff)
 
     if not quiet:
         # Optional E1 price action — empty string on disable/failure (silent).
@@ -1206,7 +1593,6 @@ def send_filing_result(ticker: str, form: str, date_str: str, text: str,
         message = render_filing_message(ticker, form, date_str,
                                         analysis, diff, price_snippet)
         tg_with_button(message, raw_key)
-        send_md_analysis(ticker, form, date_str, analysis, diff)
 
     log_weekly(ticker, form, date_str, analysis)
 
@@ -1251,37 +1637,41 @@ def scan_ticker(ticker: str, forms: list,
     status_set(last_scan=datetime.now().isoformat())
     return True
 
-def probe_new_filings_for_watchlist(form_override: list | None = None) -> bool:
+def probe_new_filings_for_watchlist(form_override: list | None = None) -> list:
     """
     Probe-only existence check for the hourly alarm.
 
-    Asks EDGAR whether the watchlist has any new (cache-filtered, lookback-
-    windowed) filings. Returns True on the FIRST hit (short-circuits) so it
-    does at most one EDGAR call per ticker until something is found.
+    Returns a list of (ticker, form, date_str) for EVERY new (cache-filtered,
+    lookback-windowed) filing across the watchlist. Empty list = nothing new.
 
-    Side-effect-free: does NOT call the LLM, does NOT write to cache,
-    does NOT touch weekly_log or previous_filings. The user sees only the
-    'Alert' message and must run /check (or `Check`) manually to actually
-    analyze the new filings — which keeps LLM quota under the user's
-    control instead of burning it silently in the background.
+    Side-effect-free: does NOT call the LLM, does NOT write to cache, does
+    NOT touch weekly_log or previous_filings. The user analyzes on demand
+    via the alert's inline buttons — keeping LLM quota under user control.
+
+    Unlike the old short-circuit version (which returned a bool on the first
+    hit), this probes the whole watchlist so the alert can name each new
+    filing. That is a few extra EDGAR existence checks per hour — still no
+    LLM call, still cheap.
     """
     cfg = get_cfg()
     items = cfg["tickers"]
     if not items:
-        return False
+        return []
     forms = form_override or cfg["default_forms"]
     cache_dict = load_cache()
     lookback = cfg["days_lookback"]
+    hits: list = []
     for ticker in items:
         rows = fetch_new_filings(
             ticker, forms, lookback,
             cache_dict=cache_dict, use_cache=True,
             quiet=True,
+            fetch_text=False,
         )
-        if rows:
-            return True
+        for form, date_str, _text in rows:
+            hits.append((ticker, form, date_str))
         time.sleep(1)
-    return False
+    return hits
 
 # ─── Top-level scan commands ──────────────────────────────
 def cmd_sec(form_override=None, quiet=False):
@@ -1455,9 +1845,37 @@ def cmd_digest(parts: list) -> str:
     return t("digest_enabled")
 
 # ─── Custom prompts ───────────────────────────────────────
+# Dash variants found in practice: en-dash (–), em-dash (—), unicode minus (−)
+_DASH_CHARS = "–—−－"  # –  —  −  －
+
+def _normalize_form_input(raw: str) -> str:
+    """Fold dash variants → ASCII hyphen, strip whitespace, uppercase."""
+    for ch in _DASH_CHARS:
+        raw = raw.replace(ch, "-")
+    return raw.strip().upper()
+
 def _match_form(raw: str) -> str | None:
-    return next((k for k in FORMS if k.upper() == raw or
-                 k.replace(" ","").upper() == raw.replace(" ","")), None)
+    """Match a user-supplied string to a canonical FORMS entry.
+
+    Matching tiers (first hit wins):
+      1. Exact (after normalize): "10-K" → "10-K"
+      2. Space-insensitive:       "SC13G" == "SC13G"
+      3. Separator-stripped:      "10k" → "10K" == "10K" (stripped 10-K)
+    """
+    n = _normalize_form_input(raw)
+    for k in FORMS:
+        ku = k.upper()
+        if ku == n:
+            return k
+        if ku.replace(" ", "") == n.replace(" ", ""):
+            return k
+    # tier 3: strip ALL separators (dashes + spaces) from both sides
+    n_bare = n.replace("-", "").replace(" ", "")
+    for k in FORMS:
+        k_bare = k.upper().replace("-", "").replace(" ", "")
+        if k_bare == n_bare:
+            return k
+    return None
 
 def cmd_setprompt(parts: list) -> str:
     if len(parts) < 3:
@@ -1643,16 +2061,18 @@ def cmd_sentiment_trend(parts: list):
 def cmd_addticker(parts: list) -> str:
     if len(parts) < 2:
         return t("addticker_usage")
-    added, already_in = [], []
+    added, already_in, invalid = [], [], []
     def _add(c):
         for raw in parts[1:]:
             ticker = raw.upper().strip()
+            if not valid_ticker(ticker): invalid.append(ticker); continue
             if ticker in c["tickers"]: already_in.append(ticker)
             else: c["tickers"].append(ticker); added.append(ticker)
     mutate_cfg(_add)
     lines = []
-    if added:   lines.append(t("ticker_added",  tickers="  ".join(f"`{x}`" for x in added)))
+    if added:      lines.append(t("ticker_added",   tickers="  ".join(f"`{x}`" for x in added)))
     if already_in: lines.append(t("ticker_already", tickers="  ".join(f"`{x}`" for x in already_in)))
+    if invalid:    lines.append(t("ticker_invalid",  tickers="  ".join(f"`{x}`" for x in invalid)))
     return "\n".join(lines)
 
 def cmd_removeticker(parts: list) -> str:
@@ -1676,6 +2096,13 @@ def cmd_listtickers() -> str:
              count=len(lst),
              lines="\n".join(f"  • `{x}`" for x in lst))
 
+# ─── Ticker validation (R4) ───────────────────────────────
+_TICKER_RE = re.compile(r"^[A-Z]{1,6}(?:[.\-][A-Z0-9]{1,3})?$")
+
+def valid_ticker(symbol: str) -> bool:
+    """PURE: True iff symbol looks like a valid US equity ticker."""
+    return bool(_TICKER_RE.match(symbol))
+
 # ─── Watchlist groups (E2) ────────────────────────────────
 # Groups are named subsets of tickers, persisted in cfg["groups"].
 # They are independent of the main watchlist — tickers can be in groups
@@ -1692,12 +2119,19 @@ def cmd_addgroup(parts: list) -> str:
     name = parts[1].strip()
     if not _valid_group_name(name):
         return t("group_name_invalid", name=name)
-    tickers = [p.upper().strip() for p in parts[2:]]
+    raw_tickers = [p.upper().strip() for p in parts[2:]]
+    valid   = [x for x in raw_tickers if valid_ticker(x)]
+    invalid = [x for x in raw_tickers if not valid_ticker(x)]
+    if not valid:
+        return t("group_no_valid_tickers", name=name)
     def _add(c):
-        c["groups"][name] = sorted(set(tickers))
+        c["groups"][name] = sorted(set(valid))
     mutate_cfg(_add)
-    return t("group_added", name=name,
-             tickers="  ".join(f"`{x}`" for x in sorted(set(tickers))))
+    lines = [t("group_added", name=name,
+               tickers="  ".join(f"`{x}`" for x in sorted(set(valid))))]
+    if invalid:
+        lines.append(t("ticker_invalid", tickers="  ".join(f"`{x}`" for x in invalid)))
+    return "\n".join(lines)
 
 def cmd_removegroup(parts: list) -> str:
     """Usage: /removegroup NAME"""
@@ -1962,42 +2396,67 @@ def cmd_alarm(parts: list) -> str:
 def background_thread():
     log.info("Background thread started.")
     last_alarm_check = datetime.now()
-    last_digest_day    = -1
+    # (ISO year, ISO week) of the last digest sent. Using the ISO week — not
+    # the calendar day-of-month — avoids the bug where two consecutive Sundays
+    # land on the same day number (e.g. a non-leap February) and the second
+    # week's digest gets silently skipped.
+    last_digest_yw: tuple = (-1, -1)
+    bg_errors = 0   # consecutive failed iterations
 
     while not _stop_event.is_set():
-        now = datetime.now()
-        cfg   = get_cfg()
+        # [H7] Crash guard. An unhandled exception here used to kill the
+        # whole background thread silently: scheduled scans, the hourly
+        # alarm and the weekly digest would stop forever while the bot
+        # still looked alive (polling kept running). Now a failure is
+        # logged with a traceback, the user is told once, and the
+        # scheduler keeps ticking.
+        try:
+            now = datetime.now()
+            cfg = get_cfg()
 
-        # Auto schedule
-        schedule_str = cfg.get("schedule")
-        if schedule_str:
-            sh, sd = _parse_hhmm(schedule_str)
-            if sh >= 0 and now.hour == sh and now.minute == sd:
-                last = last_scan_dt()
-                if last is None or (now - last).total_seconds() > 90:
-                    log.info(f"Scheduled scan: {schedule_str}")
-                    tg(t("scheduled_scan_starting", time=schedule_str))
-                    cmd_sec(quiet=False)
+            # Auto schedule
+            schedule_str = cfg.get("schedule")
+            if schedule_str:
+                sh, sd = _parse_hhmm(schedule_str)
+                if sh >= 0 and now.hour == sh and now.minute == sd:
+                    last = last_scan_dt()
+                    if last is None or (now - last).total_seconds() > 90:
+                        log.info(f"Scheduled scan: {schedule_str}")
+                        tg(t("scheduled_scan_starting", time=schedule_str))
+                        cmd_sec(quiet=False)
 
-        # Hourly alarm — PROBE ONLY. Existence check that does not touch the
-        # cache, the LLM, or weekly_log. The user runs /check manually after
-        # seeing the alert. Prevents the old bug where the alarm silently
-        # processed filings and the subsequent /check returned "no new filings".
-        if cfg.get("alarm_on"):
-            if (now - last_alarm_check).total_seconds() >= 3600:
-                log.info("Alarm: hourly probe")
-                if probe_new_filings_for_watchlist():
-                    tg(t("alert_new_filing"))
-                last_alarm_check = now
-                status_set(last_alarm=now.isoformat())
+            # Hourly alarm — PROBE ONLY. Existence check that does not touch
+            # the cache, the LLM, or weekly_log. The user runs /check manually
+            # after seeing the alert. Prevents the old bug where the alarm
+            # silently processed filings and the subsequent /check returned
+            # "no new filings".
+            if cfg.get("alarm_on"):
+                if (now - last_alarm_check).total_seconds() >= 3600:
+                    log.info("Alarm: hourly probe")
+                    hits = probe_new_filings_for_watchlist()
+                    if hits:
+                        send_alarm_alert(hits)
+                    last_alarm_check = now
+                    status_set(last_alarm=now.isoformat())
 
-        # Weekly digest (Sunday 09:00)
-        if cfg.get("weekly_digest"):
-            if (now.weekday() == 6 and now.hour == 9
-                    and now.minute == 0 and last_digest_day != now.day):
-                log.info("Sending weekly digest.")
-                send_weekly_digest()
-                last_digest_day = now.day
+            # Weekly digest (Sunday 09:00)
+            if cfg.get("weekly_digest"):
+                cur_yw = tuple(now.isocalendar()[:2])   # (ISO year, ISO week)
+                if (now.weekday() == 6 and now.hour == 9
+                        and now.minute == 0 and last_digest_yw != cur_yw):
+                    log.info("Sending weekly digest.")
+                    send_weekly_digest()
+                    last_digest_yw = cur_yw
+
+            bg_errors = 0
+        except Exception as e:
+            bg_errors += 1
+            log.exception(f"Background iteration failed ({bg_errors}): {e}")
+            if bg_errors == 1:   # notify once, on the first failure only
+                try:
+                    tg(t("background_error"))
+                except Exception:
+                    pass
 
         time.sleep(60)
 
@@ -2038,7 +2497,7 @@ def wizard_handle(text: str, parts: list) -> bool:
             tg(t("wizard_forms_set", forms="  ".join(DEFAULT_FORMS))
                + t("wizard_ticker_menu"))
             return True
-        if parts[0].lower() == "/setforms" and len(parts) >= 2:
+        if parts and parts[0].lower() == "/setforms" and len(parts) >= 2:
             valid = []
             for f in [p.upper() for p in parts[1:]]:
                 m = _match_form(f)
@@ -2059,7 +2518,7 @@ def wizard_handle(text: str, parts: list) -> bool:
             WIZARD.pop("step", None)
             tg(t("wizard_complete"))
             return True
-        if parts[0].lower() == "/addticker" and len(parts) >= 2:
+        if parts and parts[0].lower() == "/addticker" and len(parts) >= 2:
             result = cmd_addticker(parts)
             WIZARD.pop("step", None)
             tg(result + "\n\n" + t("wizard_complete"))
@@ -2106,6 +2565,32 @@ def cmd_report():
     filename = f"sec_report_{datetime.now().strftime('%Y%m%d')}.md"
     tg_send_document(filename, content, t("report_caption", date=today_str))
 
+def build_weekly_csv(entries: list) -> str:
+    """PURE: convert weekly_log entries to CSV string.
+
+    Input keys: ticker / form / tarih / ekleme / analiz
+    Output columns: ticker, form, filing_date, added_at, analysis
+    """
+    import csv, io
+    buf = io.StringIO()
+    w = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\n")
+    w.writerow(["ticker", "form", "filing_date", "added_at", "analysis"])
+    for e in entries:
+        w.writerow([e.get("ticker",""), e.get("form",""),
+                    e.get("tarih",""), e.get("ekleme",""),
+                    e.get("analiz","").replace("\n", " ")])
+    return buf.getvalue()
+
+def cmd_export():
+    """Send this week's weekly_log as a CSV file."""
+    data = get_weekly_log()
+    if not data:
+        tg(t("export_no_data"))
+        return
+    content  = build_weekly_csv(data)
+    filename = f"sec_export_{datetime.now().strftime('%Y%m%d')}.csv"
+    tg_send_document(filename, content, t("export_caption", count=len(data)))
+
 def help_msg() -> str:
     cfg = get_cfg()
     return t("help_block",
@@ -2114,6 +2599,44 @@ def help_msg() -> str:
              language=get_lang())
 
 # ─── Update handler (polling and webhook) ─────────────────
+def handle_analyze_callback(cq: dict, token: str, idx: int):
+    """Inline [🔍 TICKER FORM] pressed — analyze that one filing, then retire
+    its button from the alert message."""
+    entry = get_alarm_hits(token)
+    if entry is None or idx < 0 or idx >= len(entry["hits"]):
+        tg_answer_callback(cq["id"], t("alarm_expired"))
+        return
+    if idx in entry["done"]:
+        tg_answer_callback(cq["id"], t("alarm_already_done"))
+        return
+    ticker, form, _date = entry["hits"][idx]
+    tg_answer_callback(cq["id"], t("alarm_analyzing", ticker=ticker))
+    mark_alarm_done(token, idx)
+    # Rebuild the keyboard without the just-used button.
+    refreshed = get_alarm_hits(token)
+    msg = cq.get("message", {})
+    tg_edit_markup(msg.get("chat", {}).get("id"), msg.get("message_id"),
+                   build_alarm_keyboard(token, refreshed["hits"], refreshed["done"]))
+    # Run the real analysis (LLM) — sends a normal analysis message.
+    scan_ticker(ticker, [form], True, True, quiet=False)
+
+def handle_analyzeall_callback(cq: dict, token: str):
+    """Inline [🔍 Analyze all] pressed — analyze every pending filing and
+    strip the whole keyboard."""
+    entry = get_alarm_hits(token)
+    if entry is None:
+        tg_answer_callback(cq["id"], t("alarm_expired"))
+        return
+    tg_answer_callback(cq["id"], t("alarm_analyzing_all"))
+    msg = cq.get("message", {})
+    tg_edit_markup(msg.get("chat", {}).get("id"), msg.get("message_id"), None)
+    pending = [(i, h) for i, h in enumerate(entry["hits"])
+               if i not in entry["done"]]
+    for i, (ticker, form, _date) in pending:
+        mark_alarm_done(token, i)
+        scan_ticker(ticker, [form], True, True, quiet=False)
+
+
 def _process_update(upd: dict):
     global _webhook_active
 
@@ -2125,6 +2648,18 @@ def _process_update(upd: dict):
             data = cq.get("data", "")
             if data.startswith("raw:"):
                 send_raw_filing(cq["id"], data[4:])
+            elif data.startswith("md:"):
+                send_md_for_key(cq["id"], data[3:])
+            elif data.startswith("analyzeall:"):
+                handle_analyzeall_callback(cq, data[len("analyzeall:"):])
+            elif data.startswith("analyze:"):
+                # callback_data form: "analyze:{token}:{idx}"
+                token, _, idx_str = data[len("analyze:"):].rpartition(":")
+                try:
+                    idx = int(idx_str)
+                except ValueError:
+                    idx = -1
+                handle_analyze_callback(cq, token, idx)
             else:
                 tg_answer_callback(cq["id"])
         return
@@ -2164,8 +2699,9 @@ def _process_update(upd: dict):
     elif komut == "/digest":
         r = cmd_digest(parts)
         if r: tg(r)
-    # Report
+    # Report / export
     elif komut == "/report":         cmd_report()
+    elif komut == "/export":         cmd_export()
     # Webhook
     elif komut == "/setwebhook":     tg(cmd_setwebhook(parts))
     elif komut == "/delwebhook":     tg(cmd_delwebhook())
@@ -2205,18 +2741,60 @@ def _process_update(upd: dict):
         cmd_sec()
 
 
-def main():
-    global _webhook_active
-    log.info("Bot v2.5 started.")
+def run_startup_checks() -> list:
+    """
+    Validate every critical prerequisite before the bot starts.
 
-    # Validate EDGAR identity once at startup, then register with edgartools.
+    Returns a list of human-readable issue strings; empty list means all
+    clear. Covers the four secrets (EDGAR identity, OpenRouter key, Telegram
+    token + chat id) and the language files the i18n layer depends on.
+    Pure-ish: reads module globals only, no side effects — easy to test.
+    """
+    issues: list = []
+
     ok, msg = validate_edgar_identity(EDGAR_IDENTITY)
     if not ok:
-        log.error(f"EDGAR identity invalid: {msg}")
-        sys.stderr.write(f"\n❌ {msg}\n")
+        issues.append(msg)
+
+    if (not OPENROUTER_API_KEY
+            or OPENROUTER_API_KEY == "sk-or-v1-YOUR_KEY_HERE"
+            or len(OPENROUTER_API_KEY) < 10):
+        issues.append("OPENROUTER_API_KEY is missing or still the placeholder "
+                       "— set it in your .env file.")
+
+    if (not TELEGRAM_BOT_TOKEN
+            or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN"
+            or ":" not in TELEGRAM_BOT_TOKEN):
+        issues.append("TELEGRAM_BOT_TOKEN is missing or malformed "
+                       "(expected '123456:ABC...') — set it in your .env file.")
+
+    if not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID":
+        issues.append("TELEGRAM_CHAT_ID is missing or still the placeholder "
+                       "— set it in your .env file.")
+
+    if not LANG_DIR.exists():
+        issues.append(f"Language directory not found: {LANG_DIR}")
+    elif not list(LANG_DIR.glob("*.json")):
+        issues.append(f"No language files (*.json) in {LANG_DIR}")
+
+    return issues
+
+
+def main():
+    global _webhook_active
+    log.info("Bot v3.0 started.")
+
+    # Validate every prerequisite at startup; refuse to run on any failure.
+    issues = run_startup_checks()
+    if issues:
+        for issue in issues:
+            log.error(f"Startup check failed: {issue}")
+            sys.stderr.write(f"\n❌ {issue}\n")
+        sys.stderr.write("\nFix the above (edit your .env file) and restart.\n")
         sys.exit(1)
+
     set_identity(EDGAR_IDENTITY)
-    log.info(f"EDGAR identity registered: {EDGAR_IDENTITY}")
+    log.info("EDGAR identity registered.")
 
     # Startup cache cleanup — drop entries older than cache_max_age_days.
     pruned = prune_cache_expired()
@@ -2225,6 +2803,7 @@ def main():
 
     # Prime the lang cache early
     _ = get_lang()
+    register_bot_commands()
 
     bg = threading.Thread(target=background_thread, daemon=True)
     bg.start()
@@ -2259,8 +2838,23 @@ def main():
         while not _stop_event.is_set():
             updates = get_updates(offset)
             for upd in updates:
+                # offset advances BEFORE processing — a bad update is never
+                # retried in an infinite loop.
                 offset = upd["update_id"] + 1
-                _process_update(upd)
+                # [H7] Per-update crash guard. One malformed update or one
+                # bug in a command handler used to propagate out of the
+                # polling loop and kill the entire bot. Now it is logged,
+                # the user is told, and polling continues.
+                try:
+                    _process_update(upd)
+                except Exception as e:
+                    log.exception(
+                        f"Update processing failed "
+                        f"(update_id={upd.get('update_id')}): {e}")
+                    try:
+                        tg(t("update_error"))
+                    except Exception:
+                        pass
             time.sleep(1)
 
 if __name__ == "__main__":
