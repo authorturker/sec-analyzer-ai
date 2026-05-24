@@ -9,7 +9,7 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)](https://python.org)
 [![OpenRouter](https://img.shields.io/badge/LLM-OpenRouter%20Free-6c47ff)](https://openrouter.ai)
 [![Telegram](https://img.shields.io/badge/Interface-Telegram-2CA5E0?logo=telegram&logoColor=white)](https://telegram.org)
-[![Tests](https://img.shields.io/badge/tests-154%20passing-success)](#-tests)
+[![Tests](https://img.shields.io/badge/tests-327%20passing-success)](#-tests)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 </div>
@@ -27,10 +27,12 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 | 🆚 **Side-by-side compare** | `/compare AAPL MSFT 10-K` — single LLM call, four-axis comparison |
 | 🗂 **Watchlist groups** | `/addgroup tech AAPL MSFT NVDA` → `/scangroup tech` |
 | 📈 **Price action** | Filing date → +N day stock change appended automatically (free, no API key) |
+| 💹 **On-demand prices** | `/checkprice AAPL [days]` — last-N-day window summary (yfinance) |
+| 📰 **Yahoo Finance news** | `/checknews AAPL [count]` — latest headlines with publisher links (yfinance) |
 | 🧠 **Smart Caching** | Never re-analyzes a filing already processed; old entries auto-pruned |
 | 🤖 **Guided Setup** | First-run wizard, starts with language picker — no config file editing needed |
 | ⚙️ **Full Telegram Control** | Manage tickers, forms, model, language, schedule, prompts from chat |
-| ⏰ **Auto Scheduling** | Daily auto-scan at a time you set + hourly filing alarm |
+| ⏰ **Auto Scheduling** | Daily auto-scan at a time you set + hourly filing alarm (probe-only) |
 | 📊 **Weekly Digest** | Sunday summary of everything analyzed that week |
 | 🔍 **Filing Diff** | Risk-factor comparison between current and previous 10-K / 10-Q |
 | ✏️ **Custom Prompts** | Override the analysis prompt per form type |
@@ -38,9 +40,9 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 | 📋 **Markdown Reports** | `/report` sends this week's full analyses as a `.md` file |
 | 🔔 **Webhook Mode** | Optional — faster response, lower battery use |
 | 📡 **Health Monitoring** | `/status` shows uptime, error counts, last scan/alarm times |
-| 🧪 **Tested** | 154 pytest tests for pure helpers, i18n, config cache, thread safety |
+| 🧪 **Tested** | 327 pytest tests for pure helpers, i18n, config cache, thread safety |
 | ⚡ **OpenRouter Free LLM** | openrouter/free, $0 cost |
-| 📱 **Lightweight** | Single 1.8k-line `bot.py`, runs on a mid-range Android phone via Termux |
+| 📱 **Lightweight** | Single-file `bot.py` (~2900 lines), runs on a mid-range Android phone via Termux |
 
 ---
 
@@ -48,22 +50,31 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 
 ```text
 sec-analyzer/
-├── bot.py                 # Main bot — everything in one file
-├── config.py              # Secrets template — fill in your 4 keys
-├── requirements.txt       # pip dependencies
+├── bot.py                       # Main bot — everything in one file
+├── config.py                    # Thin loader — reads secrets from .env
+├── .env.example                 # Secrets template — copy to .env, fill in
+├── requirements.txt             # pip dependencies
+├── .gitignore
 ├── lang/
-│   ├── en.json            # English UI strings (default)
-│   └── tr.json            # Turkish UI strings
-├── tests/                 # 154 pytest tests
+│   ├── en.json                  # English UI strings (default)
+│   └── tr.json                  # Turkish UI strings
+├── tests/                       # 327 pytest tests
 │   ├── conftest.py
-│   ├── test_cfg.py        # Config cache + atomic mutate
-│   ├── test_compare.py    # /compare prompt builder
-│   ├── test_groups.py     # Watchlist groups
-│   ├── test_i18n.py       # Language loader, t(), fallback
-│   ├── test_price.py      # Stooq parsing + price snippet
-│   ├── test_pure.py       # render, hazirla, build_prompt, …
-│   ├── test_sentiment.py  # Sentiment parse + trend rendering
-│   └── test_state.py      # Locks, raw store, cache TTL
+│   ├── test_alarm_buttons.py    # Interactive alarm + on-demand .md button
+│   ├── test_cfg.py              # Config cache + atomic mutate
+│   ├── test_checkprice_news.py  # /checkprice + /checknews formatters
+│   ├── test_collect_8k.py       # 8-K EX-99.* exhibit collection
+│   ├── test_compare.py          # /compare prompt builder
+│   ├── test_groups.py           # Watchlist groups
+│   ├── test_hotfixes.py         # Atomic JSON IO, wizard guard, digest week
+│   ├── test_i18n.py             # Language loader, t(), fallback
+│   ├── test_price.py            # Stooq parsing + price snippet
+│   ├── test_probe.py            # Alarm probe — whole-watchlist hit list
+│   ├── test_pure.py             # render, extract_section, build_prompt, …
+│   ├── test_sentiment.py        # Sentiment parse + trend rendering
+│   ├── test_startup_company.py  # Startup checks + Company cache
+│   ├── test_state.py            # Locks, raw store, cache TTL
+│   └── test_tg_llm.py           # tg() + llm() characterization tests
 └── README.md
 ```
 
@@ -91,7 +102,7 @@ cd sec-analyzer-ai
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-nano config.py          # fill in your 4 keys
+cp .env.example .env    # then edit .env with your 4 keys
 python bot.py
 ```
 
@@ -101,18 +112,22 @@ On first run the bot launches a bilingual wizard — pick a language, choose def
 
 ## ⚙️ Configuration
 
-`config.py` contains only **four** required fields — secrets:
+Secrets live in a `.env` file (git-ignored). Copy the template and fill in **four** values:
 
-```python
-EDGAR_IDENTITY     = "Your Name yourname@email.com"  # Required by SEC
-OPENROUTER_API_KEY = "sk-or-v1-..."                  # From openrouter.ai
-TELEGRAM_BOT_TOKEN = "123456:ABC..."                 # From @BotFather
-TELEGRAM_CHAT_ID   = "123456789"                     # From @userinfobot
+```bash
+cp .env.example .env
 ```
 
-The bot validates `EDGAR_IDENTITY` at startup and refuses to run on the placeholder string — SEC will block the User-Agent otherwise.
+```ini
+EDGAR_IDENTITY=Your Name yourname@email.com   # Required by SEC
+OPENROUTER_API_KEY=sk-or-v1-...               # From openrouter.ai
+TELEGRAM_BOT_TOKEN=123456:ABC...              # From @BotFather
+TELEGRAM_CHAT_ID=123456789                    # From @userinfobot
+```
 
-Everything else — tickers, default forms, model, schedule, language, custom prompts, webhook URL, price-action lookforward, raw-filing cap, cache TTL — is managed live via Telegram commands and stored in `~/sec-analyzer/bot_config.json`.
+`config.py` is a thin loader that reads these via `python-dotenv` — you never edit `config.py` itself. At startup the bot runs a health check and refuses to run if any of the four is missing, malformed, or still a placeholder.
+
+Everything else — tickers, default forms, model, schedule, language, custom prompts, webhook URL, price-action lookforward, raw-filing cap (default 100), cache TTL — is managed live via Telegram commands and stored in `~/sec-analyzer/bot_config.json`.
 
 ---
 
@@ -174,7 +189,7 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 |---|---|
 | `/setschedule 08:00` | Auto-scan daily at 08:00 |
 | `/setschedule off` | Disable auto-scan |
-| `/alarm` | Enable hourly filing alarm |
+| `/alarm` | Enable hourly filing alarm (probe only — no LLM, no cache write) |
 | `/alarm off` | Disable alarm |
 | `/digest` | Enable weekly Sunday digest |
 | `/digest now` | Send digest immediately |
@@ -233,7 +248,7 @@ pkg install -y python git tmux
 git clone https://github.com/authorturker/sec-analyzer-ai.git
 cd sec-analyzer-ai
 pip install -r requirements.txt
-nano config.py
+cp .env.example .env && nano .env
 ```
 
 Run in background with tmux:
@@ -308,10 +323,10 @@ python -m pytest tests/ -q
 ```
 
 ```
-154 passed in 0.16s
+231 passed in <1s
 ```
 
-The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_parse_stooq_csv`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_md_escape`, …), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), and the thread-safe state stores. Network IO is not exercised — tests run offline.
+The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_parse_stooq_csv`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, …), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the thread-safe state stores, and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline.
 
 ---
 
@@ -325,7 +340,7 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 
 | Error | Fix |
 |---|---|
-| `EDGAR identity invalid` on startup | Edit `config.py` and set `EDGAR_IDENTITY = "Real Name your@email.com"` |
+| `EDGAR identity invalid` / startup check failed | Edit `.env` and set the flagged value (e.g. `EDGAR_IDENTITY=Real Name your@email.com`) |
 | `403 Forbidden` from SEC | Same as above — SEC requires a real-looking identity |
 | `No time zone found with key UTC` | `pip install tzdata` (already in `requirements.txt`) |
 | `429 Too Many Requests` | Free-tier daily limit — switch model with `/setmodel` |
@@ -335,15 +350,39 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 | Bot goes silent after network error | Reconnects automatically; check `/status` for error count |
 | Webhook not receiving updates | Verify public HTTPS URL; run `/delwebhook` to fall back to polling |
 | Wizard shows English even though I want Turkish | Step 0 of the wizard is bilingual — type `/lang tr` first |
+| `/checkprice` or `/checknews` says "yfinance required" | `pip install yfinance` (optional dep, ~50 MB) |
+| Alarm fires but `/check` finds nothing | Pre-v2.5 bug — update to current release (alarm is now probe-only) |
 
 ---
 
 ## 📝 Release Notes
 
+### v3.0
+- **🐛 Fix: 8-K analysis now delivers real content.** `extract_section()` now recognises all standard 8-K items (1.01–9.01, including the 2023 cybersecurity item 1.05). A new `_collect_8k_text()` helper fetches the primary cover document **and** all EX-99.* attachments (press releases, earnings releases), concatenates them, and feeds the combined text to the LLM. Previously `f.text()` returned only the cover page boilerplate; the actual item body was never seen by the model.
+- **Telegram hard-chunk.** `_split_message()` now performs character-level hard-splitting for lines that exceed Telegram's 4096-char limit, preventing message loss on very long single-line outputs.
+- **8-K form-sensitive char limit.** `_FORM_MAX_CHARS["8-K"] = 20000` (up from the global 10 000) so press releases fit without truncation. Other form limits are unchanged.
+- **`llm()` prompt clamp.** Prompts > 30 000 chars are clamped with a log warning — a last-resort guard for multi-source prompts.
+- **`f.text()` null guard.** Empty or `None` filing text is now logged as a warning and the filing is skipped cleanly instead of propagating a `TypeError`.
+- **`llm()` response guard.** Missing or empty `choices[0].message.content` raises a `ValueError` immediately instead of causing a silent `KeyError` retry cascade.
+- **Atomic JSON writes are now thread-safe.** `_atomic_write_json` uses per-thread unique `.tmp` filenames (`{name}.{pid}.{tid}.tmp`) — prevents file corruption under concurrent writes.
+- **`weekly_log.json` FIFO cap.** Capped at 500 entries so the log cannot grow unbounded when the digest is disabled or failing.
+- **fetch_new_filings `fetch_text=False`.** The hourly alarm probe no longer downloads full filing text from EDGAR — it only checks existence, eliminating unnecessary rate-limit exposure.
+- **`load_*` type guards.** `load_cache`, `load_price_cache`, `load_sentiment_history` return a clean `{}` instead of crashing when JSON root is the wrong type.
+- **All external network calls use `retry()`.** `fetch_yfinance_history`, `fetch_yfinance_news`, `fetch_stooq_daily`, `tg_send_document`, `tg_with_keyboard` — all now wrapped with the central `retry()` + `_backoff()` infrastructure.
+- **327 pytest tests** (up from 231 in v2.5) — characterization tests for `tg()` / `llm()` bespoke behaviour, corruption recovery, 8-K section extraction, EX-99.* collection.
+- **`/export`** — download this week's analysis log as a CSV file.
+- **`setMyCommands`** — the bot menu (`/`) is now populated via Telegram's command registry.
+- **Ticker validation.** `/addticker` and `/addgroup` reject entries that don't match `^[A-Z0-9.\-]{1,10}$`.
+- **Form input normalisation.** `SC13G`, `10k`, `def14a` and Unicode dash variants are all accepted and normalised.
+- **Config lock (`_cfg_lock`).** `get_cfg` returns a deep-copy; `update_cfg` / `reset_cfg` hold the lock across the read-modify-write cycle.
+
 ### v2.5
+- **🐛 Fix: alarm probe-only.** The hourly `/alarm` previously called the full scan pipeline in quiet mode — it silently consumed LLM quota, wrote to the cache, and announced an alert; then `/check` would return "no new filings" because the cache was already populated. The alarm now uses `probe_new_filings_for_watchlist()` which only asks EDGAR whether anything new exists and short-circuits on the first hit. Zero LLM calls, zero writes — the user runs `/check` manually after the alert.
 - **Multi-language UI** — single `bot.py` + `lang/en.json` + `lang/tr.json`, switch with `/setlang`. Replaces the old `bot_en.py` / `bot_tr.py` split.
 - **`/sentiment trend [days]`** — compare insider mood vs. N days ago, persistent history in `sentiment_history.json`.
 - **`/compare AAPL MSFT [FORM]`** — side-by-side LLM comparison of two tickers' latest filings.
+- **`/checkprice TICKER [days]`** — on-demand price summary via yfinance (optional dep). Default 7 days.
+- **`/checknews TICKER [count]`** — recent Yahoo Finance headlines + publisher direct links via yfinance.
 - **Watchlist groups** — `/addgroup`, `/removegroup`, `/listgroups`, `/scangroup`.
 - **Price action snippet** — every filing analysis gets `📈 +3.4% (filing-date → +5d)` from Stooq (free, no API key). Toggle with `/priceaction`, tune with `/setlookforward`.
 - **Wizard step 0 — language picker** — first-run setup now starts bilingual.
@@ -354,7 +393,7 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 - **Cache TTL** — entries older than `cache_max_age_days` (default 365) auto-pruned at startup.
 - **Raw-filing cap** — `/setrawmax N` enables FIFO eviction for long-running bots.
 - **MarkdownV2-safe escape** in digest snippets — characters like `*` and `_` no longer get stripped.
-- **154 pytest tests** — pure helpers, i18n, config cache, thread safety, sentiment, compare, groups, price.
+- **231 pytest tests** — pure helpers, i18n, config cache, thread safety, sentiment, compare, groups, price, alarm probe.
 - **Auto-discover languages** — drop `lang/<code>.json` and it's picked up.
 - **`build_prompt`** simplified to a dict-dispatch with form aliases.
 
