@@ -3,6 +3,7 @@
 edgartools>=3.0,<5.0      # SEC EDGAR client (Company, get_filings, set_identity)
 requests>=2.28,<3.0       # Telegram + OpenRouter + Stooq HTTP
 tzdata>=2024.1            # Required on Termux/Android for zoneinfo lookups
+python-dotenv>=1.0,<2.0   # Loads secrets from .env (see .env.example)
 
 # Optional — only needed for webhook mode (/setwebhook).
 # Uncomment if you want webhook delivery instead of long polling.
