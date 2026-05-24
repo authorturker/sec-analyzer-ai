@@ -95,7 +95,11 @@ class TestThreadSafety:
         # If lock works correctly, every increment lands.
         assert bot.status_snapshot()["total_analyzed"] == N_THREADS * N_OPS
 
-    def test_store_raw_filing_concurrent(self, bot):
+    def test_store_raw_filing_concurrent(self, bot, monkeypatch):
+        # Isolate the concern: race safety, not FIFO eviction. Force the
+        # store unlimited here — eviction is covered by TestHamMaxCap.
+        monkeypatch.setattr(bot, "_raw_cap", lambda: 0)
+
         N_THREADS = 8
         N_OPS     = 50
         results: list = []
@@ -115,7 +119,7 @@ class TestThreadSafety:
 
         # All keys distinct → no race lost a write
         assert len(set(results)) == N_THREADS * N_OPS
-        # Every key is retrievable
+        # Every key is retrievable (store is unlimited for this test)
         for k in results:
             assert bot.get_raw_filing(k) is not None
 

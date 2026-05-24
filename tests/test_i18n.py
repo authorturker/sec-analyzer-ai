@@ -39,9 +39,8 @@ class TestT:
 
     def test_format_kwargs_substituted(self, bot):
         bot._current_lang = "en"
-        out = bot.t("ticker_not_found", ticker="AAPL", error="bad")
+        out = bot.t("fetch_error_unknown", ticker="AAPL")
         assert "AAPL" in out
-        assert "bad" in out
 
     def test_missing_key_falls_back_to_english(self, bot):
         # Inject a TR-only-missing key by removing from the cached dict
@@ -67,8 +66,8 @@ class TestT:
     def test_format_failure_returns_unformatted(self, bot):
         # Use a key that requires kwargs but call without
         bot._current_lang = "en"
-        # ticker_not_found needs {ticker} and {error}
-        out = bot.t("ticker_not_found")  # no kwargs supplied
+        # fetch_error_unknown needs {ticker}
+        out = bot.t("fetch_error_unknown")  # no kwargs supplied
         # Returned string should still be the template, not raise
         assert "{ticker}" in out
 
