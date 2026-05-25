@@ -1541,6 +1541,11 @@ _FORM_MAX_CHARS: dict = {
     "8-K": 20000,   # bumped from 15000: press releases alone run 8-12K chars
 }
 
+# /compare per-side budget. Two filings share one llm() prompt (clamp ~30000).
+# 2 × 14000 = 28000 + ~500 scaffolding ≈ 28500 → safely under clamp, and wide enough
+# to capture Item 1/1A and reach Item 7 (MD&A) for 10-K, Item 1/2 for 10-Q.
+_COMPARE_PER_SIDE_MAX = 14000
+
 def analyze_filing(ticker: str, form: str, date_str: str, text: str,
                    max_chars: int, model: str,
                    custom_prompts: dict) -> tuple[str, str]:
@@ -1760,11 +1765,16 @@ def cmd_compare(parts: list):
     tg(t("compare_started", a=ticker_a, b=ticker_b, form=form))
 
     def _fetch_one(tk: str) -> tuple[str, str] | None:
+        # NOTE (H7): Do NOT pass max_chars_per here. For 10-K/10-Q the body
+        # often starts well past cfg["max_chars"] (cover page can be 8-12K
+        # chars); pre-truncating before extract_section runs leaves no Item
+        # anchors to find, so extract_section's fallback returns the cover
+        # page again. Let the full text reach extract_section; section-aware
+        # clamp happens at the LLM call site via _COMPARE_PER_SIDE_MAX.
         rows = fetch_new_filings(tk, [form],
                                  lookback_days=400,
                                  quiet=True,
-                                 n_latest=1,
-                                 max_chars_per=cfg["max_chars"])
+                                 n_latest=1)
         if not rows: return None
         f, d, txt = rows[0]
         return d, txt
@@ -1780,8 +1790,8 @@ def cmd_compare(parts: list):
     date_b, text_b = res_b
     summary = llm(
         build_compare_prompt(ticker_a, ticker_b, form,
-                             extract_section(text_a, form, cfg["max_chars"]),
-                             extract_section(text_b, form, cfg["max_chars"])),
+                             extract_section(text_a, form, _COMPARE_PER_SIDE_MAX),
+                             extract_section(text_b, form, _COMPARE_PER_SIDE_MAX)),
         cfg["model"],
     )
     tg(t("compare_header",
