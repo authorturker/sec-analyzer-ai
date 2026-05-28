@@ -421,9 +421,9 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 
 If you want to support this work, you can buy me a coffee.
 
-![Bitcoin](https://img.shields.io/badge/bitcoin-2F3134?style=for-the-badge&logo=bitcoin&logoColor=white) : 178hyCd89p2QQnyUCL5y6hpzyJqu7QHz34
+![Bitcoin](https://img.shields.io/badge/bitcoin-F7931A?style=for-the-badge&logo=bitcoin&logoColor=white) : 178hyCd89p2QQnyUCL5y6hpzyJqu7QHz34
 
-![Ethereum](https://img.shields.io/badge/Ethereum-3C3C3D?style=for-the-badge&logo=Ethereum&logoColor=white) : 0xf886b701d0abC89c2f59a8F98d1edF739D4b39a2
+![Lightning](https://img.shields.io/badge/bitcoin-BF00FF?style=for-the-badge&logo=bitcoin&logoColor=white) : turker@blink.sv
 
 ![Solana](https://img.shields.io/badge/solana-%239945FF.svg?style=for-the-badge&logo=solana&logoColor=white) : MXpoKvp1ZojjZ1fXYhgLCYfUo3R9U43jiCF8cEA1q1Y
 
