@@ -1,0 +1,20 @@
+# Runtime / environment
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+
+# Bot state files (created automatically at runtime — not in repo)
+seen.json
+cache.json
+watchword_seen.json
+*.log
+
+# Internal orchestration (not product files)
+FABLE_PLAN.md
+SONNET_REPORT.md
+*_Sablonu.md
+EXTERNAL_REVIEW.md
+.claude/
