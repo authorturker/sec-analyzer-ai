@@ -58,3 +58,29 @@ def bot():
             "total_analyzed": 0,
         })
     yield _bot
+
+
+# ── Network opt-in mechanism ─────────────────────────────────────────────────
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--network",
+        action="store_true",
+        default=False,
+        help="Run live network tests against real endpoints (EDGAR, EFTS, Stooq).",
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "network: live endpoint tests; run with --network flag",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    if not config.getoption("--network"):
+        skip_net = pytest.mark.skip(reason="needs --network flag")
+        for item in items:
+            if item.get_closest_marker("network"):
+                item.add_marker(skip_net)
