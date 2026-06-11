@@ -421,9 +421,12 @@ class TestFormatFactsBlockLabel:
 # ─── ai_enabled() not affected by fiscalai key ───────────────────────────────
 
 class TestAiEnabledUnaffected:
-    def test_fiscalai_key_alone_does_not_enable_ai(self, bot):
-        # Clear all LLM keys
-        bot.mutate_cfg(lambda c: c.update({"api_keys": {}, "default_provider": ""}))
+    def test_fiscalai_key_alone_does_not_enable_ai(self, bot, monkeypatch):
+        # Isolate all three openrouter legacy paths so only fiscalai key remains
+        monkeypatch.setattr(bot, "OPENROUTER_API_KEY", "")
+        bot.mutate_cfg(lambda c: c.update({
+            "api_keys": {}, "default_provider": "", "openrouter_api_key": ""
+        }))
         # Add only fiscalai key
         bot.mutate_cfg(lambda c: c.setdefault("api_keys", {}).update(
             {bot._FISCAL_AI_PROVIDER: "fiscalkey12345"}
