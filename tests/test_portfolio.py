@@ -263,26 +263,20 @@ class TestPnlPathProbeOnly:
         bot.mutate_cfg(lambda c: c.update({"portfolio": [
             {"ticker": "AAPL", "qty": 1.0, "cost": 150.0, "date": ""}
         ]}))
-        with patch("requests.get") as mock_get:
-            mock_resp = MagicMock()
-            mock_resp.raise_for_status.return_value = None
-            mock_resp.text = "Date,Open,High,Low,Close,Volume\n2026-06-09,185,186,184,185,1000000\n"
-            mock_get.return_value = mock_resp
-            with patch.object(bot, "llm") as mock_llm:
-                bot.cmd_pnl()
+        with patch.object(bot, "YF_OK", True):
+            with patch.object(bot, "fetch_last_close", return_value=185.0):
+                with patch.object(bot, "llm") as mock_llm:
+                    bot.cmd_pnl()
         mock_llm.assert_not_called()
 
     def test_pnl_does_not_write_cache(self, bot):
         bot.mutate_cfg(lambda c: c.update({"portfolio": [
             {"ticker": "AAPL", "qty": 1.0, "cost": 150.0, "date": ""}
         ]}))
-        with patch("requests.get") as mock_get:
-            mock_resp = MagicMock()
-            mock_resp.raise_for_status.return_value = None
-            mock_resp.text = "Date,Open,High,Low,Close,Volume\n2026-06-09,185,186,184,185,1000000\n"
-            mock_get.return_value = mock_resp
-            with patch.object(bot, "save_cache") as mock_save:
-                bot.cmd_pnl()
+        with patch.object(bot, "YF_OK", True):
+            with patch.object(bot, "fetch_last_close", return_value=185.0):
+                with patch.object(bot, "save_cache") as mock_save:
+                    bot.cmd_pnl()
         mock_save.assert_not_called()
 
 

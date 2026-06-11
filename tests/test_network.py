@@ -3,7 +3,7 @@ tests/test_network.py — Opt-in live endpoint smoke tests.
 
 Run with:  python -m pytest tests/ -q --network -m network
 
-These tests hit real external endpoints (EDGAR, EFTS, Stooq).
+These tests hit real external endpoints (EDGAR, EFTS, yfinance).
 They are SKIPPED in all normal runs (no --network flag) — CI is unaffected.
 
 Assertions target SCHEMA (field presence, type), never exact values.
@@ -131,19 +131,19 @@ class TestEftsLive:
             assert h["url"].startswith("https://")
 
 
-# ── Stooq live tests ──────────────────────────────────────────────────────────
+# ── yfinance live tests ───────────────────────────────────────────────────────
 
 @pytest.mark.network
-class TestStooqLive:
+class TestYfinanceLive:
 
     def test_aapl_price_positive(self, bot):
-        """fetch_last_close returns a positive float for AAPL."""
+        """fetch_last_close returns a positive float for AAPL via yfinance."""
         price = bot.fetch_last_close("AAPL")
         assert price is not None, "Expected a price but got None for AAPL"
         assert isinstance(price, float)
         assert price > 0.0
 
     def test_fake_ticker_returns_none(self, bot):
-        """fetch_last_close returns None for a delisted/unknown ticker (n/a path)."""
+        """fetch_last_close returns None for a nonexistent ticker (n/a path)."""
         price = bot.fetch_last_close("ZZZXXX_FAKE_9999")
         assert price is None, f"Expected None for fake ticker but got {price!r}"

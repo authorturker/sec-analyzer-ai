@@ -1,53 +1,10 @@
 """
-Tests for E1 — price action (Stooq parsing, pure compute, snippet formatting).
-Network IO (fetch_stooq_daily / compute_price_snippet) is not exercised
-here; pure helpers cover the logic.
+Tests for E1 — price action (pure compute helpers and snippet formatting).
+Network IO (compute_price_snippet) is not exercised here; pure helpers
+cover the logic. _compute_price_change accepts (date, close) pairs
+regardless of whether they came from yfinance or any other source.
 """
 import pytest
-
-
-# ─── _parse_stooq_csv ─────────────────────────────────────
-class TestParseStooqCsv:
-    def test_empty_returns_empty(self, bot):
-        assert bot._parse_stooq_csv("") == []
-        assert bot._parse_stooq_csv("   ") == []
-
-    def test_no_data_response(self, bot):
-        # Stooq returns "No data" for missing tickers / out-of-range dates
-        assert bot._parse_stooq_csv("No data") == []
-        assert bot._parse_stooq_csv("NO DATA\nfoo") == []
-
-    def test_header_only(self, bot):
-        # Just the header → no rows
-        assert bot._parse_stooq_csv("Date,Open,High,Low,Close,Volume") == []
-
-    def test_valid_csv_parsed_sorted(self, bot):
-        csv = (
-            "Date,Open,High,Low,Close,Volume\n"
-            "2026-04-03,150.0,152.0,149.0,151.20,1000000\n"
-            "2026-04-01,148.0,150.5,147.5,149.50,950000\n"
-            "2026-04-02,149.5,151.0,149.0,150.10,1100000\n"
-        )
-        rows = bot._parse_stooq_csv(csv)
-        # Sorted ascending by date
-        assert [r[0] for r in rows] == ["2026-04-01", "2026-04-02", "2026-04-03"]
-        # Close prices are floats
-        assert rows[0][1] == pytest.approx(149.50)
-        assert rows[2][1] == pytest.approx(151.20)
-
-    def test_skips_malformed_rows(self, bot):
-        csv = (
-            "Date,Open,High,Low,Close,Volume\n"
-            "2026-04-01,150.0,152.0,149.0,151.20,1000000\n"
-            "garbage line\n"
-            "2026-04-02,148,150,147,not-a-float,900000\n"
-            "2026-04-03,149,151,148,150.00,1100000\n"
-        )
-        rows = bot._parse_stooq_csv(csv)
-        # Only the two valid rows remain
-        assert len(rows) == 2
-        assert rows[0][0] == "2026-04-01"
-        assert rows[1][0] == "2026-04-03"
 
 
 # ─── _compute_price_change ────────────────────────────────

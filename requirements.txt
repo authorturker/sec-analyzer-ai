@@ -1,7 +1,7 @@
 # Core runtime dependencies.
 # Pinned to minor-major bounds known to work; minor bumps are safe.
 edgartools>=3.0,<6.0      # SEC EDGAR client (Company, get_filings, set_identity)
-requests>=2.28,<3.0       # Telegram + OpenRouter + Stooq HTTP
+requests>=2.28,<3.0       # Telegram + OpenRouter HTTP
 tzdata>=2024.1            # Required on Termux/Android for zoneinfo lookups
 python-dotenv>=1.0,<2.0   # Loads secrets from .env (see .env.example)
 
@@ -9,7 +9,7 @@ python-dotenv>=1.0,<2.0   # Loads secrets from .env (see .env.example)
 # Uncomment if you want webhook delivery instead of long polling.
 # flask>=3.0,<4.0
 
-# Optional — only needed for /checkprice and /checknews commands.
+# Optional — only needed for /checkprice, /checknews, /pnl and filing price-change.
 # Adds ~50 MB (pandas + numpy + curl_cffi); skip on tight Termux installs.
 # yfinance>=0.2,<2.0
 

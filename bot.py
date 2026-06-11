@@ -506,37 +506,16 @@ def mark_processed(ob, *args):
     ob[cache_key(*args)] = {"at": datetime.now().isoformat()}
 
 # ─── Price action (E1) ────────────────────────────────────
-# Uses Stooq's free daily CSV endpoint — no API key, no extra deps.
+# Uses yfinance (optional dep — same as /checkprice and /checknews).
+# When yfinance is absent, price snippets are silently omitted.
 # Layout of price_cache.json:
 #   {"AAPL_2026-04-01_5": {start_date, start_close, end_date, end_close, pct}}
 # Cache key bakes in the lookforward so changing the config never serves stale.
 
-_STOOQ_URL = "https://stooq.com/q/d/l/?s={ticker}.us&i=d&d1={d1}&d2={d2}"
-
-def _parse_stooq_csv(text: str) -> list:
-    """PURE: parse Stooq daily CSV → sorted list of (YYYY-MM-DD, close)."""
-    if not text or text.strip().lower().startswith("no data"):
-        return []
-    lines = text.strip().split("\n")
-    if len(lines) < 2:
-        return []
-    rows = []
-    for ln in lines[1:]:
-        cols = ln.split(",")
-        if len(cols) < 5:
-            continue
-        try:
-            close = float(cols[4])
-        except (ValueError, IndexError):
-            continue
-        rows.append((cols[0], close))
-    rows.sort()
-    return rows
-
 def _compute_price_change(rows: list, filing_date: str,
                           lookforward_days: int) -> dict | None:
     """
-    PURE: given parsed Stooq rows, find close on/after filing_date and close on
+    PURE: given (date, close) rows, find close on/after filing_date and close on
     or after filing_date + lookforward_days. Return change dict or None.
     """
     if not rows:
@@ -572,19 +551,6 @@ def _format_price_snippet(change: dict | None) -> str:
              start_date=change["start_date"],
              end_date=change["end_date"])
 
-def fetch_stooq_daily(ticker: str, start_date: str, end_date: str) -> str | None:
-    """IO: fetch Stooq daily CSV for a ticker over a date range."""
-    url = _STOOQ_URL.format(
-        ticker=ticker.lower(),
-        d1=start_date.replace("-", ""),
-        d2=end_date.replace("-", ""),
-    )
-    def _call():
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        return r.text
-    return retry(_call, attempts=2, base=3, cap=15, label=f"Stooq {ticker}")
-
 def load_price_cache() -> dict:
     with _price_lock:
         data = _read_json(PRICE_CACHE, {})
@@ -607,20 +573,27 @@ def compute_price_snippet(ticker: str, filing_date: str) -> str:
     except (ValueError, TypeError):
         lookforward = 5
 
+    if not YF_OK:
+        return ""
+
     cache = load_price_cache()
     cache_k = f"{ticker}_{filing_date}_{lookforward}"
     if cache_k in cache:
         return _format_price_snippet(cache[cache_k])
 
-    # Pad the window so we still find data even if filing fell on a weekend.
+    # Fetch enough history to cover from filing_date to filing_date + lookforward.
+    # yfinance history() is relative to today, so compute calendar days needed.
     try:
-        end_dt = datetime.fromisoformat(filing_date) + timedelta(days=lookforward + 14)
+        filing_dt = datetime.fromisoformat(filing_date)
     except Exception:
         return ""
-    csv = fetch_stooq_daily(ticker, filing_date, end_dt.strftime("%Y-%m-%d"))
-    if not csv:
+    days_needed = max(30, (datetime.now() - filing_dt).days + lookforward + 20)
+    rows_raw = fetch_yfinance_history(ticker, days_needed)
+    if not rows_raw:
         return ""
-    change = _compute_price_change(_parse_stooq_csv(csv), filing_date, lookforward)
+    # _compute_price_change expects [(date_str, close), ...] pairs.
+    rows = [(r[0], r[4]) for r in rows_raw]
+    change = _compute_price_change(rows, filing_date, lookforward)
     if not change:
         return ""
     cache[cache_k] = change
@@ -3015,7 +2988,7 @@ def cmd_listwords() -> str:
 
 # ─── Portfolio P&L (G2) ───────────────────────────────────
 # Unrealized P&L only (v1). No sell/realize tracking.
-# Price source: Stooq (zero new dependencies — Termux principle).
+# Price source: yfinance (optional dep — same as /checkprice and /checknews).
 # Storage: cfg["portfolio"] = list of lot dicts.
 # All pure helpers are IO-free and offline-testable.
 
@@ -3163,19 +3136,19 @@ def _fmt_qty(qty: float) -> str:
 
 
 def fetch_last_close(ticker: str) -> "float | None":
-    """THIN IO: Stooq last 7 calendar days → most recent close. Any exception → None."""
+    """THIN IO: yfinance last 5 trading days → most recent close. Any exception → None."""
+    if not YF_OK:
+        return None
     try:
-        end   = datetime.now()
-        start = end - timedelta(days=7)
-        url   = _STOOQ_URL.format(
-            ticker=ticker.lower(),
-            d1=start.strftime("%Y%m%d"),
-            d2=end.strftime("%Y%m%d"),
-        )
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        rows = _parse_stooq_csv(resp.text)
-        return rows[-1][1] if rows else None
+        def _call():
+            h = yf.Ticker(ticker).history(period="5d")
+            if h is None or h.empty:
+                return None
+            closes = h["Close"].dropna()
+            return float(closes.iloc[-1]) if not closes.empty else None
+        return retry(_call, attempts=2, base=3, cap=15,
+                     label=f"last_close {ticker}",
+                     on_error=lambda e, a: status_inc("yf_errors"))
     except Exception as e:
         log.debug(f"fetch_last_close({ticker!r}): {e}")
         return None
@@ -3226,6 +3199,8 @@ def cmd_removepos(parts: list) -> str:
 
 
 def cmd_pnl() -> str:
+    if not YF_OK:
+        return t("yfinance_missing", cmd="/pnl")
     cfg  = get_cfg()
     lots = cfg.get("portfolio", [])
     if not lots:
