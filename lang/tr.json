@@ -243,5 +243,17 @@
   "pnl_row": "• `{ticker}` ×{qty} @ ${avg_cost:.2f} → ${value:,.2f} {emoji} {pnl_usd:+,.2f} ({pnl_pct})",
   "pnl_row_na": "• `{ticker}` ×{qty} @ ${avg_cost:.2f} — n/a",
   "pnl_total": "\n*Toplam:* ${value:,.2f} {emoji} {pnl_usd:+,.2f} ({pnl_pct})",
-  "pnl_na_note": "_{count} pozisyon hariç tutuldu (fiyat alınamadı)_"
+  "pnl_na_note": "_{count} pozisyon hariç tutuldu (fiyat alınamadı)_",
+  "addchat_confirm": "✅ `{id}` numaralı chat yetkili listeye eklendi.",
+  "addchat_limit": "⚠️ Sınıra ulaşıldı (maksimum {max} chat). Önce /removechat ile bir chat silin.",
+  "addchat_format_error": "⚠️ Geçersiz chat ID — tam sayı olmalıdır. Kullanım: /addchat <id>",
+  "addchat_already_exists": "ℹ️ `{id}` numaralı chat zaten yetkili.",
+  "removechat_confirm": "✅ `{id}` numaralı chat yetkili listeden çıkarıldı.",
+  "removechat_not_found": "⚠️ `{id}` numaralı chat yetkili listede yok.",
+  "removechat_self_remove": "⚠️ Kendi yönetici chat'inizi silemezsiniz.",
+  "removechat_format_error": "⚠️ Geçersiz chat ID — tam sayı olmalıdır. Kullanım: /removechat <id>",
+  "listchats_header": "*Yetkili chatler:*",
+  "listchats_row": "{n}. `{id}`{admin}",
+  "listchats_empty": "Yetkili chat yapılandırılmamış.",
+  "unauthorized_admin": "⚠️ Bu komut yalnızca yönetici chat'ine özeldir."
 }

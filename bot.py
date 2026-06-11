@@ -73,6 +73,7 @@ _price_lock  = threading.Lock()     # price_cache.json
 _alarm_lock      = threading.Lock()     # _pending_alarms (interactive alarm)
 _watchword_lock  = threading.Lock()     # watchword_seen.json dedup state (G1)
 _stop_event  = threading.Event()
+_ctx         = threading.local()    # per-thread reactive context (I1): _ctx.chat_id
 
 # ─── Status dict (thread-safe via _status_lock) ────────────
 _status = {
@@ -228,6 +229,8 @@ def validate_edgar_identity(identity: str) -> tuple[bool, str]:
                        f"(got: {s!r}).")
     return True, "ok"
 
+_CHAT_MAX = 5   # max authorized chat IDs (I1)
+
 # ─── Config (in-memory cache + atomic mutation) ───────────
 # Source of truth lives in `_cfg_cache`. Disk is the persistence layer,
 # read once on startup and written through on every change.
@@ -253,6 +256,7 @@ _CFG_DEFAULTS = {
     "price_lookforward_days": 5,    # days after filing for price change measurement
     "watchwords":             [],   # EDGAR full-text keyword phrases (G1); max 10
     "portfolio":              [],   # unrealized P&L lots (G2); max 50
+    "chat_ids":               [],   # authorized chat ID list (I1); first = admin
 }
 _cfg_cache: dict | None = None
 
@@ -352,6 +356,40 @@ def get_cfg_value(key: str, default=None):
     """Read a single top-level config key under _cfg_lock — no deep-copy overhead."""
     with _cfg_lock:
         return _load_cfg_locked().get(key, default)
+
+# ─── Chat ID authorization helpers (I1) ──────────────────
+
+def _is_authorized(chat_id: str) -> bool:
+    """Return True if chat_id is in the authorized chat_ids list."""
+    return str(chat_id) in [str(c) for c in get_cfg().get("chat_ids", [])]
+
+def _is_admin(chat_id: str) -> bool:
+    """Return True if chat_id is the first (admin) entry in chat_ids."""
+    ids = get_cfg().get("chat_ids", [])
+    return bool(ids) and str(chat_id) == str(ids[0])
+
+def _migrate_chat_ids():
+    """Startup: ensure chat_ids list exists.
+
+    Migration order:
+    1. chat_ids already present → idempotent; remove stale scalar key if any.
+    2. Legacy 'chat_id' scalar key in config → promote to list.
+    3. TELEGRAM_CHAT_ID env var valid → bootstrap list.
+    4. Nothing available → leave empty; first incoming chat will fill it via wizard.
+    """
+    def _do(c: dict):
+        if c.get("chat_ids"):                                 # already migrated
+            c.pop("chat_id", None)                           # clean stale key
+            return
+        legacy = c.pop("chat_id", None)
+        seed = legacy or (
+            TELEGRAM_CHAT_ID
+            if TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID != "YOUR_CHAT_ID"
+            else None
+        )
+        if seed:
+            c["chat_ids"] = [str(seed)]
+    mutate_cfg(_do)
 
 # ─── i18n ─────────────────────────────────────────────────
 _lang_cache: dict = {}        # code → full strings dict
@@ -867,14 +905,14 @@ def _split_message(text: str, limit: int = _TG_LIMIT) -> list:
         parts.append(current)
     return parts
 
-def tg(text: str):
-    """Send a Telegram message (chunked, exponential backoff, Markdown fallback)."""
+def _tg_to(chat_id: str, text: str):
+    """Primitive: send `text` to one specific Telegram chat (chunked, backoff, Markdown fallback)."""
     for part in _split_message(text):
         sent = False
         for attempt in range(4):
             try:
                 r = requests.post(f"{_TG}/sendMessage", json={
-                    "chat_id": TELEGRAM_CHAT_ID,
+                    "chat_id": chat_id,
                     "text": part.strip(),
                     "parse_mode": "Markdown",
                     "disable_web_page_preview": True,
@@ -887,7 +925,7 @@ def tg(text: str):
                     # Markdown invalid — retry as plain text
                     log.warning("Markdown parse error — retrying as plain text")
                     r2 = requests.post(f"{_TG}/sendMessage", json={
-                        "chat_id": TELEGRAM_CHAT_ID,
+                        "chat_id": chat_id,
                         "text": part.strip(),
                         "disable_web_page_preview": True,
                     }, timeout=15)
@@ -915,13 +953,34 @@ def tg(text: str):
                              "message lost. Check network / bot token.\n")
         time.sleep(0.3)
 
-def tg_send_document(filename: str, content: str, caption: str = ""):
-    """Send a document over Telegram (no temp file, BytesIO)."""
-    url  = f"{_TG}/sendDocument"
-    raw  = content.encode("utf-8")
+def broadcast(text: str):
+    """Send `text` to ALL authorized chat_ids (proactive/background messages).
+    Each chat's failure is isolated — one blocked bot does not stop the rest."""
+    for cid in get_cfg().get("chat_ids", []):
+        try:
+            _tg_to(str(cid), text)
+        except Exception as e:
+            log.debug(f"broadcast to {cid}: {e}")
+
+def tg(text: str):
+    """Send a Telegram message.
+
+    Reactive context (inside handle_update): sends only to the requesting chat.
+    No context (background thread / startup): broadcasts to all chat_ids.
+    """
+    cid = getattr(_ctx, "chat_id", None)
+    if cid:
+        _tg_to(cid, text)
+    else:
+        broadcast(text)
+
+def _tg_send_document_to(chat_id: str, filename: str, content: str, caption: str = ""):
+    """Primitive: send a document to one specific chat."""
+    url = f"{_TG}/sendDocument"
+    raw = content.encode("utf-8")
     def _call():
         r = requests.post(url, data={
-            "chat_id": TELEGRAM_CHAT_ID,
+            "chat_id": chat_id,
             "caption": caption[:1024] if caption else "",
             "parse_mode": "Markdown",
         }, files={
@@ -930,6 +989,16 @@ def tg_send_document(filename: str, content: str, caption: str = ""):
         r.raise_for_status()
     retry(_call, attempts=3, base=5, cap=30, label=f"tg_send_document:{filename}",
           on_error=lambda e, a: status_inc("tg_errors"))
+
+def tg_send_document(filename: str, content: str, caption: str = ""):
+    """Send a document to the reactive context chat, or broadcast if no context."""
+    cid = getattr(_ctx, "chat_id", None)
+    chats = [cid] if cid else [str(c) for c in get_cfg().get("chat_ids", [])]
+    for chat in chats:
+        try:
+            _tg_send_document_to(str(chat), filename, content, caption)
+        except Exception as e:
+            log.debug(f"tg_send_document to {chat}: {e}")
 
 def tg_answer_callback(callback_id: str, text: str = ""):
     """Acknowledge an inline-button callback (Telegram requirement)."""
@@ -988,8 +1057,8 @@ def build_inline_button(raw_key: str) -> dict:
         ]]
     }
 
-def tg_with_keyboard(text: str, keyboard: dict | None):
-    """Send a (chunked) message; attach `keyboard` to the LAST chunk only."""
+def _tg_with_keyboard_to(chat_id: str, text: str, keyboard: dict | None):
+    """Primitive: send a (chunked) message with keyboard to one specific chat."""
     parts, current = [], ""
     for line in text.split("\n"):
         if len(current) + len(line) + 1 > 4000:
@@ -1000,7 +1069,7 @@ def tg_with_keyboard(text: str, keyboard: dict | None):
 
     for i, part in enumerate(parts):
         payload: dict = {
-            "chat_id": TELEGRAM_CHAT_ID,
+            "chat_id": chat_id,
             "text": part.strip(),
             "parse_mode": "Markdown",
             "disable_web_page_preview": True,
@@ -1018,6 +1087,16 @@ def tg_with_keyboard(text: str, keyboard: dict | None):
         retry(_send, attempts=3, base=3, cap=30, label="tg_with_keyboard",
               on_error=lambda e, a: status_inc("tg_errors"))
         time.sleep(0.3)
+
+def tg_with_keyboard(text: str, keyboard: dict | None):
+    """Send message+keyboard to the reactive context chat, or broadcast if no context."""
+    cid = getattr(_ctx, "chat_id", None)
+    chats = [cid] if cid else [str(c) for c in get_cfg().get("chat_ids", [])]
+    for chat in chats:
+        try:
+            _tg_with_keyboard_to(str(chat), text, keyboard)
+        except Exception as e:
+            log.debug(f"tg_with_keyboard to {chat}: {e}")
 
 def tg_with_button(text: str, raw_key: str):
     """Send an analysis message with its inline buttons (view raw + .md)."""
@@ -2986,6 +3065,56 @@ def cmd_listwords() -> str:
     )
 
 
+# ─── Multi-chat admin commands (I1) ───────────────────────
+
+def cmd_addchat(parts: list, caller_id: str) -> str:
+    """Add a new authorized chat ID. Admin only. Usage: /addchat <id>"""
+    if len(parts) < 2:
+        return t("addchat_format_error")
+    try:
+        new_id = str(int(parts[1]))          # validate: must be an integer
+    except ValueError:
+        return t("addchat_format_error")
+    ids = [str(c) for c in get_cfg().get("chat_ids", [])]
+    if len(ids) >= _CHAT_MAX:
+        return t("addchat_limit", max=_CHAT_MAX)
+    if new_id in ids:
+        return t("addchat_already_exists", id=new_id)
+    mutate_cfg(lambda c: c["chat_ids"].append(new_id))
+    return t("addchat_confirm", id=new_id)
+
+
+def cmd_removechat(parts: list, caller_id: str) -> str:
+    """Remove an authorized chat ID. Admin only. Usage: /removechat <id>"""
+    if len(parts) < 2:
+        return t("removechat_format_error")
+    try:
+        rem_id = str(int(parts[1]))
+    except ValueError:
+        return t("removechat_format_error")
+    if rem_id == str(caller_id):
+        return t("removechat_self_remove")
+    ids = [str(c) for c in get_cfg().get("chat_ids", [])]
+    if rem_id not in ids:
+        return t("removechat_not_found", id=rem_id)
+    def _remove(c: dict):
+        c["chat_ids"] = [x for x in c.get("chat_ids", []) if str(x) != rem_id]
+    mutate_cfg(_remove)
+    return t("removechat_confirm", id=rem_id)
+
+
+def cmd_listchats() -> str:
+    """List all authorized chat IDs. Admin only."""
+    ids = get_cfg().get("chat_ids", [])
+    if not ids:
+        return t("listchats_empty")
+    rows = []
+    for i, cid in enumerate(ids):
+        rows.append(t("listchats_row", n=i + 1, id=cid,
+                      admin=" ⭐" if i == 0 else ""))
+    return t("listchats_header") + "\n" + "\n".join(rows)
+
+
 # ─── Portfolio P&L (G2) ───────────────────────────────────
 # Unrealized P&L only (v1). No sell/realize tracking.
 # Price source: yfinance (optional dep — same as /checkprice and /checknews).
@@ -3491,24 +3620,30 @@ def _process_update(upd: dict):
     cq = upd.get("callback_query")
     if cq:
         chat_id = str(cq.get("from", {}).get("id", ""))
-        if chat_id == str(TELEGRAM_CHAT_ID):
-            data = cq.get("data", "")
-            if data.startswith("raw:"):
-                send_raw_filing(cq["id"], data[4:])
-            elif data.startswith("md:"):
-                send_md_for_key(cq["id"], data[3:])
-            elif data.startswith("analyzeall:"):
-                handle_analyzeall_callback(cq, data[len("analyzeall:"):])
-            elif data.startswith("analyze:"):
-                # callback_data form: "analyze:{token}:{idx}"
-                token, _, idx_str = data[len("analyze:"):].rpartition(":")
-                try:
-                    idx = int(idx_str)
-                except ValueError:
-                    idx = -1
-                handle_analyze_callback(cq, token, idx)
-            else:
-                tg_answer_callback(cq["id"])
+        if _is_authorized(chat_id):
+            _ctx.chat_id = chat_id
+            try:
+                data = cq.get("data", "")
+                if data.startswith("raw:"):
+                    send_raw_filing(cq["id"], data[4:])
+                elif data.startswith("md:"):
+                    send_md_for_key(cq["id"], data[3:])
+                elif data.startswith("analyzeall:"):
+                    handle_analyzeall_callback(cq, data[len("analyzeall:"):])
+                elif data.startswith("analyze:"):
+                    # callback_data form: "analyze:{token}:{idx}"
+                    token, _, idx_str = data[len("analyze:"):].rpartition(":")
+                    try:
+                        idx = int(idx_str)
+                    except ValueError:
+                        idx = -1
+                    handle_analyze_callback(cq, token, idx)
+                else:
+                    tg_answer_callback(cq["id"])
+            finally:
+                _ctx.chat_id = None
+        else:
+            log.debug(f"Unauthorized callback from chat_id={chat_id}")
         return
 
     # Normal message
@@ -3519,81 +3654,97 @@ def _process_update(upd: dict):
     parts = raw.split()
     komut   = parts[0].lower() if parts else ""
 
-    if chat_id != str(TELEGRAM_CHAT_ID): return
-    if wizard_handle(text, parts):   return
+    if not _is_authorized(chat_id):
+        log.debug(f"Unauthorized message from chat_id={chat_id}")
+        return
+    _ctx.chat_id = chat_id
+    try:
+        if wizard_handle(text, parts):   return
 
-    # Tickers
-    if   komut == "/addticker":      tg(cmd_addticker(parts))
-    elif komut == "/removeticker":   tg(cmd_removeticker(parts))
-    elif komut == "/listtickers":    tg(cmd_listtickers())
-    # Groups
-    elif komut == "/addgroup":       tg(cmd_addgroup(parts))
-    elif komut == "/removegroup":    tg(cmd_removegroup(parts))
-    elif komut == "/listgroups":     tg(cmd_listgroups())
-    elif komut == "/scangroup":      cmd_scangroup(parts)
-    # Forms
-    elif komut == "/listforms":      tg(cmd_listforms())
-    elif komut == "/addform":        tg(cmd_addform(parts))
-    elif komut == "/removeform":     tg(cmd_removeform(parts))
-    # Watchwords (G1)
-    elif komut == "/addword":        tg(cmd_addword(parts))
-    elif komut == "/removeword":     tg(cmd_removeword(parts))
-    elif komut == "/listwords":      tg(cmd_listwords())
-    # Portfolio P&L (G2)
-    elif komut == "/addpos":         tg(cmd_addpos(parts))
-    elif komut == "/removepos":      tg(cmd_removepos(parts))
-    elif komut == "/pnl":            tg(cmd_pnl())
-    # Custom prompts
-    elif komut == "/setprompt":      tg(cmd_setprompt(parts))
-    elif komut == "/getprompt":      tg(cmd_getprompt(parts))
-    elif komut == "/resetprompt":    tg(cmd_resetprompt(parts))
-    elif komut == "/listprompts":    tg(cmd_listprompts())
-    # Schedule, alarm, digest
-    elif komut == "/setschedule":    tg(cmd_setschedule(parts))
-    elif komut == "/alarm":          tg(cmd_alarm(parts))
-    elif komut == "/digest":
-        r = cmd_digest(parts)
-        if r: tg(r)
-    # Report / export
-    elif komut == "/report":         cmd_report()
-    elif komut == "/export":         cmd_export()
-    # Webhook
-    elif komut == "/setwebhook":     tg(cmd_setwebhook(parts))
-    elif komut == "/delwebhook":     tg(cmd_delwebhook())
-    # Settings, status, language
-    elif komut == "/settings":       tg(cmd_settings())
-    elif komut == "/status":         tg(cmd_status())
-    elif komut == "/setlang":        tg(cmd_setlang(parts))
-    elif komut == "/setmodel":       tg(cmd_setmodel(parts))
-    elif komut == "/setlookback":    tg(cmd_setlookback(parts))
-    elif komut == "/setchars":       tg(cmd_setchars(parts))
-    elif komut == "/setrawmax":      tg(cmd_setrawmax(parts))
-    elif komut == "/priceaction":    tg(cmd_priceaction(parts))
-    elif komut == "/setlookforward": tg(cmd_setlookforward(parts))
-    # On-demand scan
-    elif komut == "/scanticker":     cmd_scanticker(parts)
-    elif komut == "/compare":        cmd_compare(parts)
-    elif komut == "/checkprice":     cmd_checkprice(parts)
-    elif komut == "/checknews":      cmd_checknews(parts)
-    # Help
-    elif text in ["/start", "/help"]:
-        tg(help_msg())
-    # Sentiment
-    elif any(s in text for s in ["/sentiment", "sentiment", "sentiment score"]):
-        if len(parts) >= 2 and parts[1].lower() == "trend":
-            cmd_sentiment_trend(parts)
-        else:
-            cmd_sentiment()
-    # Combined scan
-    elif any(s in text for s in ["check all","scan all","everything","/all"]):
-        cmd_sec(); cmd_insider()
-    # Insider only
-    elif any(s in text for s in ["insider","form4","/insider","/form4"]):
-        cmd_insider()
-    # Default scan
-    elif any(s in text for s in ["any news","check","scan","sec",
-                                   "filings","/sec","/check","/scan"]):
-        cmd_sec()
+        # Tickers
+        if   komut == "/addticker":      tg(cmd_addticker(parts))
+        elif komut == "/removeticker":   tg(cmd_removeticker(parts))
+        elif komut == "/listtickers":    tg(cmd_listtickers())
+        # Groups
+        elif komut == "/addgroup":       tg(cmd_addgroup(parts))
+        elif komut == "/removegroup":    tg(cmd_removegroup(parts))
+        elif komut == "/listgroups":     tg(cmd_listgroups())
+        elif komut == "/scangroup":      cmd_scangroup(parts)
+        # Forms
+        elif komut == "/listforms":      tg(cmd_listforms())
+        elif komut == "/addform":        tg(cmd_addform(parts))
+        elif komut == "/removeform":     tg(cmd_removeform(parts))
+        # Watchwords (G1)
+        elif komut == "/addword":        tg(cmd_addword(parts))
+        elif komut == "/removeword":     tg(cmd_removeword(parts))
+        elif komut == "/listwords":      tg(cmd_listwords())
+        # Portfolio P&L (G2)
+        elif komut == "/addpos":         tg(cmd_addpos(parts))
+        elif komut == "/removepos":      tg(cmd_removepos(parts))
+        elif komut == "/pnl":            tg(cmd_pnl())
+        # Multi-chat admin (I1)
+        elif komut == "/addchat":
+            if _is_admin(chat_id):  tg(cmd_addchat(parts, chat_id))
+            else:                   tg(t("unauthorized_admin"))
+        elif komut == "/removechat":
+            if _is_admin(chat_id):  tg(cmd_removechat(parts, chat_id))
+            else:                   tg(t("unauthorized_admin"))
+        elif komut == "/listchats":
+            if _is_admin(chat_id):  tg(cmd_listchats())
+            else:                   tg(t("unauthorized_admin"))
+        # Custom prompts
+        elif komut == "/setprompt":      tg(cmd_setprompt(parts))
+        elif komut == "/getprompt":      tg(cmd_getprompt(parts))
+        elif komut == "/resetprompt":    tg(cmd_resetprompt(parts))
+        elif komut == "/listprompts":    tg(cmd_listprompts())
+        # Schedule, alarm, digest
+        elif komut == "/setschedule":    tg(cmd_setschedule(parts))
+        elif komut == "/alarm":          tg(cmd_alarm(parts))
+        elif komut == "/digest":
+            r = cmd_digest(parts)
+            if r: tg(r)
+        # Report / export
+        elif komut == "/report":         cmd_report()
+        elif komut == "/export":         cmd_export()
+        # Webhook
+        elif komut == "/setwebhook":     tg(cmd_setwebhook(parts))
+        elif komut == "/delwebhook":     tg(cmd_delwebhook())
+        # Settings, status, language
+        elif komut == "/settings":       tg(cmd_settings())
+        elif komut == "/status":         tg(cmd_status())
+        elif komut == "/setlang":        tg(cmd_setlang(parts))
+        elif komut == "/setmodel":       tg(cmd_setmodel(parts))
+        elif komut == "/setlookback":    tg(cmd_setlookback(parts))
+        elif komut == "/setchars":       tg(cmd_setchars(parts))
+        elif komut == "/setrawmax":      tg(cmd_setrawmax(parts))
+        elif komut == "/priceaction":    tg(cmd_priceaction(parts))
+        elif komut == "/setlookforward": tg(cmd_setlookforward(parts))
+        # On-demand scan
+        elif komut == "/scanticker":     cmd_scanticker(parts)
+        elif komut == "/compare":        cmd_compare(parts)
+        elif komut == "/checkprice":     cmd_checkprice(parts)
+        elif komut == "/checknews":      cmd_checknews(parts)
+        # Help
+        elif text in ["/start", "/help"]:
+            tg(help_msg())
+        # Sentiment
+        elif any(s in text for s in ["/sentiment", "sentiment", "sentiment score"]):
+            if len(parts) >= 2 and parts[1].lower() == "trend":
+                cmd_sentiment_trend(parts)
+            else:
+                cmd_sentiment()
+        # Combined scan
+        elif any(s in text for s in ["check all","scan all","everything","/all"]):
+            cmd_sec(); cmd_insider()
+        # Insider only
+        elif any(s in text for s in ["insider","form4","/insider","/form4"]):
+            cmd_insider()
+        # Default scan
+        elif any(s in text for s in ["any news","check","scan","sec",
+                                       "filings","/sec","/check","/scan"]):
+            cmd_sec()
+    finally:
+        _ctx.chat_id = None
 
 
 def run_startup_checks() -> list:
@@ -3623,9 +3774,12 @@ def run_startup_checks() -> list:
         issues.append("TELEGRAM_BOT_TOKEN is missing or malformed "
                        "(expected '123456:ABC...') — set it in your .env file.")
 
-    if not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID":
-        issues.append("TELEGRAM_CHAT_ID is missing or still the placeholder "
-                       "— set it in your .env file.")
+    cfg_chat_ids = get_cfg_value("chat_ids", [])
+    if not cfg_chat_ids:
+        # First run: need TELEGRAM_CHAT_ID to bootstrap chat_ids list.
+        if not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID":
+            issues.append("TELEGRAM_CHAT_ID is missing or still the placeholder "
+                           "— set it in your .env file.")
 
     if not LANG_DIR.exists():
         issues.append(f"Language directory not found: {LANG_DIR}")
@@ -3659,6 +3813,10 @@ def main():
     # Prime the lang cache early
     _ = get_lang()
     register_bot_commands()
+
+    # Migrate scalar chat_id → chat_ids list (I1). Idempotent.
+    _migrate_chat_ids()
+    log.info(f"Authorized chats: {get_cfg_value('chat_ids', [])}")
 
     bg = threading.Thread(target=background_thread, daemon=True)
     bg.start()

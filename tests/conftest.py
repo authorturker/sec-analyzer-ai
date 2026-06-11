@@ -57,7 +57,11 @@ def bot():
             "last_alarm":     None,
             "total_analyzed": 0,
         })
+    # Simulate a reactive context so tg() routes through _tg_to() in tests.
+    # Tests that need broadcast behavior set _ctx.chat_id = None explicitly.
+    _bot._ctx.chat_id = "0"
     yield _bot
+    _bot._ctx.chat_id = None
 
 
 # ── Network opt-in mechanism ─────────────────────────────────────────────────

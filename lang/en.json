@@ -243,5 +243,17 @@
   "pnl_row": "• `{ticker}` ×{qty} @ ${avg_cost:.2f} → ${value:,.2f} {emoji} {pnl_usd:+,.2f} ({pnl_pct})",
   "pnl_row_na": "• `{ticker}` ×{qty} @ ${avg_cost:.2f} — n/a",
   "pnl_total": "\n*Total:* ${value:,.2f} {emoji} {pnl_usd:+,.2f} ({pnl_pct})",
-  "pnl_na_note": "_{count} position(s) excluded (price unavailable)_"
+  "pnl_na_note": "_{count} position(s) excluded (price unavailable)_",
+  "addchat_confirm": "✅ Chat `{id}` added to authorized list.",
+  "addchat_limit": "⚠️ Limit reached ({max} chats max). Remove one with /removechat first.",
+  "addchat_format_error": "⚠️ Invalid chat ID — must be an integer. Usage: /addchat <id>",
+  "addchat_already_exists": "ℹ️ Chat `{id}` is already authorized.",
+  "removechat_confirm": "✅ Chat `{id}` removed from authorized list.",
+  "removechat_not_found": "⚠️ Chat `{id}` is not in the authorized list.",
+  "removechat_self_remove": "⚠️ You cannot remove your own admin chat.",
+  "removechat_format_error": "⚠️ Invalid chat ID — must be an integer. Usage: /removechat <id>",
+  "listchats_header": "*Authorized chats:*",
+  "listchats_row": "{n}. `{id}`{admin}",
+  "listchats_empty": "No authorized chats configured.",
+  "unauthorized_admin": "⚠️ This command is restricted to the admin chat."
 }
