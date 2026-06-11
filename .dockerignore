@@ -1,0 +1,36 @@
+# Version control
+.git
+.github
+
+# Tests (not needed at runtime)
+tests/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets — pass at runtime with: docker run --env-file .env
+.env
+
+# Runtime state files — mount a volume to persist across restarts
+seen.json
+cache.json
+watchword_seen.json
+price_cache.json
+bot_config.json
+weekly_log.json
+sentiment_history.json
+
+# Internal orchestration (not part of the product)
+FABLE_PLAN.md
+SONNET_REPORT.md
+*_Sablonu.md
+EXTERNAL_REVIEW.md
+.claude/
+
+# Dev tooling
+.pytest_cache/
+venv/
+.venv/
+*.log

@@ -9,7 +9,8 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)](https://python.org)
 [![OpenRouter](https://img.shields.io/badge/LLM-OpenRouter%20Free-6c47ff)](https://openrouter.ai)
 [![Telegram](https://img.shields.io/badge/Interface-Telegram-2CA5E0?logo=telegram&logoColor=white)](https://telegram.org)
-[![Tests](https://img.shields.io/badge/tests-477%20passing-success)](#-tests)
+[![CI](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-472%20passing-success)](#-tests)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 </div>
@@ -43,8 +44,8 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 | 🧾 **Grounded Analysis** | 10-K/10-Q/20-F analyses are grounded in audited XBRL facts injected into the prompt |
 | ✅ **Numeric Verification** | Figures in the LLM output are checked against XBRL facts and the filing text; unverifiable ones are flagged with ⚠️ |
 | 🔎 **Keyword Alerts** | Watch any phrase across ALL EDGAR filings (`/addword`); hourly full-text search alert, no LLM cost |
-| 💼 **Portfolio P&L** | Track positions with `/addpos`; `/pnl` shows unrealized profit/loss per ticker (Stooq, no API key) |
-| 🧪 **Tested** | 477 pytest tests for pure helpers, i18n, config cache, thread safety |
+| 💼 **Portfolio P&L** | Track positions with `/addpos`; `/pnl` shows unrealized profit/loss per ticker (yfinance, optional dep) |
+| 🧪 **Tested** | 472 pytest tests for pure helpers, i18n, config cache, thread safety |
 | ⚡ **OpenRouter Free LLM** | openrouter/free, $0 cost |
 | 📱 **Lightweight** | Single 1.8k-line `bot.py`, runs on a mid-range Android phone via Termux |
 
@@ -58,11 +59,16 @@ sec-analyzer/
 ├── config.py                    # Thin loader — reads secrets from .env
 ├── .env.example                 # Secrets template — copy to .env, fill in
 ├── requirements.txt             # pip dependencies
+├── Dockerfile                   # Container image (python:3.12-slim, yfinance included)
+├── .dockerignore
 ├── .gitignore
+├── .github/
+│   └── workflows/
+│       └── ci.yml               # GitHub Actions CI (Python 3.10–3.14 matrix)
 ├── lang/
 │   ├── en.json                  # English UI strings (default)
 │   └── tr.json                  # Turkish UI strings
-├── tests/                       # 477 pytest tests
+├── tests/                       # 472 pytest tests (+ 6 opt-in live network tests)
 │   ├── conftest.py
 │   ├── test_alarm_buttons.py    # Interactive alarm + on-demand .md button
 │   ├── test_cfg.py              # Config cache + atomic mutate
@@ -71,8 +77,9 @@ sec-analyzer/
 │   ├── test_groups.py           # Watchlist groups
 │   ├── test_hotfixes.py         # Atomic JSON IO, wizard guard, digest week
 │   ├── test_i18n.py             # Language loader, t(), fallback
+│   ├── test_network.py          # Opt-in live endpoint tests (--network flag)
 │   ├── test_portfolio.py        # Portfolio P&L
-│   ├── test_price.py            # Stooq parsing + price snippet
+│   ├── test_price.py            # Price compute helpers + snippet formatting
 │   ├── test_probe.py            # Alarm probe — whole-watchlist hit list
 │   ├── test_pure.py             # render, extract_section, build_prompt, …
 │   ├── test_sentiment.py        # Sentiment parse + trend rendering
@@ -92,7 +99,7 @@ Runtime files (created automatically under `~/sec-analyzer/`, **not** in the rep
 ├── cache.json              # Analyzed filings cache
 ├── weekly_log.json         # Buffer for digest + /report
 ├── sentiment_history.json  # /sentiment trend history
-├── price_cache.json        # Stooq price snippets cache
+├── price_cache.json        # Filing price-action snippets cache
 ├── watchword_seen.json     # Watchword dedup state
 ├── previous_filings/       # For risk-factor diff
 └── reports/
@@ -214,7 +221,7 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 |---|---|
 | `/addpos TICKER QTY PRICE [DATE]` | Add a lot; fractional shares OK, max 50 lots |
 | `/removepos TICKER` | Remove all lots for a ticker |
-| `/pnl` | Unrealized P&L summary (delayed/end-of-day prices from Stooq) |
+| `/pnl` | Unrealized P&L summary (delayed prices via yfinance) |
 
 ### Language & Webhook
 | Command | Action |
@@ -282,6 +289,27 @@ python bot.py
 
 ---
 
+## 🐳 Docker
+
+Build and run the bot in a container (yfinance included — all features available):
+
+```bash
+docker build -t sec-analyzer .
+docker run --env-file .env sec-analyzer
+```
+
+**Persist state across restarts** — without a volume mount the dedup/cache JSONs reset on every container restart. Mount a host directory:
+
+```bash
+docker run --env-file .env \
+  -v /path/to/data:/root/sec-analyzer \
+  sec-analyzer
+```
+
+> **Note:** Secrets in `.env` are never baked into the image (`.dockerignore` excludes `.env`). Always use `--env-file` at runtime.
+
+---
+
 ## 🔔 Webhook Mode (optional)
 
 Webhook mode requires a publicly accessible HTTPS URL and Flask. On Android use [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) or [ngrok](https://ngrok.com):
@@ -346,16 +374,16 @@ python -m pytest tests/ -q
 ```
 
 ```
-477 passed in <1s
+472 passed, 6 skipped in <3s
 ```
 
-The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_parse_stooq_csv`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, …), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the thread-safe state stores, and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline.
+The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, …), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the thread-safe state stores, and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline. The 6 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
 
 ---
 
 ## 💰 Cost
 
-**$0.** OpenRouter free tier — 50 requests/day per model. Loading $10 credit raises the limit to 1,000/day (only drawn on paid models). Stooq price data is also free.
+**$0.** OpenRouter free tier — 50 requests/day per model. Loading $10 credit raises the limit to 1,000/day (only drawn on paid models). Price data via yfinance is also free (delayed/end-of-day).
 
 ---
 
@@ -376,17 +404,25 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 | `/checkprice` or `/checknews` says "yfinance required" | `pip install yfinance` (optional dep, ~50 MB) |
 | Alarm fires but `/check` finds nothing | Pre-v2.5 bug — update to current release (alarm is now probe-only) |
 | `⚠️ Could not verify against filing data: …` appears in an analysis | The flagged figure was not found in the filing's audited XBRL data or text — treat it with caution; it may be LLM-derived (e.g., a computed total or segment share). Not necessarily wrong, just unverifiable. |
-| `/pnl` shows `n/a` for a ticker | Stooq has no data for it (delisted or non-US listing) — the total skips that row |
+| `/pnl` shows `n/a` for a ticker | yfinance has no data for it (delisted or non-US listing) — the total skips that row; also check `pip install yfinance` |
 | Watchword alert fires but nothing analyzed | By design: keyword alerts are probe-only (no LLM); run `/scanticker` on the company if you want an analysis |
 
 ---
 
 ## 📝 Release Notes
 
+### v2.8
+- **Git repository + MIT license:** Project initialized as a git repository with `.gitignore` covering runtime state, secrets, and internal orchestration files.
+- **GitHub Actions CI:** `.github/workflows/ci.yml` runs `pytest tests/ -q` across Python 3.10, 3.11, 3.12, 3.13, and 3.14 on every push and pull request (fail-fast disabled, 10-minute timeout). CI badge added to README — badge will show green once the first push reaches GitHub.
+- **Opt-in live network smoke tests:** `tests/test_network.py` adds 6 end-to-end tests against real endpoints (EDGAR, EFTS, yfinance). Skipped in all normal and CI runs; run manually with `python -m pytest tests/ -q --network -m network`. First run caught a price-endpoint HTTP 404 that prompted the price-source migration below.
+- **Price source migrated to yfinance.** The previous daily CSV price endpoint was found unreachable during live smoke testing. Price data (filing price-action snippet + `/pnl`) now uses yfinance — already an optional dep for `/checkprice` and `/checknews`. yfinance remains optional — when absent, `/pnl` returns a clear message instead of silent `n/a`. Old price-fetching code removed entirely (no dead code).
+- **Docker support:** `Dockerfile` (python:3.12-slim, yfinance included) and `.dockerignore` added. Run with `docker run --env-file .env sec-analyzer`; mount a volume for state persistence.
+- **472 tests** (−5 deleted price-source parser tests, +6 opt-in network tests).
+
 ### v2.7
 - **Keyword alerts (watchwords):** EDGAR full-text search (EFTS) monitoring via `/addword`; checks hourly alongside the existing filing alarm; probe-only (no LLM, no cache writes); accession-based dedup per phrase with a 200-entry FIFO cap; max 10 phrases; SEC courtesy intervals respected. State persisted in `watchword_seen.json`.
 - **Portfolio P&L:** Lot-based position tracking via `/addpos`; weighted average cost across multiple lots of the same ticker; `/pnl` shows unrealized profit/loss per position using delayed/end-of-day prices from Stooq (free, no API key required); rows with unavailable prices show `n/a` and are excluded from the total — the command does not fail. Unrealized P&L only — realized P&L, dividends, and non-USD positions are out of scope.
-- **+65 tests (477 total).**
+- **+65 tests.**
 
 ### v2.6
 - **Grounded Analysis:** For 10-K, 10-Q, and 20-F filings, audited XBRL facts (9 us-gaap concepts: Revenues, GrossProfit, OperatingIncomeLoss, NetIncomeLoss, EarningsPerShareDiluted, Cash, Assets, Liabilities, StockholdersEquity, plus derived gross margin %) are pulled from the filing and injected into the prompt with the instruction to use only these figures for numeric financial claims. When XBRL is unavailable the behaviour is identical to prior versions.
@@ -402,7 +438,7 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 - **`/checkprice TICKER [days]`** — on-demand price summary via yfinance (optional dep). Default 7 days.
 - **`/checknews TICKER [count]`** — recent Yahoo Finance headlines + publisher direct links via yfinance.
 - **Watchlist groups** — `/addgroup`, `/removegroup`, `/listgroups`, `/scangroup`.
-- **Price action snippet** — every filing analysis gets `📈 +3.4% (filing-date → +5d)` from Stooq (free, no API key). Toggle with `/priceaction`, tune with `/setlookforward`.
+- **Price action snippet** — every filing analysis gets `📈 +3.4% (filing-date → +5d)` via yfinance (optional dep). Toggle with `/priceaction`, tune with `/setlookforward`.
 - **Wizard step 0 — language picker** — first-run setup now starts bilingual.
 - **In-memory config cache + atomic `mutate_cfg`** — no more TOCTOU races on concurrent edits.
 - **Thread-safe `_raw_filings` and `_status`** stores with helper accessors.
