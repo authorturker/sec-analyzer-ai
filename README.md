@@ -10,7 +10,7 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 [![OpenRouter](https://img.shields.io/badge/LLM-OpenRouter%20Free-6c47ff)](https://openrouter.ai)
 [![Telegram](https://img.shields.io/badge/Interface-Telegram-2CA5E0?logo=telegram&logoColor=white)](https://telegram.org)
 [![CI](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-503%20passing-success)](#-tests)
+[![Tests](https://img.shields.io/badge/tests-732%20passing-success)](#-tests)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 </div>
@@ -46,7 +46,11 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 | 🔎 **Keyword Alerts** | Watch any phrase across ALL EDGAR filings (`/addword`); hourly full-text search alert, no LLM cost |
 | 💼 **Portfolio P&L** | Track positions with `/addpos`; `/pnl` shows unrealized profit/loss per ticker (yfinance, optional dep) |
 | 👥 **Multi-Chat** | Share the bot with up to 5 chats (`/addchat`); alerts broadcast to all, replies stay private to the asking chat |
-| 🧪 **Tested** | 503 pytest tests for pure helpers, i18n, config cache, thread safety |
+| 🧠 **Multi-LLM** | OpenRouter · Gemini · Anthropic · Groq — add keys with `/addapi`; auto-failover across providers |
+| 📴 **No-AI Mode** | Without any LLM key the bot still runs: delivers raw filing text with a clear ⚠️ label; never goes silent |
+| 📈 **Portfolio History** | Daily portfolio-value snapshots (up to 730 days); `/pnl` shows 1d / 7d / 30d raw-value delta |
+| 📊 **Fiscal AI (optional)** | Optional data source for grounding analysis — falls back to EDGAR XBRL when key absent or period not matched |
+| 🧪 **Tested** | 732 pytest tests for pure helpers, i18n, config cache, thread safety |
 | ⚡ **OpenRouter Free LLM** | openrouter/free, $0 cost |
 | 📱 **Lightweight** | Single 1.8k-line `bot.py`, runs on a mid-range Android phone via Termux |
 
@@ -69,18 +73,23 @@ sec-analyzer/
 ├── lang/
 │   ├── en.json                  # English UI strings (default)
 │   └── tr.json                  # Turkish UI strings
-├── tests/                       # 503 pytest tests (+ 6 opt-in live network tests)
+├── tests/                       # 732 pytest tests (+ 7 opt-in live network tests)
 │   ├── conftest.py
 │   ├── test_alarm_buttons.py    # Interactive alarm + on-demand .md button
+│   ├── test_bootstrap.py        # Minimal .env bootstrap, master-user init, env migration
 │   ├── test_cfg.py              # Config cache + atomic mutate
 │   ├── test_checkprice_news.py  # /checkprice + /checknews formatters
 │   ├── test_compare.py          # /compare prompt builder
+│   ├── test_fiscal_ai.py        # Fiscal AI optional facts source, fallback chain
 │   ├── test_groups.py           # Watchlist groups
 │   ├── test_hotfixes.py         # Atomic JSON IO, wizard guard, digest week
 │   ├── test_i18n.py             # Language loader, t(), fallback
 │   ├── test_multichat.py        # Multi-chat auth, migration, broadcast
+│   ├── test_multi_llm.py        # Multi-LLM provider abstraction, /addapi, /apis, retry
 │   ├── test_network.py          # Opt-in live endpoint tests (--network flag)
+│   ├── test_no_ai_mode.py       # No-AI mode — raw text delivery, daily reminder gate
 │   ├── test_portfolio.py        # Portfolio P&L
+│   ├── test_portfolio_history.py # Daily value snapshots, 1d/7d/30d delta helpers
 │   ├── test_price.py            # Price compute helpers + snippet formatting
 │   ├── test_probe.py            # Alarm probe — whole-watchlist hit list
 │   ├── test_pure.py             # render, extract_section, build_prompt, …
@@ -118,30 +127,42 @@ cd sec-analyzer-ai
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env    # then edit .env with your 4 keys
+cp .env.example .env    # then edit .env with your 3 required keys
 python bot.py
 ```
 
-On first run the bot launches a bilingual wizard — pick a language, choose default form types, add tickers, done.
+On first run the bot sends a welcome message and launches a bilingual setup wizard — pick a language, choose default form types, add tickers, done.
 
 ---
 
 ## ⚙️ Configuration
 
-Secrets live in a `.env` file (git-ignored). Copy the template and fill in **four** values:
+Secrets live in a `.env` file (git-ignored). Only **three** values are required to start:
 
 ```bash
 cp .env.example .env
 ```
 
 ```ini
-EDGAR_IDENTITY=Your Name yourname@email.com   # Required by SEC
-OPENROUTER_API_KEY=sk-or-v1-...               # From openrouter.ai
 TELEGRAM_BOT_TOKEN=123456:ABC...              # From @BotFather
-TELEGRAM_CHAT_ID=123456789                    # From @userinfobot
+MASTER_CHAT_ID=123456789                      # Your Telegram chat ID (from @userinfobot)
+EDGAR_IDENTITY=Your Name yourname@email.com   # Required by SEC (any real name + email)
 ```
 
-`config.py` is a thin loader that reads these via `python-dotenv` — you never edit `config.py` itself. At startup the bot runs a health check and refuses to run if any of the four is missing, malformed, or still a placeholder.
+`config.py` is a thin loader that reads these via `python-dotenv` — you never edit `config.py` itself. At startup the bot validates all three and refuses to run if any is missing or malformed.
+
+**LLM API keys are not required to start.** Without a key the bot runs in No-AI Mode — it fetches and delivers raw filing text with a clear ⚠️ label so you always know what you are reading. Add your first key from Telegram at any time:
+
+```
+/addapi openrouter sk-or-v1-...
+/addapi gemini AIza...
+/addapi anthropic sk-ant-...
+/addapi groq gsk_...
+```
+
+The key message is deleted from Telegram immediately after saving. You can add multiple providers; the bot tries them in order and falls back automatically if one fails.
+
+**Migrating from an older `.env`:** if your `.env` contains `OPENROUTER_API_KEY` or `TELEGRAM_CHAT_ID`, the bot reads them on first start and migrates them into `bot_config.json` automatically — no manual action required. You can then remove those lines from `.env`.
 
 Everything else — tickers, default forms, model, schedule, language, custom prompts, webhook URL, price-action lookforward, raw-filing cap (default 100), cache TTL — is managed live via Telegram commands and stored in `~/sec-analyzer/bot_config.json`.
 
@@ -220,12 +241,20 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 | `/removeword <phrase>` | Stop watching a phrase |
 | `/listwords` | Show all watched phrases |
 
+### API Keys (admin only)
+| Command | Action |
+|---|---|
+| `/addapi <provider> [key]` | Add or update a provider API key — send in a **private chat** (key is deleted from Telegram immediately); providers: `openrouter` `gemini` `anthropic` `groq` `fiscalai` |
+| `/apis` | Show all configured providers (masked keys) and the active LLM provider |
+| `/setapi <provider>` | Set the preferred LLM provider (used first; others as fallback) |
+| `/delapi <provider>` | Remove a provider's key |
+
 ### Portfolio
 | Command | Action |
 |---|---|
 | `/addpos TICKER QTY PRICE [DATE]` | Add a lot; fractional shares OK, max 50 lots |
 | `/removepos TICKER` | Remove all lots for a ticker |
-| `/pnl` | Unrealized P&L summary (delayed prices via yfinance) |
+| `/pnl` | Unrealized P&L summary (delayed prices via yfinance) with 1d / 7d / 30d raw-value delta |
 
 ### Multi-chat (admin only)
 | Command | Action |
@@ -385,10 +414,10 @@ python -m pytest tests/ -q
 ```
 
 ```
-503 passed, 6 skipped in <3s
+732 passed, 7 skipped in <3s
 ```
 
-The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, …), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the thread-safe state stores, and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline. The 6 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
+The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, `_parse_fiscal_period`, `_parse_fiscal_response`, `_portfolio_history_delta`, …), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the multi-LLM provider abstraction (provider chain, key masking, retry logic), the No-AI mode (raw text delivery, short-circuit, daily reminder gate), the portfolio-history delta helpers, and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline. The 7 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
 
 ---
 
@@ -419,10 +448,24 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 | Watchword alert fires but nothing analyzed | By design: keyword alerts are probe-only (no LLM); run `/scanticker` on the company if you want an analysis |
 | Bot doesn't respond in a new chat | The chat isn't authorized — the admin must run `/addchat <id>` first; unauthorized chats are ignored silently by design |
 | `/addchat` says limit reached | Cap is 5 chats; remove one with `/removechat` first |
+| Analysis says `⚠️ AI mode off — no API key configured` | No LLM key is set; use `/addapi openrouter sk-or-v1-...` (or any other provider) in a private chat |
+| All providers failed — you see raw text with a retry button | Every configured LLM key returned an error; tap the retry button or check keys with `/apis` |
+| `fiscalai key rejected (401/403)` in analysis | Your Fiscal AI key is invalid or over quota — update it with `/addapi fiscalai <newkey>` or remove it with `/delapi fiscalai`; analysis falls back to EDGAR XBRL automatically |
+| `/pnl` delta shows a jump after adding a position | This is expected: the Δ columns show raw total-value change, not time-weighted return — adding shares increases the total, which registers as a positive delta |
 
 ---
 
 ## 📝 Release Notes
+
+### v4.0
+> Note: the v3.x range was skipped. Leftover version labels carried forward from v2.x development had left the codebase self-identifying as an earlier version string; this release unifies all labels at v4.0 to eliminate the ambiguity.
+
+- **Minimal `.env` bootstrap:** only three environment variables are required to start (`TELEGRAM_BOT_TOKEN`, `MASTER_CHAT_ID`, `EDGAR_IDENTITY`). LLM API keys are no longer required at launch. Existing `.env` files with `OPENROUTER_API_KEY` or `TELEGRAM_CHAT_ID` are migrated automatically on first start.
+- **Multi-LLM provider abstraction:** OpenRouter, Gemini, Anthropic, and Groq are supported via pure-HTTP adapters (no new required packages). Add keys with `/addapi <provider>` in a private chat — the key message is deleted from Telegram immediately after saving. The bot tries providers in order and fails over automatically if one is unreachable. View configured keys (masked) with `/apis`; switch preference with `/setapi`.
+- **No-AI Mode:** when no LLM key is configured or all providers fail, the bot delivers raw filing text with a clear ⚠️ label rather than going silent. A daily reminder prompts the admin to add a key. The filing-fetch and grounding pipeline still run — only the LLM call is skipped.
+- **Portfolio value history:** daily portfolio-value snapshots are recorded to `portfolio_history.json` (up to 730 entries). `/pnl` now shows a Σ line with 1-day, 7-day, and 30-day raw-value deltas. Note: the Δ columns reflect raw total-value change and are not time-weighted — adding a position produces an apparent positive delta.
+- **Fiscal AI (optional data source):** when a Fiscal AI key is configured (`/addapi fiscalai`), the bot tries Fiscal AI's income and balance-sheet endpoints before EDGAR XBRL for grounding analysis. Exact period matching is required — if the period does not match, or the key is absent, the bot falls back silently to EDGAR XBRL. Free tier: 25 companies / 250 calls per day. Keys are stored in `bot_config.json` on disk in plain text — the file is git-ignored and docker-ignored but is not encrypted.
+- **+229 tests** (732 total, 7 opt-in network smoke tests).
 
 ### v2.9
 - **Multi-Chat (Model A):** Share one bot instance with up to 5 authorized Telegram chats. Proactive messages — scheduled scans, filing alerts, watchword alarms, digest — broadcast to all authorized chats. Command replies go only to the chat that sent the command. All authorized chats share the same watchlist, language, and settings (Model B with per-chat isolation is out of scope).

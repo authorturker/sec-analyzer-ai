@@ -1,5 +1,5 @@
 """
-SEC Analyzer Bot v3.0 — Telegram (multi-language)
+SEC Analyzer Bot v4.0 — Telegram (multi-language)
 
 Single-codebase replacement for bot_en.py + bot_tr.py.
 - i18n: lang/en.json (default) + lang/tr.json, switch with /setlang.
@@ -7,6 +7,8 @@ Single-codebase replacement for bot_en.py + bot_tr.py.
 - scan_ticker split into pure-ish helpers (fetch / analyze / render / send).
 - 8-K EX-99.* exhibit collection, full network I/O hardening, 327 tests.
 """
+
+__version__ = "4.0"
 
 import copy, csv, os, time, json, logging, hashlib, threading, io, uuid
 from datetime import datetime, timedelta
@@ -4705,7 +4707,7 @@ def run_startup_checks() -> list:
 
 def main():
     global _webhook_active
-    log.info("Bot v3.0 started.")
+    log.info(f"Bot v{__version__} started.")
 
     # Validate every prerequisite at startup; refuse to run on any failure.
     issues = run_startup_checks()
