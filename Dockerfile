@@ -7,6 +7,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt yfinance
 
-COPY bot.py lang/ ./
+COPY bot.py ./
+COPY lang/ ./lang/
 
 CMD ["python", "bot.py"]
