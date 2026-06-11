@@ -283,5 +283,9 @@
   "no_ai_no_keys": "🤖 AI modu kapalı — API anahtarı yapılandırılmamış. Eklemek için `/addapi` kullanın.",
   "no_ai_all_failed": "⚠️ Tüm AI sağlayıcıları şu an yanıt vermiyor — ham metin gönderildi, daha sonra tekrar denenecek.",
   "no_ai_reminder": "🤖 *AI modu kapalı.* API anahtarı yapılandırılmamış. Analizi etkinleştirmek için `/addapi` ile bir anahtar ekleyin.",
-  "no_ai_signal_placeholder": "n/a (AI kapalı)"
+  "no_ai_signal_placeholder": "n/a (AI kapalı)",
+
+  "setapi_fiscalai_rejected": "⚠️ `fiscalai` bir veri sağlayıcısıdır, LLM sağlayıcısı değil — varsayılan AI modeli olarak ayarlanamaz. Anahtarınızı yapılandırmak için `/addapi fiscalai` kullanın.",
+  "apis_data_row": "📊 Veri: `{provider}` — `{masked_key}`",
+  "fiscalai_auth_error": "⚠️ *Fiscal AI anahtarı reddedildi (401/403).* Veriler EDGAR XBRL'den alınacak.\nAnahtarınızı `/addapi fiscalai` ile güncelleyin."
 }

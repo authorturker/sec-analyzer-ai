@@ -283,5 +283,9 @@
   "no_ai_no_keys": "🤖 AI mode is off — no API key configured. Add one with `/addapi`.",
   "no_ai_all_failed": "⚠️ All AI providers are currently unavailable — raw text sent, will retry later.",
   "no_ai_reminder": "🤖 *AI mode is off.* No API key is configured. Add one with `/addapi` to enable analysis.",
-  "no_ai_signal_placeholder": "n/a (AI off)"
+  "no_ai_signal_placeholder": "n/a (AI off)",
+
+  "setapi_fiscalai_rejected": "⚠️ `fiscalai` is a data provider, not an LLM provider — it cannot be set as the default AI model. Use `/addapi fiscalai` to configure your key.",
+  "apis_data_row": "📊 Data: `{provider}` — `{masked_key}`",
+  "fiscalai_auth_error": "⚠️ *Fiscal AI key rejected (401/403).* Facts will fall back to EDGAR XBRL.\nUpdate your key with `/addapi fiscalai`."
 }

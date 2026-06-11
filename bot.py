@@ -75,6 +75,7 @@ _price_lock  = threading.Lock()     # price_cache.json
 _alarm_lock      = threading.Lock()     # _pending_alarms (interactive alarm)
 _watchword_lock  = threading.Lock()     # watchword_seen.json dedup state (G1)
 _phistory_lock   = threading.Lock()     # portfolio_history.json (J4)
+_fiscal_memo_lock = threading.Lock()    # in-memory Fiscal AI memo cache (J5)
 _stop_event  = threading.Event()
 _ctx         = threading.local()    # per-thread reactive context (I1): _ctx.chat_id
 
@@ -265,6 +266,7 @@ _CFG_DEFAULTS = {
     "api_keys":               {},   # {provider: key} (J2)
     "default_provider":       "",   # active LLM provider name (J2)
     "no_keys_warned_date":    "",   # YYYY-MM-DD of last NO_KEYS reminder (J3 spam gate)
+    "fiscal_auth_warned_date": "",  # YYYY-MM-DD of last Fiscal AI auth warning (J5)
 }
 _cfg_cache: dict | None = None
 
@@ -1582,9 +1584,13 @@ def _handle_pending_key(chat_id: str, key_text: str, msg: dict):
     _tg_delete_msg(chat_id, msg.get("message_id"))
     def _do(c: dict):
         c.setdefault("api_keys", {})[provider] = key_text
-        if not c.get("default_provider"):
+        # fiscalai is a data provider — never set as default LLM provider (J5)
+        if not c.get("default_provider") and provider != _FISCAL_AI_PROVIDER:
             c["default_provider"] = provider
     mutate_cfg(_do)
+    if provider == _FISCAL_AI_PROVIDER:
+        with _fiscal_memo_lock:
+            _fiscal_memo.clear()
     tg(t("addapi_saved", provider=provider, masked_key=_mask_key(key_text)))
 
 
@@ -1846,9 +1852,10 @@ def _fmt_xbrl_value(concept: str, value: float, unit: str | None) -> str:
     return f"{sign}{prefix}{scaled}"
 
 
-def format_facts_block(facts: dict) -> str:
+def format_facts_block(facts: dict, source: str = "EDGAR XBRL") -> str:
     """Pure. Normalized {concept: (value, unit, period_end)} → ≤600-char text block.
     Returns "" when facts is empty.
+    source: label shown in header ("EDGAR XBRL" or "Fiscal AI").
     """
     if not facts:
         return ""
@@ -1856,7 +1863,11 @@ def format_facts_block(facts: dict) -> str:
     # Header date: latest period_end across all facts
     ends = [v[2] for v in facts.values() if v[2]]
     header_date = max(ends) if ends else "unknown"
-    lines = [f"AUDITED XBRL FACTS (period ending {header_date}):"]
+    if source == "Fiscal AI":
+        header = f"AUDITED FISCAL AI FACTS (period ending {header_date}):"
+    else:
+        header = f"AUDITED XBRL FACTS (period ending {header_date}):"
+    lines = [header]
 
     for concept in _XBRL_DISPLAY_ORDER:
         if concept not in facts:
@@ -1989,6 +2000,186 @@ def fetch_xbrl_facts(filing) -> dict | None:  # type: ignore[type-arg]
     except Exception as exc:
         log.debug("fetch_xbrl_facts: %s", exc)
         return None
+
+
+# ─── Fiscal AI optional facts source (J5) ─────────────────
+
+_FISCAL_AI_PROVIDER   = "fiscalai"
+_FISCAL_AI_BASE       = "https://api.fiscal.ai"
+_FISCAL_FACTS_MINIMUM = 4       # min concepts for fiscal response to be accepted
+
+# In-memory memo: {(ticker_upper, period_end_YYYY-MM-DD): dict | None}
+_fiscal_memo: dict = {}
+
+# Concept field-name mapping: Fiscal AI key → internal XBRL concept name
+_FISCAL_INCOME_MAP: dict[str, str] = {
+    "revenue":                    "Revenues",
+    "revenues":                   "Revenues",
+    "total_revenue":              "Revenues",
+    "net_revenue":                "Revenues",
+    "gross_profit":               "GrossProfit",
+    "operating_income":           "OperatingIncomeLoss",
+    "operating_income_loss":      "OperatingIncomeLoss",
+    "ebit":                       "OperatingIncomeLoss",
+    "net_income":                 "NetIncomeLoss",
+    "net_income_loss":            "NetIncomeLoss",
+    "diluted_eps":                "EarningsPerShareDiluted",
+    "eps_diluted":                "EarningsPerShareDiluted",
+    "earnings_per_share_diluted": "EarningsPerShareDiluted",
+    "basic_and_diluted_eps":      "EarningsPerShareDiluted",
+}
+_FISCAL_BALANCE_MAP: dict[str, str] = {
+    "cash":                             "CashAndCashEquivalentsAtCarryingValue",
+    "cash_and_equivalents":             "CashAndCashEquivalentsAtCarryingValue",
+    "cash_and_cash_equivalents":        "CashAndCashEquivalentsAtCarryingValue",
+    "cash_equivalents":                 "CashAndCashEquivalentsAtCarryingValue",
+    "total_assets":                     "Assets",
+    "assets":                           "Assets",
+    "total_liabilities":                "Liabilities",
+    "liabilities":                      "Liabilities",
+    "stockholders_equity":              "StockholdersEquity",
+    "shareholders_equity":              "StockholdersEquity",
+    "total_equity":                     "StockholdersEquity",
+    "total_stockholders_equity":        "StockholdersEquity",
+}
+
+
+def _get_fiscal_key() -> str:
+    """Return Fiscal AI API key from config, or '' if not set."""
+    return get_cfg().get("api_keys", {}).get(_FISCAL_AI_PROVIDER, "")
+
+
+def _parse_fiscal_period(data: list, period_end: str, field_map: dict) -> dict:
+    """PURE: scan data list for an entry with exact period_end match; map fields.
+
+    Returns {internal_concept: float} for matched fields.
+    Returns {} on no match, wrong types, or missing fields.
+    Period date comparison uses only the first 10 chars (YYYY-MM-DD).
+    """
+    if not isinstance(data, list) or not period_end:
+        return {}
+    target = period_end[:10]
+    for record in data:
+        if not isinstance(record, dict):
+            continue
+        rec_end = (record.get("period_end_date") or record.get("date") or
+                   record.get("period_end") or record.get("end_date") or "")
+        if str(rec_end)[:10] != target:
+            continue
+        # Match — extract and convert fields
+        result: dict[str, float] = {}
+        for field, concept in field_map.items():
+            raw = record.get(field)
+            if raw is not None:
+                try:
+                    result[concept] = float(raw)
+                except (TypeError, ValueError):
+                    pass
+        return result
+    return {}
+
+
+def _parse_fiscal_response(income_data, balance_data, period_end: str) -> "dict | None":
+    """PURE: merge income + balance facts for period_end; validate ≥ threshold.
+
+    income_data / balance_data: raw dicts from Fiscal AI (any type safe).
+    Returns normalized {concept: (value, "USD", period_end)} or None.
+    None when < _FISCAL_FACTS_MINIMUM concepts found.
+    """
+    if not period_end:
+        return None
+    inc_list = income_data.get("data") if isinstance(income_data, dict) else None
+    bal_list = balance_data.get("data") if isinstance(balance_data, dict) else None
+    if not isinstance(inc_list, list):
+        inc_list = []
+    if not isinstance(bal_list, list):
+        bal_list = []
+    inc_facts = _parse_fiscal_period(inc_list, period_end, _FISCAL_INCOME_MAP)
+    bal_facts = _parse_fiscal_period(bal_list, period_end, _FISCAL_BALANCE_MAP)
+    merged = {**inc_facts, **bal_facts}
+    if len(merged) < _FISCAL_FACTS_MINIMUM:
+        return None
+    return {concept: (val, "USD", period_end) for concept, val in merged.items()}
+
+
+def _check_fiscal_auth_reminder() -> None:
+    """Send daily warning when Fiscal AI key is rejected (401/403). J5 spam gate."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if get_cfg().get("fiscal_auth_warned_date", "") == today:
+        return
+    mutate_cfg(lambda c: c.update({"fiscal_auth_warned_date": today}))
+    tg(t("fiscalai_auth_error"))
+
+
+def fetch_fiscal_facts(ticker: str, period_end: str) -> "dict | None":
+    """IO: fetch standardized financials from Fiscal AI for (ticker, period_end).
+
+    Returns normalized facts dict (same 9-concept format as EDGAR XBRL) or None.
+    None on: no key, no period_end, period mismatch, 4xx/5xx, timeout, < 4 concepts.
+    In-memory memo cache: (ticker_upper, period_end) — no persistent file.
+    Max 2 HTTP per unique (ticker, period_end) pair.
+    """
+    if not period_end:
+        return None
+    key = _get_fiscal_key()
+    if not key:
+        return None
+    cache_k = (ticker.upper(), period_end[:10])
+    with _fiscal_memo_lock:
+        if cache_k in _fiscal_memo:
+            return _fiscal_memo[cache_k]
+
+    headers = {"X-Api-Key": key, "Accept": "application/json"}
+    period_types = "annual,quarterly,semi-annual,ltm,latest"
+    endpoints = [
+        (f"/v1/company/financials/income-statement/standardized"
+         f"?ticker={ticker}&periodType={period_types}", "income"),
+        (f"/v1/company/financials/balance-sheet/standardized"
+         f"?ticker={ticker}&periodType={period_types}", "balance"),
+    ]
+    income_data: "dict | None" = None
+    balance_data: "dict | None" = None
+    for suffix, which in endpoints:
+        url = _FISCAL_AI_BASE + suffix
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code in (401, 403):
+                _check_fiscal_auth_reminder()
+                log.debug(f"fetch_fiscal_facts {which}: {r.status_code} — auth fail")
+                with _fiscal_memo_lock:
+                    _fiscal_memo[cache_k] = None
+                return None
+            if r.status_code == 404:
+                log.debug(f"fetch_fiscal_facts {which}: 404 {ticker} — not found")
+                with _fiscal_memo_lock:
+                    _fiscal_memo[cache_k] = None
+                return None
+            if not r.ok:
+                log.debug(f"fetch_fiscal_facts {which}: {r.status_code} — fallback")
+                with _fiscal_memo_lock:
+                    _fiscal_memo[cache_k] = None
+                return None
+            try:
+                body = r.json()
+            except Exception:
+                log.debug(f"fetch_fiscal_facts {which}: JSON parse error")
+                with _fiscal_memo_lock:
+                    _fiscal_memo[cache_k] = None
+                return None
+        except Exception as exc:
+            log.debug(f"fetch_fiscal_facts {which}: {exc}")
+            with _fiscal_memo_lock:
+                _fiscal_memo[cache_k] = None
+            return None
+        if which == "income":
+            income_data = body
+        else:
+            balance_data = body
+
+    result = _parse_fiscal_response(income_data, balance_data, period_end)
+    with _fiscal_memo_lock:
+        _fiscal_memo[cache_k] = result
+    return result
 
 
 # ─── Numeric verification (F3) ────────────────────────────
@@ -2424,13 +2615,25 @@ def fetch_new_filings(ticker: str, forms: list, lookback_days: int,
                                     text = text[:max_chars_per]
                             else:
                                 text = None
-                            # F2: XBRL grounding — at most 1 extra network call per
-                            # qualifying filing; 8-K/Form 4/etc. never touch .xbrl().
+                            # F2 + J5: XBRL/Fiscal AI grounding.
+                            # Fiscal AI tried first (if key present); falls back
+                            # to EDGAR XBRL. 8-K/Form 4/etc. never grounded.
                             facts_block = ""
                             if fetch_text and form in _XBRL_FORMS:
-                                facts_block = format_facts_block(
-                                    fetch_xbrl_facts(f) or {}
-                                )
+                                fiscal_facts = None
+                                if _get_fiscal_key():
+                                    # Derive period_end: prefer period_of_report
+                                    _por = getattr(f, "period_of_report", None)
+                                    if _por and hasattr(_por, "isoformat"):
+                                        _por = _por.isoformat()
+                                    period_end_str = str(_por)[:10] if _por else ds
+                                    fiscal_facts = fetch_fiscal_facts(ticker, period_end_str)
+                                if fiscal_facts is not None:
+                                    facts_block = format_facts_block(fiscal_facts, source="Fiscal AI")
+                                else:
+                                    facts_block = format_facts_block(
+                                        fetch_xbrl_facts(f) or {}
+                                    )
                             found.append((form, ds, text, facts_block))
                             time.sleep(0.5)
                         break
@@ -4205,14 +4408,15 @@ def cmd_addapi(parts: list, chat_id: str, msg: dict) -> str:
     Two-message form: /addapi openrouter  → prompts for key in next message.
     One-message form: /addapi openrouter sk-or-v1-xxx  → saves immediately.
     Rejected in group chats (members can see message before deletion).
+    fiscalai is a data provider (not LLM) — accepted here but not in /setapi.
     """
-    valid = list(_PROVIDERS.keys())
+    valid = list(_PROVIDERS.keys()) + [_FISCAL_AI_PROVIDER]
     if msg.get("chat", {}).get("type", "private") != "private":
         return t("addapi_group_rejected")
     if len(parts) < 2:
         return t("addapi_usage", providers=", ".join(valid))
     provider = parts[1].lower()
-    if provider not in _PROVIDERS:
+    if provider not in valid:
         return t("addapi_unknown_provider", provider=provider, providers=", ".join(valid))
     if len(parts) >= 3:
         # One-message form: key is inline
@@ -4222,9 +4426,13 @@ def cmd_addapi(parts: list, chat_id: str, msg: dict) -> str:
         _tg_delete_msg(chat_id, msg.get("message_id"))
         def _do(c: dict):
             c.setdefault("api_keys", {})[provider] = key
-            if not c.get("default_provider"):
+            # fiscalai is a data provider — never set as default LLM provider (J5)
+            if not c.get("default_provider") and provider != _FISCAL_AI_PROVIDER:
                 c["default_provider"] = provider
         mutate_cfg(_do)
+        if provider == _FISCAL_AI_PROVIDER:
+            with _fiscal_memo_lock:
+                _fiscal_memo.clear()
         return t("addapi_saved", provider=provider, masked_key=_mask_key(key))
     # Two-message form: register pending entry
     with _pending_lock:
@@ -4233,7 +4441,7 @@ def cmd_addapi(parts: list, chat_id: str, msg: dict) -> str:
 
 
 def cmd_apis() -> str:
-    """Admin: /apis — list configured providers with masked keys."""
+    """Admin: /apis — list configured LLM providers + data providers (J5)."""
     cfg = get_cfg()
     api_keys = cfg.get("api_keys", {})
     default = cfg.get("default_provider", "")
@@ -4243,17 +4451,27 @@ def cmd_apis() -> str:
         if key:
             star = " ⭐" if prov == default else ""
             rows.append(t("apis_row", provider=prov, masked_key=_mask_key(key), star=star))
+    # Data providers section (J5)
+    fiscal_key = api_keys.get(_FISCAL_AI_PROVIDER, "")
+    if fiscal_key:
+        rows.append(t("apis_data_row",
+                      provider=_FISCAL_AI_PROVIDER,
+                      masked_key=_mask_key(fiscal_key)))
     if not rows:
         return t("apis_empty")
     return t("apis_header") + "\n" + "\n".join(rows)
 
 
 def cmd_setapi(parts: list) -> str:
-    """Admin: /setapi <provider> — change the default LLM provider."""
+    """Admin: /setapi <provider> — change the default LLM provider.
+    fiscalai is a data provider and cannot be set as default LLM (J5).
+    """
     valid = list(_PROVIDERS.keys())
     if len(parts) < 2:
         return t("setapi_usage", providers=", ".join(valid))
     provider = parts[1].lower()
+    if provider == _FISCAL_AI_PROVIDER:
+        return t("setapi_fiscalai_rejected")
     if provider not in _PROVIDERS or not _get_provider_key(provider):
         return t("setapi_unknown", provider=provider)
     mutate_cfg(lambda c: c.update({"default_provider": provider}))
@@ -4261,9 +4479,12 @@ def cmd_setapi(parts: list) -> str:
 
 
 def cmd_delapi(parts: list) -> str:
-    """Admin: /delapi <provider> — delete an API key."""
+    """Admin: /delapi <provider> — delete an API key.
+    Accepts fiscalai (data provider) in addition to LLM providers (J5).
+    """
+    all_valid = list(_PROVIDERS.keys()) + [_FISCAL_AI_PROVIDER]
     if len(parts) < 2:
-        return t("delapi_usage", providers=", ".join(_PROVIDERS.keys()))
+        return t("delapi_usage", providers=", ".join(all_valid))
     provider = parts[1].lower()
     cfg = get_cfg()
     if not cfg.get("api_keys", {}).get(provider):
@@ -4274,6 +4495,9 @@ def cmd_delapi(parts: list) -> str:
             remaining = [p for p in _PROVIDERS if c.get("api_keys", {}).get(p)]
             c["default_provider"] = remaining[0] if remaining else ""
     mutate_cfg(_do)
+    if provider == _FISCAL_AI_PROVIDER:
+        with _fiscal_memo_lock:
+            _fiscal_memo.clear()
     return t("delapi_done", provider=provider)
 
 
