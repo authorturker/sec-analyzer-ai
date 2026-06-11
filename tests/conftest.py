@@ -22,6 +22,7 @@ def _install_stubs():
         fake_cfg.OPENROUTER_API_KEY = "test-key"
         fake_cfg.TELEGRAM_BOT_TOKEN = "test-token"
         fake_cfg.TELEGRAM_CHAT_ID   = "0"
+        fake_cfg.MASTER_CHAT_ID     = "0"
         sys.modules["config"] = fake_cfg
 
     if "edgar" not in sys.modules:

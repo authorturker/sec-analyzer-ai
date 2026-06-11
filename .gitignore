@@ -10,6 +10,7 @@ venv/
 seen.json
 cache.json
 watchword_seen.json
+bot_config.json
 *.log
 
 # Internal orchestration (not product files)

@@ -6,18 +6,16 @@ import pytest
 
 # ─── H6 — run_startup_checks ──────────────────────────────
 class TestStartupChecks:
-    def _set_secrets(self, bot, monkeypatch, *, edgar=None, openrouter=None,
-                     token=None, chat=None):
-        """Patch the four secret module globals to known-good defaults,
+    def _set_secrets(self, bot, monkeypatch, *, edgar=None, token=None,
+                     master=None):
+        """Patch the three required secret module globals to known-good defaults,
         overriding individual ones as needed."""
         monkeypatch.setattr(bot, "EDGAR_IDENTITY",
                             edgar if edgar is not None else "Real Person r@e.com")
-        monkeypatch.setattr(bot, "OPENROUTER_API_KEY",
-                            openrouter if openrouter is not None else "sk-or-v1-abcdef123456")
         monkeypatch.setattr(bot, "TELEGRAM_BOT_TOKEN",
                             token if token is not None else "123456:ABCdef")
-        monkeypatch.setattr(bot, "TELEGRAM_CHAT_ID",
-                            chat if chat is not None else "123456789")
+        monkeypatch.setattr(bot, "MASTER_CHAT_ID",
+                            master if master is not None else "123456789")
 
     def test_all_good_returns_empty(self, bot, monkeypatch):
         self._set_secrets(bot, monkeypatch)
@@ -27,16 +25,6 @@ class TestStartupChecks:
         self._set_secrets(bot, monkeypatch, edgar="Your Name yourname@email.com")
         issues = bot.run_startup_checks()
         assert any("EDGAR" in i for i in issues)
-
-    def test_placeholder_openrouter_flagged(self, bot, monkeypatch):
-        self._set_secrets(bot, monkeypatch, openrouter="sk-or-v1-YOUR_KEY_HERE")
-        issues = bot.run_startup_checks()
-        assert any("OPENROUTER_API_KEY" in i for i in issues)
-
-    def test_short_openrouter_flagged(self, bot, monkeypatch):
-        self._set_secrets(bot, monkeypatch, openrouter="abc")
-        issues = bot.run_startup_checks()
-        assert any("OPENROUTER_API_KEY" in i for i in issues)
 
     def test_malformed_token_flagged(self, bot, monkeypatch):
         # No colon → malformed
@@ -48,11 +36,6 @@ class TestStartupChecks:
         self._set_secrets(bot, monkeypatch, token="YOUR_BOT_TOKEN")
         issues = bot.run_startup_checks()
         assert any("TELEGRAM_BOT_TOKEN" in i for i in issues)
-
-    def test_placeholder_chat_id_flagged(self, bot, monkeypatch):
-        self._set_secrets(bot, monkeypatch, chat="YOUR_CHAT_ID")
-        issues = bot.run_startup_checks()
-        assert any("TELEGRAM_CHAT_ID" in i for i in issues)
 
     def test_missing_lang_dir_flagged(self, bot, monkeypatch, tmp_path):
         self._set_secrets(bot, monkeypatch)

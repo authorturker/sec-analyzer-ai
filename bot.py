@@ -34,6 +34,7 @@ except ImportError:
 from config import (
     EDGAR_IDENTITY, OPENROUTER_API_KEY,
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    MASTER_CHAT_ID,
 )
 
 # ─── Paths ────────────────────────────────────────────────
@@ -257,6 +258,8 @@ _CFG_DEFAULTS = {
     "watchwords":             [],   # EDGAR full-text keyword phrases (G1); max 10
     "portfolio":              [],   # unrealized P&L lots (G2); max 50
     "chat_ids":               [],   # authorized chat ID list (I1); first = admin
+    "openrouter_api_key":     "",   # migrated from .env (J1)
+    "env_imported":           False, # one-time .env migration guard (J1)
 }
 _cfg_cache: dict | None = None
 
@@ -359,6 +362,13 @@ def get_cfg_value(key: str, default=None):
 
 # ─── Chat ID authorization helpers (I1) ──────────────────
 
+def _is_valid_chat_id(v) -> bool:
+    """Return True if v is a non-empty string that parses as a non-zero integer."""
+    try:
+        return bool(v) and int(str(v)) != 0
+    except (ValueError, TypeError):
+        return False
+
 def _is_authorized(chat_id: str) -> bool:
     """Return True if chat_id is in the authorized chat_ids list."""
     return str(chat_id) in [str(c) for c in get_cfg().get("chat_ids", [])]
@@ -390,6 +400,55 @@ def _migrate_chat_ids():
         if seed:
             c["chat_ids"] = [str(seed)]
     mutate_cfg(_do)
+
+def _ensure_master_in_chat_ids():
+    """Guarantee MASTER_CHAT_ID is always chat_ids[0].
+
+    The cap (_CHAT_MAX) can never exclude the master chat. Idempotent.
+    """
+    if not _is_valid_chat_id(MASTER_CHAT_ID):
+        return
+    master = str(MASTER_CHAT_ID)
+    def _do(c: dict):
+        ids = [str(i) for i in c.get("chat_ids", [])]
+        ids = [i for i in ids if i != master]   # remove master from wherever it is
+        c["chat_ids"] = [master] + ids           # prepend master
+    mutate_cfg(_do)
+
+def _import_legacy_env() -> list[str]:
+    """One-time migration of legacy .env values into bot_config.json.
+
+    Imports OPENROUTER_API_KEY and TELEGRAM_CHAT_ID if they are valid in the
+    environment and not already present in config. Guarded by the
+    ``env_imported`` config flag — idempotent on subsequent restarts.
+
+    Returns list of key names that were imported (empty if nothing was done).
+    """
+    if get_cfg_value("env_imported", False):
+        return []
+
+    imported: list[str] = []
+
+    def _do(c: dict):
+        # Migrate OPENROUTER_API_KEY if valid and not already stored
+        if (OPENROUTER_API_KEY
+                and OPENROUTER_API_KEY != "sk-or-v1-YOUR_KEY_HERE"
+                and len(OPENROUTER_API_KEY) >= 10
+                and not c.get("openrouter_api_key")):
+            c["openrouter_api_key"] = OPENROUTER_API_KEY
+            imported.append("OPENROUTER_API_KEY")
+
+        # Migrate TELEGRAM_CHAT_ID if valid and not already in chat_ids
+        if _is_valid_chat_id(TELEGRAM_CHAT_ID):
+            ids = [str(i) for i in c.get("chat_ids", [])]
+            if str(TELEGRAM_CHAT_ID) not in ids:
+                c["chat_ids"] = ids + [str(TELEGRAM_CHAT_ID)]
+                imported.append("TELEGRAM_CHAT_ID")
+
+        c["env_imported"] = True
+
+    mutate_cfg(_do)
+    return imported
 
 # ─── i18n ─────────────────────────────────────────────────
 _lang_cache: dict = {}        # code → full strings dict
@@ -1272,6 +1331,21 @@ _ORH = {
     "X-Title": "SEC Analyzer Bot",
 }
 
+def _get_or_headers() -> dict:
+    """Build OpenRouter auth headers with the key read dynamically from config.
+
+    Priority: bot_config.json ``openrouter_api_key`` → legacy env-var fallback.
+    This lets the key be stored in bot_config.json (J1) without requiring a
+    bot restart after migration.
+    """
+    key = get_cfg_value("openrouter_api_key") or OPENROUTER_API_KEY
+    return {
+        "Authorization": f"Bearer {key}",
+        "Content-Type":  "application/json",
+        "HTTP-Referer":  "https://github.com/sec-analyzer-bot",
+        "X-Title":       "SEC Analyzer Bot",
+    }
+
 def system_message() -> str:
     """Build the LLM system message, including the active response language."""
     lang_name = lang_meta().get("llm_response_language", "English")
@@ -1299,7 +1373,7 @@ def llm(istem: str, model: str) -> str:
     }
     for attempt in range(4):
         try:
-            r = requests.post(_OR, headers=_ORH, json=payload, timeout=120)
+            r = requests.post(_OR, headers=_get_or_headers(), json=payload, timeout=120)
             if r.status_code == 429:
                 wait_sec = min(180, 60 * (attempt + 1))
                 log.warning(f"Rate limit — waiting {wait_sec}s"); time.sleep(wait_sec); continue
@@ -3752,8 +3826,10 @@ def run_startup_checks() -> list:
     Validate every critical prerequisite before the bot starts.
 
     Returns a list of human-readable issue strings; empty list means all
-    clear. Covers the four secrets (EDGAR identity, OpenRouter key, Telegram
-    token + chat id) and the language files the i18n layer depends on.
+    clear. Covers the three required secrets (EDGAR identity, Telegram token,
+    MASTER_CHAT_ID) and the language files the i18n layer depends on.
+    OPENROUTER_API_KEY is NOT checked here — it is migrated from .env into
+    bot_config.json on first run (J1) and fetched dynamically thereafter.
     Pure-ish: reads module globals only, no side effects — easy to test.
     """
     issues: list = []
@@ -3762,24 +3838,15 @@ def run_startup_checks() -> list:
     if not ok:
         issues.append(msg)
 
-    if (not OPENROUTER_API_KEY
-            or OPENROUTER_API_KEY == "sk-or-v1-YOUR_KEY_HERE"
-            or len(OPENROUTER_API_KEY) < 10):
-        issues.append("OPENROUTER_API_KEY is missing or still the placeholder "
-                       "— set it in your .env file.")
-
     if (not TELEGRAM_BOT_TOKEN
             or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN"
             or ":" not in TELEGRAM_BOT_TOKEN):
         issues.append("TELEGRAM_BOT_TOKEN is missing or malformed "
                        "(expected '123456:ABC...') — set it in your .env file.")
 
-    cfg_chat_ids = get_cfg_value("chat_ids", [])
-    if not cfg_chat_ids:
-        # First run: need TELEGRAM_CHAT_ID to bootstrap chat_ids list.
-        if not TELEGRAM_CHAT_ID or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID":
-            issues.append("TELEGRAM_CHAT_ID is missing or still the placeholder "
-                           "— set it in your .env file.")
+    if not _is_valid_chat_id(MASTER_CHAT_ID):
+        issues.append("MASTER_CHAT_ID is missing or invalid — set it to your "
+                       "numeric Telegram chat ID in your .env file.")
 
     if not LANG_DIR.exists():
         issues.append(f"Language directory not found: {LANG_DIR}")
@@ -3816,13 +3883,23 @@ def main():
 
     # Migrate scalar chat_id → chat_ids list (I1). Idempotent.
     _migrate_chat_ids()
+    # Guarantee MASTER_CHAT_ID is always chat_ids[0] (J1). Idempotent.
+    _ensure_master_in_chat_ids()
+    log.info(f"Master chat: {MASTER_CHAT_ID}")
     log.info(f"Authorized chats: {get_cfg_value('chat_ids', [])}")
+
+    # One-time .env migration → bot_config.json (J1).
+    migrated = _import_legacy_env()
+    if migrated:
+        tg(t("env_import_done", keys=", ".join(migrated)))
+        log.info(f"Migrated from .env: {migrated}")
 
     bg = threading.Thread(target=background_thread, daemon=True)
     bg.start()
 
     cfg = get_cfg()
     if cfg.get("first_run", True):
+        tg(t("welcome_bootstrap", master_chat_id=MASTER_CHAT_ID))
         start_wizard()
     else:
         tg(t("bot_active"))

@@ -255,5 +255,7 @@
   "listchats_header": "*Authorized chats:*",
   "listchats_row": "{n}. `{id}`{admin}",
   "listchats_empty": "No authorized chats configured.",
-  "unauthorized_admin": "⚠️ This command is restricted to the admin chat."
+  "unauthorized_admin": "⚠️ This command is restricted to the admin chat.",
+  "env_import_done": "ℹ️ *Settings migrated from .env:* {keys}\n\nThese values are now stored in `bot_config.json`. You can safely remove those lines from your `.env` file.",
+  "welcome_bootstrap": "🎉 *SEC Analyzer Bot v3.0 ready!*\n\nAdmin chat: `{master_chat_id}` ⭐\n\nType `/help` to see all commands.\n\n📌 _API key management_ (`/addapi`) coming soon."
 }

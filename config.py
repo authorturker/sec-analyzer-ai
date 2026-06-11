@@ -23,9 +23,13 @@ except ImportError:
     # The startup health check in bot.py will flag any missing values.
     pass
 
-# Placeholder defaults are intentionally invalid so the startup health
-# check refuses to run until real values are supplied via .env.
+# Required secrets — the bot refuses to start if any of the three below are
+# missing or invalid. OPENROUTER_API_KEY and TELEGRAM_CHAT_ID are legacy
+# migration sources: they are imported once into bot_config.json (J1) and are
+# not required at startup thereafter.
 EDGAR_IDENTITY     = os.getenv("EDGAR_IDENTITY",     "Your Name yourname@email.com")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "sk-or-v1-YOUR_KEY_HERE")
+MASTER_CHAT_ID     = os.getenv("MASTER_CHAT_ID",     "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
+# Legacy — kept as migration sources; not required after first run.
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "")

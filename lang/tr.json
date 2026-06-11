@@ -255,5 +255,7 @@
   "listchats_header": "*Yetkili chatler:*",
   "listchats_row": "{n}. `{id}`{admin}",
   "listchats_empty": "Yetkili chat yapılandırılmamış.",
-  "unauthorized_admin": "⚠️ Bu komut yalnızca yönetici chat'ine özeldir."
+  "unauthorized_admin": "⚠️ Bu komut yalnızca yönetici chat'ine özeldir.",
+  "env_import_done": "ℹ️ *.env'den ayarlar taşındı:* {keys}\n\nBu değerler artık `bot_config.json` dosyasında saklanıyor. İlgili satırları `.env` dosyanızdan güvenle kaldırabilirsiniz.",
+  "welcome_bootstrap": "🎉 *SEC Analizci Bot v3.0 hazır!*\n\nYönetici chat: `{master_chat_id}` ⭐\n\nTüm komutlar için `/help` yazın.\n\n📌 _API anahtarı yönetimi_ (`/addapi`) yakında."
 }
