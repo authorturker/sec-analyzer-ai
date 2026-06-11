@@ -116,68 +116,6 @@ class TestLlmBehavior:
         result = bot.llm("prompt", "model")
         assert result == "Great analysis."
 
-    def test_429_uses_linear_backoff_not_exponential(self, bot, monkeypatch):
-        """429 → min(180, 60*(attempt+1)) — lineer backoff, _backoff() değil."""
-        slept = []
-        call_count = {"n": 0}
-        def fake_post(*a, **k):
-            call_count["n"] += 1
-            if call_count["n"] <= 2:
-                return FakeResp(429)
-            return _llm_success_resp()
-        monkeypatch.setattr(bot.requests, "post", fake_post)
-        monkeypatch.setattr(bot.time, "sleep", lambda s: slept.append(s))
-        bot.llm("p", "m")
-        # attempt=0 → 60*(0+1)=60; attempt=1 → 60*(1+1)=120
-        assert slept[:2] == [60, 120]
-
-    def test_5xx_uses_backoff(self, bot, monkeypatch):
-        """500/502/503/504 → _backoff(attempt, 10, 60) sleep."""
-        slept = []
-        call_count = {"n": 0}
-        def fake_post(*a, **k):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                return FakeResp(503)
-            return _llm_success_resp()
-        monkeypatch.setattr(bot.requests, "post", fake_post)
-        monkeypatch.setattr(bot.time, "sleep", lambda s: slept.append(s))
-        bot.llm("p", "m")
-        # attempt=0 → _backoff(0, 10, 60) = 10
-        assert slept[0] == 10
-
-    def test_timeout_uses_linear_backoff_no_status_inc(self, bot, monkeypatch):
-        """Timeout → lineer sleep, status_inc("or_errors") ÇAĞRILMAZ."""
-        import requests as req
-        slept = []
-        call_count = {"n": 0}
-        def fake_post(*a, **k):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                raise req.exceptions.Timeout("timed out")
-            return _llm_success_resp()
-        monkeypatch.setattr(bot.requests, "post", fake_post)
-        monkeypatch.setattr(bot.time, "sleep", lambda s: slept.append(s))
-        before = bot._status.get("or_errors", 0)
-        bot.llm("p", "m")
-        after = bot._status.get("or_errors", 0)
-        # attempt=0 → min(60, 15*(0+1)) = 15
-        assert slept[0] == 15
-        assert after == before    # timeout or_errors'ı artırmaz
-
-    def test_generic_error_then_success_no_exception(self, bot, monkeypatch):
-        """Generic exception sonra başarı → exception fırlatılmaz, içerik döner."""
-        call_count = {"n": 0}
-        def fake_post(*a, **k):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                raise ValueError("unexpected")
-            return _llm_success_resp("recovered")
-        monkeypatch.setattr(bot.requests, "post", fake_post)
-        monkeypatch.setattr(bot.time, "sleep", lambda *a, **k: None)
-        result = bot.llm("p", "m")
-        assert result == "recovered"
-
     def test_all_attempts_exhausted_returns_unavailable(self, bot, monkeypatch):
         """4 denemede de başarısız → analysis_unavailable i18n metni döner."""
         monkeypatch.setattr(bot.requests, "post",

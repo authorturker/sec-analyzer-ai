@@ -258,8 +258,10 @@ _CFG_DEFAULTS = {
     "watchwords":             [],   # EDGAR full-text keyword phrases (G1); max 10
     "portfolio":              [],   # unrealized P&L lots (G2); max 50
     "chat_ids":               [],   # authorized chat ID list (I1); first = admin
-    "openrouter_api_key":     "",   # migrated from .env (J1)
+    "openrouter_api_key":     "",   # migrated from .env (J1); superseded by api_keys (J2)
     "env_imported":           False, # one-time .env migration guard (J1)
+    "api_keys":               {},   # {provider: key} (J2)
+    "default_provider":       "",   # active LLM provider name (J2)
 }
 _cfg_cache: dict | None = None
 
@@ -449,6 +451,22 @@ def _import_legacy_env() -> list[str]:
 
     mutate_cfg(_do)
     return imported
+
+def _migrate_openrouter_key():
+    """Idempotent: move legacy openrouter_api_key → api_keys['openrouter'] (J2).
+
+    Sets default_provider='openrouter' if no default is set and the key exists.
+    Does NOT remove openrouter_api_key from config — _apply_defaults repopulates
+    it as "" anyway, and _get_provider_key() checks api_keys first.
+    """
+    def _do(c: dict):
+        legacy = c.get("openrouter_api_key", "")
+        api_keys = c.setdefault("api_keys", {})
+        if legacy and not api_keys.get("openrouter"):
+            api_keys["openrouter"] = legacy
+        if api_keys.get("openrouter") and not c.get("default_provider"):
+            c["default_provider"] = "openrouter"
+    mutate_cfg(_do)
 
 # ─── i18n ─────────────────────────────────────────────────
 _lang_cache: dict = {}        # code → full strings dict
@@ -1332,11 +1350,8 @@ _ORH = {
 }
 
 def _get_or_headers() -> dict:
-    """Build OpenRouter auth headers with the key read dynamically from config.
-
-    Priority: bot_config.json ``openrouter_api_key`` → legacy env-var fallback.
-    This lets the key be stored in bot_config.json (J1) without requiring a
-    bot restart after migration.
+    """Legacy header builder — superseded by _get_provider_key() in J2.
+    Kept for reference; llm() no longer uses it directly.
     """
     key = get_cfg_value("openrouter_api_key") or OPENROUTER_API_KEY
     return {
@@ -1345,6 +1360,253 @@ def _get_or_headers() -> dict:
         "HTTP-Referer":  "https://github.com/sec-analyzer-bot",
         "X-Title":       "SEC Analyzer Bot",
     }
+
+# ─── Multi-LLM provider registry (J2) ─────────────────────
+# Pure HTTP for all providers (Termux principle — no SDKs).
+# Each entry defines: endpoint template, default model, wire type.
+_PROVIDERS: dict = {
+    "openrouter": {
+        "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+        "model":    "openrouter/auto",
+        "type":     "openai",
+    },
+    "groq": {
+        "endpoint": "https://api.groq.com/openai/v1/chat/completions",
+        "model":    "llama-3.3-70b-versatile",
+        "type":     "openai",
+    },
+    "anthropic": {
+        "endpoint": "https://api.anthropic.com/v1/messages",
+        "model":    "claude-haiku-4-5-20251001",
+        "type":     "anthropic",
+    },
+    "gemini": {
+        "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        "model":    "gemini-2.0-flash",
+        "type":     "gemini",
+    },
+}
+
+# Sentinel returned by _llm_one on 401 (invalid key) — distinct from None (other failure).
+_AUTH_FAIL = object()
+
+# Pending API-key intake: {chat_id: {"provider": str, "expires": float}}
+_pending_api_key: dict = {}
+_pending_lock = threading.Lock()
+
+# Last failed LLM prompt for retry button: {chat_id: {"istem": str, "model": str, "remaining": list}}
+_retry_prompt: dict = {}
+_retry_lock = threading.Lock()
+
+
+def _mask_key(key: str) -> str:
+    """Return masked representation for display: first 4 chars + '…'."""
+    if not key:
+        return "…"
+    return key[:4] + "…"
+
+
+def _get_provider_key(provider: str) -> str:
+    """Return the API key for *provider*.
+
+    Priority (highest first):
+      1. cfg['api_keys'][provider]  — set via /addapi or migration
+      2. cfg['openrouter_api_key']  — legacy pre-J2 config (openrouter only)
+      3. OPENROUTER_API_KEY env var — very legacy (openrouter only)
+    """
+    cfg = get_cfg()
+    key = cfg.get("api_keys", {}).get(provider, "")
+    if not key and provider == "openrouter":
+        key = cfg.get("openrouter_api_key", "") or OPENROUTER_API_KEY
+    return key or ""
+
+
+def _ordered_providers() -> list[str]:
+    """Return provider names that have a key, default-provider first.
+
+    Falls back to _PROVIDERS insertion order for ties.
+    """
+    cfg = get_cfg()
+    default = cfg.get("default_provider", "")
+    available = []
+    for p in _PROVIDERS:
+        if _get_provider_key(p):
+            available.append(p)
+    if not available:
+        return []
+    if default in available:
+        return [default] + [p for p in available if p != default]
+    return available
+
+
+# ─── Response parsers (pure — easy to unit-test) ──────────
+
+def _parse_openai_resp(body: dict) -> str:
+    """Extract content from an OpenAI-compatible chat/completions response."""
+    choices = body.get("choices") or []
+    return (choices[0].get("message", {}).get("content", "") if choices else "").strip()
+
+
+def _parse_anthropic_resp(body: dict) -> str:
+    """Extract content from an Anthropic Messages API response."""
+    content_list = body.get("content") or []
+    return (content_list[0].get("text", "") if content_list else "").strip()
+
+
+def _parse_gemini_resp(body: dict) -> str:
+    """Extract content from a Gemini generateContent response."""
+    candidates = body.get("candidates") or []
+    if not candidates:
+        return ""
+    parts_list = candidates[0].get("content", {}).get("parts") or []
+    return (parts_list[0].get("text", "") if parts_list else "").strip()
+
+
+def _llm_one(istem: str, model: str, provider: str):
+    """Single-attempt LLM call to *provider*.
+
+    Returns:
+      str        — content on success
+      _AUTH_FAIL — 401 (invalid key)
+      None       — any other failure (429, 5xx, timeout, parse error)
+
+    No retries; caller handles fallback / backoff.
+    Keys are never logged in full.
+    """
+    prov = _PROVIDERS.get(provider)
+    if prov is None:
+        return None
+    key = _get_provider_key(provider)
+    if not key:
+        return None
+
+    ptype = prov["type"]
+    p_model = model if provider == "openrouter" else prov["model"]
+
+    if ptype == "openai":
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        if provider == "openrouter":
+            headers["HTTP-Referer"] = "https://github.com/sec-analyzer-bot"
+            headers["X-Title"]      = "SEC Analyzer Bot"
+        payload  = {
+            "model": p_model,
+            "messages": [
+                {"role": "system", "content": system_message()},
+                {"role": "user",   "content": istem},
+            ],
+            "max_tokens": 1200, "temperature": 0.2,
+        }
+        endpoint = prov["endpoint"]
+        parser   = _parse_openai_resp
+
+    elif ptype == "anthropic":
+        headers  = {
+            "x-api-key":          key,
+            "anthropic-version":  "2023-06-01",
+            "Content-Type":       "application/json",
+        }
+        payload  = {
+            "model":      prov["model"],
+            "max_tokens": 1200,
+            "system":     system_message(),
+            "messages":   [{"role": "user", "content": istem}],
+        }
+        endpoint = prov["endpoint"]
+        parser   = _parse_anthropic_resp
+
+    elif ptype == "gemini":
+        headers  = {"Content-Type": "application/json"}
+        payload  = {
+            "contents": [{"parts": [{"text": f"{system_message()}\n\n{istem}"}]}],
+            "generationConfig": {"maxOutputTokens": 1200, "temperature": 0.2},
+        }
+        endpoint = prov["endpoint"].format(model=prov["model"]) + f"?key={key}"
+        parser   = _parse_gemini_resp
+
+    else:
+        return None
+
+    try:
+        r = requests.post(endpoint, headers=headers, json=payload, timeout=120)
+        if r.status_code == 401:
+            log.warning(f"LLM {provider}: 401 — key {_mask_key(key)} invalid")
+            return _AUTH_FAIL
+        if r.status_code in (429, 500, 502, 503, 504):
+            log.warning(f"LLM {provider}: {r.status_code}")
+            return None
+        r.raise_for_status()
+        content = parser(r.json())
+        if not content:
+            log.warning(f"LLM {provider}: empty response")
+            return None
+        status_reset_zero("or_errors")
+        return content
+    except requests.exceptions.Timeout:
+        log.error(f"LLM {provider}: timeout")
+        return None
+    except Exception as e:
+        status_inc("or_errors")
+        log.error(f"LLM {provider}: {e}")
+        return None
+
+def _tg_delete_msg(chat_id: str, message_id):
+    """Best-effort Telegram deleteMessage; failure logged at debug only."""
+    if not message_id:
+        return
+    try:
+        requests.post(f"{_TG}/deleteMessage", json={
+            "chat_id":    chat_id,
+            "message_id": message_id,
+        }, timeout=10)
+    except Exception as e:
+        log.debug(f"deleteMessage {chat_id}/{message_id}: {e}")
+
+
+def _handle_pending_key(chat_id: str, key_text: str, msg: dict):
+    """Process an API key message during a pending /addapi flow.
+
+    Pops the pending entry, validates key, deletes the key message from
+    Telegram (best-effort), and persists the key to config.
+    """
+    with _pending_lock:
+        entry = _pending_api_key.pop(chat_id, None)
+    if entry is None or time.time() > entry["expires"]:
+        return  # expired between check and pop — ignore
+    provider = entry["provider"]
+    if not key_text or len(key_text) < 8:
+        tg(t("addapi_invalid_key_short"))
+        return
+    _tg_delete_msg(chat_id, msg.get("message_id"))
+    def _do(c: dict):
+        c.setdefault("api_keys", {})[provider] = key_text
+        if not c.get("default_provider"):
+            c["default_provider"] = provider
+    mutate_cfg(_do)
+    tg(t("addapi_saved", provider=provider, masked_key=_mask_key(key_text)))
+
+
+def _handle_retry_callback(cq: dict):
+    """Handle the 'retry' inline-button press.
+
+    Pops the stored retry entry and tries remaining providers in order.
+    If all fail, sends t("analysis_unavailable").
+    _ctx.chat_id is already set by _process_update's callback branch.
+    """
+    with _retry_lock:
+        entry = _retry_prompt.pop(str(cq.get("from", {}).get("id", "")), None)
+    if entry is None:
+        tg_answer_callback(cq["id"], t("llm_retry_expired"))
+        return
+    tg_answer_callback(cq["id"])
+    for provider in entry.get("remaining", []):
+        result = _llm_one(entry["istem"], entry["model"], provider)
+        if isinstance(result, str):
+            tg(result)
+            return
+        if result is _AUTH_FAIL:
+            tg(t("llm_key_invalid", provider=provider))
+    tg(t("analysis_unavailable"))
+
 
 def system_message() -> str:
     """Build the LLM system message, including the active response language."""
@@ -1359,42 +1621,59 @@ def system_message() -> str:
 _LLM_MAX_PROMPT = 30000   # generous cap — avoids false-positives on multi-source prompts
 
 def llm(istem: str, model: str) -> str:
-    """OpenRouter LLM call — exponential backoff retry."""
+    """Multi-provider LLM call with proactive/reactive fallback asymmetry (J2).
+
+    Proactive (_ctx.chat_id is None):
+        Try providers in order, silently. All fail → t("analysis_unavailable").
+    Reactive (_ctx.chat_id set):
+        Try default provider only. Fail → offer retry inline button (next provider).
+        Return t("analysis_unavailable") immediately (backward-compat — callers
+        embed the return value in strings).
+    model is forwarded to openrouter only; other providers use their own default.
+    """
     if len(istem) > _LLM_MAX_PROMPT:
         log.warning(f"LLM prompt clamped: {len(istem)} → {_LLM_MAX_PROMPT} chars")
         istem = istem[:_LLM_MAX_PROMPT]
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_message()},
-            {"role": "user",   "content": istem},
-        ],
-        "max_tokens": 1200, "temperature": 0.2,
-    }
-    for attempt in range(4):
-        try:
-            r = requests.post(_OR, headers=_get_or_headers(), json=payload, timeout=120)
-            if r.status_code == 429:
-                wait_sec = min(180, 60 * (attempt + 1))
-                log.warning(f"Rate limit — waiting {wait_sec}s"); time.sleep(wait_sec); continue
-            if r.status_code in (500, 502, 503, 504):
-                wait_sec = _backoff(attempt, 10, 60)
-                log.warning(f"OpenRouter {r.status_code} — waiting {wait_sec}s"); time.sleep(wait_sec); continue
-            r.raise_for_status()
-            body = r.json()
-            choices = body.get("choices") or []
-            content = (choices[0].get("message", {}).get("content", "") if choices else "")
-            if not content:
-                raise ValueError(f"OpenRouter empty/malformed response: {str(body)[:120]}")
-            status_reset_zero("or_errors")
-            return content.strip()
-        except requests.exceptions.Timeout:
-            wait_sec = min(60, 15 * (attempt + 1))
-            log.error(f"LLM timeout (attempt {attempt+1}) — waiting {wait_sec}s"); time.sleep(wait_sec)
-        except Exception as e:
-            status_inc("or_errors")
-            wait_sec = _backoff(attempt, 10, 60)
-            log.error(f"LLM error (attempt {attempt+1}): {e} — waiting {wait_sec}s"); time.sleep(wait_sec)
+
+    providers = _ordered_providers()
+    if not providers:
+        return t("analysis_unavailable")
+
+    chat_id = getattr(_ctx, "chat_id", None)
+
+    if chat_id:
+        # Reactive: try the default (first) provider only.
+        provider = providers[0]
+        result = _llm_one(istem, model, provider)
+        if isinstance(result, str):
+            with _retry_lock:
+                _retry_prompt.pop(chat_id, None)
+            return result
+        if result is _AUTH_FAIL:
+            tg(t("llm_key_invalid", provider=provider))
+        # Offer retry button if a next provider exists.
+        if len(providers) > 1:
+            next_prov = providers[1]
+            with _retry_lock:
+                _retry_prompt[chat_id] = {
+                    "istem":     istem,
+                    "model":     model,
+                    "remaining": providers[1:],
+                }
+            keyboard = {"inline_keyboard": [[{
+                "text":          t("llm_retry_button", provider=next_prov),
+                "callback_data": "retry",
+            }]]}
+            tg_with_keyboard(t("llm_retry_offer", provider=next_prov), keyboard)
+        return t("analysis_unavailable")
+
+    # Proactive: silent fallback chain through all available providers.
+    for provider in providers:
+        result = _llm_one(istem, model, provider)
+        if isinstance(result, str):
+            return result
+        if result is _AUTH_FAIL:
+            log.warning(f"LLM {provider}: auth fail (proactive — skipping)")
     return t("analysis_unavailable")
 
 # ─── XBRL facts (F1) ─────────────────────────────────────
@@ -3687,6 +3966,86 @@ def handle_analyzeall_callback(cq: dict, token: str):
         scan_ticker(ticker, [form], True, True, quiet=False)
 
 
+# ─── Multi-LLM API management commands (J2) ──────────────
+
+def cmd_addapi(parts: list, chat_id: str, msg: dict) -> str:
+    """Admin-only: /addapi <provider> [key] — add or update an API key.
+
+    Two-message form: /addapi openrouter  → prompts for key in next message.
+    One-message form: /addapi openrouter sk-or-v1-xxx  → saves immediately.
+    Rejected in group chats (members can see message before deletion).
+    """
+    valid = list(_PROVIDERS.keys())
+    if msg.get("chat", {}).get("type", "private") != "private":
+        return t("addapi_group_rejected")
+    if len(parts) < 2:
+        return t("addapi_usage", providers=", ".join(valid))
+    provider = parts[1].lower()
+    if provider not in _PROVIDERS:
+        return t("addapi_unknown_provider", provider=provider, providers=", ".join(valid))
+    if len(parts) >= 3:
+        # One-message form: key is inline
+        key = parts[2]
+        if len(key) < 8:
+            return t("addapi_invalid_key_short")
+        _tg_delete_msg(chat_id, msg.get("message_id"))
+        def _do(c: dict):
+            c.setdefault("api_keys", {})[provider] = key
+            if not c.get("default_provider"):
+                c["default_provider"] = provider
+        mutate_cfg(_do)
+        return t("addapi_saved", provider=provider, masked_key=_mask_key(key))
+    # Two-message form: register pending entry
+    with _pending_lock:
+        _pending_api_key[chat_id] = {"provider": provider, "expires": time.time() + 120}
+    return t("addapi_prompt", provider=provider)
+
+
+def cmd_apis() -> str:
+    """Admin: /apis — list configured providers with masked keys."""
+    cfg = get_cfg()
+    api_keys = cfg.get("api_keys", {})
+    default = cfg.get("default_provider", "")
+    rows = []
+    for prov in _PROVIDERS:
+        key = api_keys.get(prov, "")
+        if key:
+            star = " ⭐" if prov == default else ""
+            rows.append(t("apis_row", provider=prov, masked_key=_mask_key(key), star=star))
+    if not rows:
+        return t("apis_empty")
+    return t("apis_header") + "\n" + "\n".join(rows)
+
+
+def cmd_setapi(parts: list) -> str:
+    """Admin: /setapi <provider> — change the default LLM provider."""
+    valid = list(_PROVIDERS.keys())
+    if len(parts) < 2:
+        return t("setapi_usage", providers=", ".join(valid))
+    provider = parts[1].lower()
+    if provider not in _PROVIDERS or not _get_provider_key(provider):
+        return t("setapi_unknown", provider=provider)
+    mutate_cfg(lambda c: c.update({"default_provider": provider}))
+    return t("setapi_done", provider=provider)
+
+
+def cmd_delapi(parts: list) -> str:
+    """Admin: /delapi <provider> — delete an API key."""
+    if len(parts) < 2:
+        return t("delapi_usage", providers=", ".join(_PROVIDERS.keys()))
+    provider = parts[1].lower()
+    cfg = get_cfg()
+    if not cfg.get("api_keys", {}).get(provider):
+        return t("delapi_unknown", provider=provider)
+    def _do(c: dict):
+        c.setdefault("api_keys", {}).pop(provider, None)
+        if c.get("default_provider") == provider:
+            remaining = [p for p in _PROVIDERS if c.get("api_keys", {}).get(p)]
+            c["default_provider"] = remaining[0] if remaining else ""
+    mutate_cfg(_do)
+    return t("delapi_done", provider=provider)
+
+
 def _process_update(upd: dict):
     global _webhook_active
 
@@ -3712,6 +4071,8 @@ def _process_update(upd: dict):
                     except ValueError:
                         idx = -1
                     handle_analyze_callback(cq, token, idx)
+                elif data == "retry":
+                    _handle_retry_callback(cq)
                 else:
                     tg_answer_callback(cq["id"])
             finally:
@@ -3733,6 +4094,24 @@ def _process_update(upd: dict):
         return
     _ctx.chat_id = chat_id
     try:
+        # Pending API key intake (J2) — intercept key messages before command dispatch
+        with _pending_lock:
+            _pentry = _pending_api_key.get(chat_id)
+        if _pentry is not None:
+            if time.time() <= _pentry["expires"]:
+                if not raw.startswith("/"):
+                    # This message is the API key
+                    _handle_pending_key(chat_id, raw, msg)
+                    return
+                else:
+                    # A command arrived while waiting — cancel pending, fall through
+                    with _pending_lock:
+                        _pending_api_key.pop(chat_id, None)
+                    tg(t("addapi_cancelled"))
+            else:
+                with _pending_lock:
+                    _pending_api_key.pop(chat_id, None)
+
         if wizard_handle(text, parts):   return
 
         # Tickers
@@ -3756,6 +4135,19 @@ def _process_update(upd: dict):
         elif komut == "/addpos":         tg(cmd_addpos(parts))
         elif komut == "/removepos":      tg(cmd_removepos(parts))
         elif komut == "/pnl":            tg(cmd_pnl())
+        # Multi-LLM API management (J2) — admin only
+        elif komut == "/addapi":
+            if _is_admin(chat_id):  tg(cmd_addapi(parts, chat_id, msg))
+            else:                   tg(t("unauthorized_admin"))
+        elif komut == "/apis":
+            if _is_admin(chat_id):  tg(cmd_apis())
+            else:                   tg(t("unauthorized_admin"))
+        elif komut == "/setapi":
+            if _is_admin(chat_id):  tg(cmd_setapi(parts))
+            else:                   tg(t("unauthorized_admin"))
+        elif komut == "/delapi":
+            if _is_admin(chat_id):  tg(cmd_delapi(parts))
+            else:                   tg(t("unauthorized_admin"))
         # Multi-chat admin (I1)
         elif komut == "/addchat":
             if _is_admin(chat_id):  tg(cmd_addchat(parts, chat_id))
@@ -3893,6 +4285,8 @@ def main():
     if migrated:
         tg(t("env_import_done", keys=", ".join(migrated)))
         log.info(f"Migrated from .env: {migrated}")
+    # Migrate legacy openrouter_api_key → api_keys["openrouter"] (J2). Idempotent.
+    _migrate_openrouter_key()
 
     bg = threading.Thread(target=background_thread, daemon=True)
     bg.start()
