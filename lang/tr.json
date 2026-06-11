@@ -277,5 +277,10 @@
   "llm_retry_offer": "⚠️ Birincil sağlayıcı başarısız oldu. *{provider}* ile tekrar denensin mi?",
   "llm_retry_button": "🔄 {provider} ile dene",
   "llm_retry_expired": "Yeniden deneme süresi doldu — komutunuzu tekrar çalıştırın.",
-  "llm_key_invalid": "⚠️ *{provider}* API anahtarı geçersiz (401). `/addapi {provider}` ile güncelleyin."
+  "llm_key_invalid": "⚠️ *{provider}* API anahtarı geçersiz (401). `/addapi {provider}` ile güncelleyin.",
+
+  "no_ai_no_keys": "🤖 AI modu kapalı — API anahtarı yapılandırılmamış. Eklemek için `/addapi` kullanın.",
+  "no_ai_all_failed": "⚠️ Tüm AI sağlayıcıları şu an yanıt vermiyor — ham metin gönderildi, daha sonra tekrar denenecek.",
+  "no_ai_reminder": "🤖 *AI modu kapalı.* API anahtarı yapılandırılmamış. Analizi etkinleştirmek için `/addapi` ile bir anahtar ekleyin.",
+  "no_ai_signal_placeholder": "n/a (AI kapalı)"
 }

@@ -262,6 +262,7 @@ _CFG_DEFAULTS = {
     "env_imported":           False, # one-time .env migration guard (J1)
     "api_keys":               {},   # {provider: key} (J2)
     "default_provider":       "",   # active LLM provider name (J2)
+    "no_keys_warned_date":    "",   # YYYY-MM-DD of last NO_KEYS reminder (J3 spam gate)
 }
 _cfg_cache: dict | None = None
 
@@ -1618,10 +1619,85 @@ def system_message() -> str:
         f"Respond in {lang_name}."
     )
 
-_LLM_MAX_PROMPT = 30000   # generous cap — avoids false-positives on multi-source prompts
+_LLM_MAX_PROMPT = 30000      # generous cap — avoids false-positives on multi-source prompts
+_RAW_TEXT_INLINE_LIMIT = 3500  # chars; above this → sendDocument (J3)
+_RAW_TEXT_FILE_MAX = 200_000   # 200 KB byte cap for sendDocument content (J3)
 
-def llm(istem: str, model: str) -> str:
+
+def ai_enabled() -> bool:
+    """True if at least one LLM provider has an API key configured.
+
+    Pure: reads config only, no network calls.
+    """
+    return bool(_ordered_providers())
+
+
+def _deliver_raw_text(body: str, ticker: str, form: str, date_str: str, warn_key: str):
+    """Deliver raw filing text when AI is unavailable (J3).
+
+    ≤3500 chars → tg() inline.  Longer → sendDocument .txt.
+    sendDocument failure → inline fallback with first 3500 chars.
+    No parse_mode: avoids Markdown errors on raw filing text.
+    """
+    warning = t(warn_key)
+    safe_body = (body or "").strip()
+
+    cid = getattr(_ctx, "chat_id", None)
+    chats = [cid] if cid else [str(c) for c in get_cfg().get("chat_ids", [])]
+
+    if not safe_body:
+        tg(warning)
+        return
+
+    if len(safe_body) <= _RAW_TEXT_INLINE_LIMIT:
+        for chat in chats:
+            _tg_to(chat, f"{warning}\n\n{safe_body}")
+        return
+
+    content = safe_body[:_RAW_TEXT_FILE_MAX]
+    if len(safe_body) > _RAW_TEXT_FILE_MAX:
+        content += "\n[truncated]"
+    filename = f"{ticker}_{form}_{date_str}.txt"
+
+    for chat in chats:
+        success = False
+        try:
+            r = requests.post(
+                f"{_TG}/sendDocument",
+                data={
+                    "chat_id":    chat,
+                    "caption":    warning[:1024],
+                },
+                files={"document": (filename, io.BytesIO(content.encode("utf-8")), "text/plain")},
+                timeout=30,
+            )
+            success = r.ok
+            if not r.ok:
+                log.debug(f"_deliver_raw_text sendDocument {chat}: {r.status_code}")
+        except Exception as e:
+            log.debug(f"_deliver_raw_text sendDocument {chat}: {e}")
+        if not success:
+            _tg_to(chat, f"{warning}\n\n{safe_body[:_RAW_TEXT_INLINE_LIMIT]}")
+
+
+def _check_no_keys_reminder():
+    """Send a NO_KEYS reminder at most once per calendar day (spam gate, J3).
+
+    Writes today's date to cfg['no_keys_warned_date'] after sending.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    cfg = get_cfg()
+    if cfg.get("no_keys_warned_date", "") == today:
+        return
+    mutate_cfg(lambda c: c.update({"no_keys_warned_date": today}))
+    tg(t("no_ai_reminder"))
+
+
+def llm(istem: str, model: str) -> str | None:
     """Multi-provider LLM call with proactive/reactive fallback asymmetry (J2).
+
+    Returns None immediately (no HTTP) when no API keys are configured (J3 NO_KEYS).
+    Callers that have source text should deliver raw text on None return.
 
     Proactive (_ctx.chat_id is None):
         Try providers in order, silently. All fail → t("analysis_unavailable").
@@ -1631,6 +1707,9 @@ def llm(istem: str, model: str) -> str:
         embed the return value in strings).
     model is forwarded to openrouter only; other providers use their own default.
     """
+    if not ai_enabled():
+        return None   # NO_KEYS: zero HTTP attempts (J3)
+
     if len(istem) > _LLM_MAX_PROMPT:
         log.warning(f"LLM prompt clamped: {len(istem)} → {_LLM_MAX_PROMPT} chars")
         istem = istem[:_LLM_MAX_PROMPT]
@@ -2123,6 +2202,7 @@ def _risk_section(text: str) -> str:
 
 def diff_analysis(ticker: str, form: str, yeni_metin: str, model: str,
                   previous: str | None = None) -> str:
+    if not ai_enabled(): return ""   # NO_KEYS: skip diff entirely (J3)
     if form not in ("10-K", "10-Q"): return ""
     if previous is None:
         previous = load_prev(ticker, form)
@@ -2392,6 +2472,9 @@ def analyze_filing(ticker: str, form: str, date_str: str, text: str,
     effective_max = _FORM_MAX_CHARS.get(form, max_chars)
     body = extract_section(text, form, effective_max)
     custom  = custom_prompts.get(form, "")
+    if not ai_enabled():
+        # NO_KEYS: signal caller to deliver raw text; diff skipped (J3)
+        return None, None
     analysis = llm(build_prompt(ticker, form, date_str, body, custom, facts_block), model)
     diff   = diff_analysis(ticker, form, text, model)
     return analysis, diff
@@ -2479,6 +2562,17 @@ def scan_ticker(ticker: str, forms: list,
             cfg["max_chars"], cfg["model"], cfg["custom_prompts"],
             facts_block=facts_block,
         )
+        if analysis is None:
+            # NO_KEYS: deliver raw text instead of LLM analysis (J3)
+            _check_no_keys_reminder()
+            body = extract_section(text, form, _FORM_MAX_CHARS.get(form, cfg["max_chars"]))
+            _deliver_raw_text(body, ticker, form, date_str, "no_ai_no_keys")
+            if save_to_cache:
+                ob = load_cache()
+                mark_processed(ob, ticker, form, date_str)
+                save_cache(ob)
+            time.sleep(5)
+            continue
         unverified = verify_numeric_claims(analysis, facts_block, text)
         send_filing_result(ticker, form, date_str, text,
                            analysis, diff, save_to_cache, quiet,
@@ -2634,12 +2728,18 @@ def cmd_compare(parts: list):
 
     date_a, text_a = res_a
     date_b, text_b = res_b
+    body_a = extract_section(text_a, form, _COMPARE_PER_SIDE_MAX)
+    body_b = extract_section(text_b, form, _COMPARE_PER_SIDE_MAX)
     summary = llm(
-        build_compare_prompt(ticker_a, ticker_b, form,
-                             extract_section(text_a, form, _COMPARE_PER_SIDE_MAX),
-                             extract_section(text_b, form, _COMPARE_PER_SIDE_MAX)),
+        build_compare_prompt(ticker_a, ticker_b, form, body_a, body_b),
         cfg["model"],
     )
+    if summary is None:
+        # NO_KEYS: deliver raw text for each side (J3)
+        tg(t("no_ai_no_keys"))
+        _deliver_raw_text(body_a, ticker_a, form, date_a, "no_ai_no_keys")
+        _deliver_raw_text(body_b, ticker_b, form, date_b, "no_ai_no_keys")
+        return
     tg(t("compare_header",
          a=ticker_a, date_a=date_a,
          b=ticker_b, date_b=date_b,
@@ -2793,14 +2893,21 @@ def cmd_sentiment():
 
     signals = []
     today_iso = datetime.now().strftime("%Y-%m-%d")
+    _no_keys = not ai_enabled()   # snapshot once for this run (J3)
     for ticker, texts in ticker_data:
-        signal = llm(
-            f"{ticker} — Last 30 days Form 4 transactions:\n{texts[:6000]}\n\n"
-            "Summarize in a single line:\n"
-            "Format: EMOJI SENTIMENT (Bullish/Bearish/Neutral) — 1-sentence reason\n"
-            "Emoji: 📈 Bullish, 📉 Bearish, ➡️ Neutral",
-            cfg["model"]
-        )
+        if _no_keys:
+            # Source text exists — but /sentiment is synthesis; use n/a label (J3)
+            signal = t("no_ai_signal_placeholder")
+        else:
+            signal = llm(
+                f"{ticker} — Last 30 days Form 4 transactions:\n{texts[:6000]}\n\n"
+                "Summarize in a single line:\n"
+                "Format: EMOJI SENTIMENT (Bullish/Bearish/Neutral) — 1-sentence reason\n"
+                "Emoji: 📈 Bullish, 📉 Bearish, ➡️ Neutral",
+                cfg["model"]
+            )
+            if signal is None:
+                signal = t("no_ai_signal_placeholder")
         signals.append(f"*{ticker}*: {signal}")
         # Persist for /sentiment trend comparisons.
         try:
@@ -2809,13 +2916,19 @@ def cmd_sentiment():
             log.error(f"append_sentiment {ticker}: {e}")
         time.sleep(3)
 
-    portfolio = llm(
-        "Based on the following insider signals, give a portfolio-wide assessment:\n\n"
-        + "\n".join(signals)
-        + "\n\nWhat is the insider sentiment across the portfolio? "
-        "Are there any standout warnings or opportunities?",
-        cfg["model"]
-    )
+    if _no_keys:
+        # Synthesis: no source text — skip portfolio summary (J3)
+        portfolio = t("no_ai_signal_placeholder")
+    else:
+        portfolio = llm(
+            "Based on the following insider signals, give a portfolio-wide assessment:\n\n"
+            + "\n".join(signals)
+            + "\n\nWhat is the insider sentiment across the portfolio? "
+            "Are there any standout warnings or opportunities?",
+            cfg["model"]
+        )
+        if portfolio is None:
+            portfolio = t("no_ai_signal_placeholder")
 
     tg(t("sentiment_score_header",
          count=len(ticker_data),

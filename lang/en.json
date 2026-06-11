@@ -277,5 +277,10 @@
   "llm_retry_offer": "⚠️ Primary provider failed. Retry with *{provider}*?",
   "llm_retry_button": "🔄 Try {provider}",
   "llm_retry_expired": "Retry expired — please run your command again.",
-  "llm_key_invalid": "⚠️ API key for *{provider}* is invalid (401). Update it with `/addapi {provider}`."
+  "llm_key_invalid": "⚠️ API key for *{provider}* is invalid (401). Update it with `/addapi {provider}`.",
+
+  "no_ai_no_keys": "🤖 AI mode is off — no API key configured. Add one with `/addapi`.",
+  "no_ai_all_failed": "⚠️ All AI providers are currently unavailable — raw text sent, will retry later.",
+  "no_ai_reminder": "🤖 *AI mode is off.* No API key is configured. Add one with `/addapi` to enable analysis.",
+  "no_ai_signal_placeholder": "n/a (AI off)"
 }
