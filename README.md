@@ -10,7 +10,7 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 [![OpenRouter](https://img.shields.io/badge/LLM-OpenRouter%20Free-6c47ff)](https://openrouter.ai)
 [![Telegram](https://img.shields.io/badge/Interface-Telegram-2CA5E0?logo=telegram&logoColor=white)](https://telegram.org)
 [![CI](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-472%20passing-success)](#-tests)
+[![Tests](https://img.shields.io/badge/tests-503%20passing-success)](#-tests)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 </div>
@@ -45,7 +45,8 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 | ✅ **Numeric Verification** | Figures in the LLM output are checked against XBRL facts and the filing text; unverifiable ones are flagged with ⚠️ |
 | 🔎 **Keyword Alerts** | Watch any phrase across ALL EDGAR filings (`/addword`); hourly full-text search alert, no LLM cost |
 | 💼 **Portfolio P&L** | Track positions with `/addpos`; `/pnl` shows unrealized profit/loss per ticker (yfinance, optional dep) |
-| 🧪 **Tested** | 472 pytest tests for pure helpers, i18n, config cache, thread safety |
+| 👥 **Multi-Chat** | Share the bot with up to 5 chats (`/addchat`); alerts broadcast to all, replies stay private to the asking chat |
+| 🧪 **Tested** | 503 pytest tests for pure helpers, i18n, config cache, thread safety |
 | ⚡ **OpenRouter Free LLM** | openrouter/free, $0 cost |
 | 📱 **Lightweight** | Single 1.8k-line `bot.py`, runs on a mid-range Android phone via Termux |
 
@@ -68,7 +69,7 @@ sec-analyzer/
 ├── lang/
 │   ├── en.json                  # English UI strings (default)
 │   └── tr.json                  # Turkish UI strings
-├── tests/                       # 472 pytest tests (+ 6 opt-in live network tests)
+├── tests/                       # 503 pytest tests (+ 6 opt-in live network tests)
 │   ├── conftest.py
 │   ├── test_alarm_buttons.py    # Interactive alarm + on-demand .md button
 │   ├── test_cfg.py              # Config cache + atomic mutate
@@ -77,6 +78,7 @@ sec-analyzer/
 │   ├── test_groups.py           # Watchlist groups
 │   ├── test_hotfixes.py         # Atomic JSON IO, wizard guard, digest week
 │   ├── test_i18n.py             # Language loader, t(), fallback
+│   ├── test_multichat.py        # Multi-chat auth, migration, broadcast
 │   ├── test_network.py          # Opt-in live endpoint tests (--network flag)
 │   ├── test_portfolio.py        # Portfolio P&L
 │   ├── test_price.py            # Price compute helpers + snippet formatting
@@ -142,6 +144,8 @@ TELEGRAM_CHAT_ID=123456789                    # From @userinfobot
 `config.py` is a thin loader that reads these via `python-dotenv` — you never edit `config.py` itself. At startup the bot runs a health check and refuses to run if any of the four is missing, malformed, or still a placeholder.
 
 Everything else — tickers, default forms, model, schedule, language, custom prompts, webhook URL, price-action lookforward, raw-filing cap (default 100), cache TTL — is managed live via Telegram commands and stored in `~/sec-analyzer/bot_config.json`.
+
+**Multi-chat:** authorized chats are stored as a `chat_ids` list in `bot_config.json`. The first element is the admin; only the admin can run `/addchat`, `/removechat`, and `/listchats`. Proactive messages (alerts, scheduled scans) broadcast to all authorized chats; command replies go only to the chat that sent the command. All authorized chats share the same watchlist, language, and settings. If your existing config has a single `TELEGRAM_CHAT_ID`, the bot migrates it automatically on first start — no action required. Maximum 5 authorized chats.
 
 ---
 
@@ -222,6 +226,13 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 | `/addpos TICKER QTY PRICE [DATE]` | Add a lot; fractional shares OK, max 50 lots |
 | `/removepos TICKER` | Remove all lots for a ticker |
 | `/pnl` | Unrealized P&L summary (delayed prices via yfinance) |
+
+### Multi-chat (admin only)
+| Command | Action |
+|---|---|
+| `/addchat <id>` | Authorize a chat (max 5); group IDs are negative, e.g. `/addchat -1001234567890` |
+| `/removechat <id>` | Remove a chat from the authorized list (admin cannot remove itself) |
+| `/listchats` | Show all authorized chats; ⭐ marks the admin |
 
 ### Language & Webhook
 | Command | Action |
@@ -374,7 +385,7 @@ python -m pytest tests/ -q
 ```
 
 ```
-472 passed, 6 skipped in <3s
+503 passed, 6 skipped in <3s
 ```
 
 The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, …), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the thread-safe state stores, and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline. The 6 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
@@ -406,10 +417,19 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 | `⚠️ Could not verify against filing data: …` appears in an analysis | The flagged figure was not found in the filing's audited XBRL data or text — treat it with caution; it may be LLM-derived (e.g., a computed total or segment share). Not necessarily wrong, just unverifiable. |
 | `/pnl` shows `n/a` for a ticker | yfinance has no data for it (delisted or non-US listing) — the total skips that row; also check `pip install yfinance` |
 | Watchword alert fires but nothing analyzed | By design: keyword alerts are probe-only (no LLM); run `/scanticker` on the company if you want an analysis |
+| Bot doesn't respond in a new chat | The chat isn't authorized — the admin must run `/addchat <id>` first; unauthorized chats are ignored silently by design |
+| `/addchat` says limit reached | Cap is 5 chats; remove one with `/removechat` first |
 
 ---
 
 ## 📝 Release Notes
+
+### v2.9
+- **Multi-Chat (Model A):** Share one bot instance with up to 5 authorized Telegram chats. Proactive messages — scheduled scans, filing alerts, watchword alarms, digest — broadcast to all authorized chats. Command replies go only to the chat that sent the command. All authorized chats share the same watchlist, language, and settings (Model B with per-chat isolation is out of scope).
+- **Admin commands:** `/addchat <id>` authorizes a new chat (Telegram group IDs are negative, e.g. `/addchat -1001234567890`); `/removechat <id>` removes one (admin cannot remove itself); `/listchats` shows all authorized chats with ⭐ marking the admin. Maximum 5 chats.
+- **Automatic migration:** existing single-chat configs (`TELEGRAM_CHAT_ID` env var or legacy `chat_id` config key) are migrated to the new `chat_ids` list on first startup — no user action required.
+- **Security:** unauthorized chats are ignored silently; the bot's existence is not revealed to unknown callers.
+- **+31 tests** (`test_multichat.py`: migration, auth, broadcast isolation, context routing, admin commands, i18n parity) — **503 total**.
 
 ### v2.8
 - **Git repository + MIT license:** Project initialized as a git repository with `.gitignore` covering runtime state, secrets, and internal orchestration files.
