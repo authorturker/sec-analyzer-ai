@@ -10,6 +10,7 @@ venv/
 seen.json
 cache.json
 watchword_seen.json
+portfolio_history.json
 bot_config.json
 *.log
 

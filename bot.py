@@ -46,7 +46,8 @@ PREV_DIR    = BASE_DIR / "previous_filings"
 WEEKLY_LOG  = BASE_DIR / "weekly_log.json"
 SENT_HIST   = BASE_DIR / "sentiment_history.json"
 PRICE_CACHE     = BASE_DIR / "price_cache.json"
-WATCHWORD_SEEN  = BASE_DIR / "watchword_seen.json"
+WATCHWORD_SEEN      = BASE_DIR / "watchword_seen.json"
+PORTFOLIO_HISTORY   = BASE_DIR / "portfolio_history.json"   # J4 daily value log
 LANG_DIR        = Path(__file__).resolve().parent / "lang"
 for d in [OUTPUT_DIR, PREV_DIR]:
     d.mkdir(parents=True, exist_ok=True)
@@ -73,6 +74,7 @@ _sent_lock   = threading.Lock()     # sentiment_history.json
 _price_lock  = threading.Lock()     # price_cache.json
 _alarm_lock      = threading.Lock()     # _pending_alarms (interactive alarm)
 _watchword_lock  = threading.Lock()     # watchword_seen.json dedup state (G1)
+_phistory_lock   = threading.Lock()     # portfolio_history.json (J4)
 _stop_event  = threading.Event()
 _ctx         = threading.local()    # per-thread reactive context (I1): _ctx.chat_id
 
@@ -3587,7 +3589,8 @@ def cmd_listchats() -> str:
 # Storage: cfg["portfolio"] = list of lot dicts.
 # All pure helpers are IO-free and offline-testable.
 
-_PORTFOLIO_MAX = 50   # hard cap on number of lots
+_PORTFOLIO_MAX         = 50    # hard cap on number of lots
+_PORTFOLIO_HISTORY_CAP = 730  # max records in portfolio_history.json (J4 ≈ 2 years)
 
 
 def _parse_pos_args(parts: list) -> "dict | str":
@@ -3793,6 +3796,88 @@ def cmd_removepos(parts: list) -> str:
              ticker=_md_escape(ticker), count=count)
 
 
+# ─── Portfolio value history helpers (J4) ─────────────────────────────────────
+
+def _prune_history(h: dict, cap: int = _PORTFOLIO_HISTORY_CAP) -> dict:
+    """PURE: remove oldest entries until len <= cap. Returns new dict."""
+    if len(h) <= cap:
+        return h
+    keys = sorted(h.keys())
+    trim = keys[:len(h) - cap]
+    return {k: v for k, v in h.items() if k not in trim}
+
+
+def _compute_delta(history: dict, today_val: float, days: int) -> "tuple[float, float] | None":
+    """PURE: compute (abs_delta, pct_delta) vs snapshot ~`days` ago.
+
+    Finds nearest record <= target date (today - days), within 5-day tolerance.
+    Returns None if no qualifying record found, or if base value is 0.
+    today_val itself is NOT in history yet when this is called.
+    """
+    from datetime import date, timedelta
+    target = date.today() - timedelta(days=days)
+    target_str = target.isoformat()
+    candidates = [k for k in history if k <= target_str]
+    if not candidates:
+        return None
+    best = max(candidates)
+    cutoff = (target - timedelta(days=5)).isoformat()
+    if best < cutoff:
+        return None
+    base_val = history[best]
+    if base_val == 0:
+        return None
+    abs_delta = today_val - base_val
+    pct_delta = abs_delta / base_val * 100.0
+    return abs_delta, pct_delta
+
+
+def load_portfolio_history() -> dict:
+    """IO: read portfolio_history.json → dict. Missing/corrupt → {}."""
+    with _phistory_lock:
+        return _read_json(PORTFOLIO_HISTORY, {})
+
+
+def save_portfolio_history(h: dict) -> None:
+    """IO: atomically write portfolio_history.json."""
+    with _phistory_lock:
+        _atomic_write_json(PORTFOLIO_HISTORY, h)
+
+
+def maybe_snapshot_portfolio_value(agg: dict, prices: dict) -> None:
+    """IO: write today's UTC total value if ALL tickers have prices.
+
+    agg:    {ticker: (qty, avg_cost)}
+    prices: {ticker: float | None}
+
+    If any price is None → log.debug + skip (no partial snapshot written).
+    Same-day second call overwrites (last price wins).
+    """
+    if not YF_OK or not agg:
+        return
+    for ticker in agg:
+        if prices.get(ticker) is None:
+            log.debug(f"maybe_snapshot: skipping — no price for {ticker}")
+            return
+    total = sum(agg[tk][0] * prices[tk] for tk in agg)
+    from datetime import timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    h = load_portfolio_history()
+    h[today] = total
+    h = _prune_history(h, cap=_PORTFOLIO_HISTORY_CAP)
+    save_portfolio_history(h)
+    log.debug(f"maybe_snapshot: saved {today} = {total:.2f}")
+
+
+def _format_delta(abs_d: "float | None", pct_d: "float | None") -> str:
+    """PURE: format one delta column. None → 'n/a'."""
+    if abs_d is None or pct_d is None:
+        return "n/a"
+    emoji = "📈" if abs_d >= 0 else "📉"
+    sign  = "+" if abs_d >= 0 else ""
+    return f"{emoji} {sign}${abs_d:,.2f} ({sign}{pct_d:.2f}%)"
+
+
 def cmd_pnl() -> str:
     if not YF_OK:
         return t("yfinance_missing", cmd="/pnl")
@@ -3806,7 +3891,29 @@ def cmd_pnl() -> str:
         prices[ticker] = fetch_last_close(ticker)
         time.sleep(0.5)
     rows = compute_pnl_rows(agg, prices)
-    return format_pnl(rows)
+    # J4: opportunistic snapshot (only if all prices present)
+    maybe_snapshot_portfolio_value(agg, prices)
+    base = format_pnl(rows)
+    # J4: append delta line if snapshot data available
+    priced_rows = [r for r in rows if r["last"] is not None]
+    if not priced_rows or len(priced_rows) != len(rows):
+        return base   # partial prices → no delta line
+    today_val = sum(r["value"] for r in priced_rows)
+    h = load_portfolio_history()
+    # Remove today's just-written entry for delta calc (can't diff against itself)
+    from datetime import timezone
+    today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    h_without_today = {k: v for k, v in h.items() if k != today_key}
+    d1  = _compute_delta(h_without_today, today_val, 1)
+    d7  = _compute_delta(h_without_today, today_val, 7)
+    d30 = _compute_delta(h_without_today, today_val, 30)
+    col1  = _format_delta(d1[0]  if d1  else None, d1[1]  if d1  else None)
+    col7  = _format_delta(d7[0]  if d7  else None, d7[1]  if d7  else None)
+    col30 = _format_delta(d30[0] if d30 else None, d30[1] if d30 else None)
+    delta_line = t("pnl_delta_line",
+                   total=today_val,
+                   d1=col1, d7=col7, d30=col30)
+    return f"{base}\n{delta_line}"
 
 
 # ─── Background thread ────────────────────────────────────
@@ -3841,6 +3948,17 @@ def background_thread():
                         log.info(f"Scheduled scan: {schedule_str}")
                         tg(t("scheduled_scan_starting", time=schedule_str))
                         cmd_sec(quiet=False)
+                        # J4: opportunistic portfolio snapshot after scheduled scan
+                        if YF_OK:
+                            _bg_cfg = get_cfg()
+                            _bg_lots = _bg_cfg.get("portfolio", [])
+                            if _bg_lots:
+                                _bg_agg = aggregate_positions(_bg_lots)
+                                _bg_prices: dict[str, "float | None"] = {}
+                                for _bg_tk in _bg_agg:
+                                    _bg_prices[_bg_tk] = fetch_last_close(_bg_tk)
+                                    time.sleep(0.5)
+                                maybe_snapshot_portfolio_value(_bg_agg, _bg_prices)
 
             # Hourly alarm — PROBE ONLY. Existence check that does not touch
             # the cache, the LLM, or weekly_log. The user runs /check manually

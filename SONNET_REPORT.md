@@ -1,90 +1,64 @@
-# SONNET REPORT — J3: No-AI Mode — LLM'siz Zarif Bozulma
+# SONNET REPORT — J4: Portföy Değer Geçmişi — Günlük Anlık Görüntü + Δ Satırları
 
 **Tarih:** 2026-06-11
-**Görev:** FABLE_PLAN.md § 1 — Görev J3
+**Görev:** FABLE_PLAN.md § 1 — Görev J4
 **Durum:** ✅ Tamamlandı
 
 ---
 
 ## 1. Yapılan Değişiklikler
 
-| Dosya | Değişiklik |
-|---|---|
-| `bot.py` — `_CFG_DEFAULTS` | `"no_keys_warned_date": ""` eklendi |
-| `bot.py` — LLM bölümü | `_RAW_TEXT_INLINE_LIMIT = 3500`, `_RAW_TEXT_FILE_MAX = 200_000` sabitleri |
-| `bot.py` — LLM bölümü | `ai_enabled()` — saf bool, `_ordered_providers()` delegasyonu |
-| `bot.py` — LLM bölümü | `_deliver_raw_text()` — ≤3500 inline / üstü sendDocument / document fail → inline fallback |
-| `bot.py` — LLM bölümü | `_check_no_keys_reminder()` — günlük spam çiti, cfg'ye tarih yazar |
-| `bot.py` — `llm()` | Başına `if not ai_enabled(): return None` eklendi (sıfır HTTP kısa devre) |
-| `bot.py` — `diff_analysis()` | Başına `if not ai_enabled(): return ""` eklendi |
-| `bot.py` — `analyze_filing()` | `not ai_enabled()` ise `return None, None` |
-| `bot.py` — `scan_ticker()` | `analysis is None` yakalanır → `_check_no_keys_reminder()` + `_deliver_raw_text()` + cache + continue |
-| `bot.py` — `compare_tickers` | `summary is None` ise ham metin her iki taraf için teslim |
-| `bot.py` — `cmd_sentiment()` | `_no_keys` snapshot; ticker döngüsü + portföy sentezi → `no_ai_signal_placeholder` |
-| `lang/en.json` | 4 yeni anahtar |
-| `lang/tr.json` | 4 yeni anahtar (EN paritesi) |
-| `tests/test_no_ai_mode.py` | **Yeni dosya** — 34 test |
+### bot.py
+
+- **`PORTFOLIO_HISTORY`** sabit yolu eklendi (`BASE_DIR / "portfolio_history.json"`).
+- **`_phistory_lock`** threading.Lock() eklendi (J4 JSON IO koruması).
+- **`_PORTFOLIO_HISTORY_CAP = 730`** sabit eklendi.
+- **`_prune_history(h, cap)`** — PURE: en eski kayıtları kırpar; cap=730 varsayılan.
+- **`_compute_delta(history, today_val, days)`** — PURE: hedef tarihe ≤ ve en fazla 5 gün eski en yakın kaydı bulur; paya-0 → None; tolerans dışı → None.
+- **`load_portfolio_history()` / `save_portfolio_history(h)`** — `_phistory_lock` altında `_read_json` / `_atomic_write_json` kullanır.
+- **`maybe_snapshot_portfolio_value(agg, prices)`** — tüm fiyatlar mevcutsa UTC günlük toplam değeri yazar; eksik fiyat → log.debug + atla; aynı gün üzerine yazar; prune uygular.
+- **`_format_delta(abs_d, pct_d)`** — PURE: n/a veya emoji+$+% biçimleri döner.
+- **`cmd_pnl()`** genişletildi: `maybe_snapshot_portfolio_value` çağrısı eklendi; tüm fiyatlar tam ise delta satırı eklenir (eksik fiyat varsa satır eklenmez). Bugünkü anahtar delta hesabından hariç tutulur (kendisiyle kıyas yok).
+- **`background_thread()`**: zamanlanmış tarama sonrası fırsatçı portföy anlık görüntüsü alır.
+
+### lang/en.json + lang/tr.json
+
+- **`pnl_delta_line`** — EN/TR pariteli yeni i18n anahtarı. `{total}`, `{d1}`, `{d7}`, `{d30}` parametreleri.
+
+### .gitignore / .dockerignore
+
+- `portfolio_history.json` her ikisine eklendi.
 
 ---
 
-## 2. llm() Çağrı Yeri Haritası
+## 2. Test Sonuçları
 
-| # | Konum | Fonksiyon | Kaynak Metin | NO_KEYS Davranışı | ALL_FAILED Davranışı |
-|---|---|---|---|---|---|
-| 1 | `analyze_filing()` | Dosyalama analizi | `body` (extract_section) | `(None, None)` → scan_ticker ham metin teslimi | `t("analysis_unavailable")` (J2 mevcut) |
-| 2 | `diff_analysis()` | Risk faktörü farkı | `yeni_risk` (risk bölümü) | `""` — diff sessizce atlanır | `""` — diff sessizce atlanır |
-| 3 | `compare_tickers` | Şirket karşılaştırması | `text_a`, `text_b` (extract_section) | ham metin her iki taraf için teslim | `t("analysis_unavailable")` karşılaştırma mesajına gömülür |
-| 4 | `cmd_sentiment()` ticker döngüsü | Form 4 sinyal özeti | `texts[:6000]` | `no_ai_signal_placeholder` | `no_ai_signal_placeholder` (llm None → atanır) |
-| 5 | `cmd_sentiment()` portföy sentezi | Portföy değerlendirmesi | Sentez (kaynak metin YOK) | `no_ai_signal_placeholder` — sentez atlanır | `no_ai_signal_placeholder` (llm None → atanır) |
+```
+677 passed, 6 skipped in 2.72s
+```
 
----
-
-## 3. Yeni Testler (test_no_ai_mode.py — sınıf başına)
-
-| Sınıf | Test Sayısı |
-|---|---|
-| `TestAiEnabled` | 4 |
-| `TestLlmNoKeys` | 3 |
-| `TestDeliverRawText` | 8 |
-| `TestNoKeysReminder` | 4 |
-| `TestAnalyzeFilingNoAi` | 3 |
-| `TestDiffAnalysisNoAi` | 2 |
-| `TestSentimentNoAi` | 2 |
-| `TestJ3I18nKeys` | 8 (4 anahtar × 2 dil, parametrize) |
+Yeni test dosyası: `tests/test_portfolio_history.py` — 31 test:
+- `TestPruneHistory` (4): alt/eşit/üzeri cap, 730 sabit.
+- `TestComputeDelta` (9): tam eşleşme, tolerans içi, sınır (5g), dışı (6g), aday yok, tek-kayıt-bugün hariç, sıfır-pay, negatif delta, en-yakın seçimi.
+- `TestMaybeSnapshot` (6): YF_OK=False, boş agg, eksik fiyat, tam → yazar, aynı-gün üzerine yazar, prune uygulanır.
+- `TestLoadSaveHistory` (3): eksik dosya, bozuk dosya, roundtrip.
+- `TestCmdPnlDelta` (4): ilk gün (geçmiş yok), geçmiş varsa delta satırı, YF_OK=False, kısmi fiyat.
+- `TestFormatDelta` (3): None→n/a, pozitif emoji, negatif emoji.
+- `TestJ4I18nKeys` (2): EN + TR `pnl_delta_line` var ve anahtar adına geri düşmüyor.
 
 ---
 
-## 4. Kabul Kriterleri Sonuçları
+## 3. Kabul Kriterleri Doğrulaması
 
-| Kriter | Durum |
-|---|---|
-| `python -m pytest tests/ -q` → `646 passed, 6 skipped` | ✅ |
-| Mevcut 612 test kırılmadı | ✅ |
-| `NO_KEYS`'te sıfır HTTP çağrısı (mock kanıtı) | ✅ `TestLlmNoKeys::test_zero_http_calls_on_no_keys` |
-| Kırpma sınırı (3.500↔dosya geçişi) | ✅ `test_exactly_at_limit_goes_inline` + `test_long_body_sends_document` |
-| 200 KB tavanı + `[truncated]` | ✅ `test_200kb_cap_truncated` |
-| Boş metin yolu | ✅ `test_empty_body_sends_only_warning` |
-| sendDocument başarısızlık yedeği | ✅ `test_document_failure_fallback_inline` |
-| Sentez noktalarının atlanması | ✅ `test_no_ai_signal_placeholder_used` |
-| Günlük hatırlatma çiti | ✅ `test_no_repeat_same_day` |
-| i18n EN/TR parite (4 yeni anahtar) | ✅ `TestJ3I18nKeys` |
-| `llm(` çağrı yeri haritası SONNET_REPORT'ta | ✅ Bölüm 2 |
-| Commit: `feat: No-AI mode — graceful degradation without LLM (J3)` | ✅ `[main fffca4c]` |
-| `git status` temiz | ✅ |
-| SONNET_REPORT.md güncellendi | ✅ Bu dosya |
+1. ✅ Yeni testler — tüm spec senaryoları kapsandı.
+2. ✅ `677 passed, 6 skipped` — mevcut 646 test kırılmadı.
+3. ✅ `grep -n "portfolio_history.json" .gitignore .dockerignore` → her ikisinde de mevcut.
+4. ✅ Commit mesajı: `feat: portfolio value history — daily snapshots + 1d/7d/30d deltas (J4)`.
 
 ---
 
-## 5. Mimari Notlar
+## 4. Mimari Notlar
 
-**`ai_enabled()` delegasyonu:** `_ordered_providers()` zaten env var + cfg fallback hiyerarşisini biliyor. `ai_enabled()` bunu çağırır — mantık tekrarı yok.
-
-**`llm()` dönüş tipi:** `str | None`. Mevcut `t("analysis_unavailable")` (ALL_FAILED) string olarak kalmaya devam eder — geriye uyumlu. Yalnız `None` yeni davranış (NO_KEYS).
-
-**Ham metin parse_mode'suz:** Filing metinleri Markdown özel karakterleri içerebilir. `_tg_to()` zaten 400 durumunda plain text'e düşüyor — ek güvence.
-
-**`sendDocument` yedek mantığı:** Doğrudan `requests.post` çağrısı yapılır (tek deneme); exception veya `not r.ok` → `_tg_to()` ile ilk 3500 karakter inline.
-
-**`scan_ticker()` cache davranışı:** NO_KEYS'te analiz yapılamasa da dosyalama cache'lenir — anahtar eklendikten sonra aynı dosyalama tekrar işlenmez.
-
-**J3 dalgası kapandı.**
+- Delta hesabı `today_key` dışarıda tutularak yapılır — yeni yazılan anlık görüntüyle kıyas hatasını önler.
+- `_prune_history(h, cap=_PORTFOLIO_HISTORY_CAP)` şeklinde açık geçirme: `cap` varsayılan parametresi tanım anında değerlendirildiğinden, monkeypatch testlerinin çalışması için gereklidir.
+- Zamanlanmış taramadaki anlık görüntü yeni fiyat GET isteği yapar (tarama zaten yfinance kullanmıyor); `time.sleep(0.5)` ticker arası oran sınırlaması için korundu.

@@ -244,6 +244,7 @@
   "pnl_row_na": "• `{ticker}` ×{qty} @ ${avg_cost:.2f} — n/a",
   "pnl_total": "\n*Total:* ${value:,.2f} {emoji} {pnl_usd:+,.2f} ({pnl_pct})",
   "pnl_na_note": "_{count} position(s) excluded (price unavailable)_",
+  "pnl_delta_line": "Σ Total: ${total:,.2f} · 1d: {d1} · 7d: {d7} · 30d: {d30}",
   "addchat_confirm": "✅ Chat `{id}` added to authorized list.",
   "addchat_limit": "⚠️ Limit reached ({max} chats max). Remove one with /removechat first.",
   "addchat_format_error": "⚠️ Invalid chat ID — must be an integer. Usage: /addchat <id>",

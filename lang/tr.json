@@ -244,6 +244,7 @@
   "pnl_row_na": "• `{ticker}` ×{qty} @ ${avg_cost:.2f} — n/a",
   "pnl_total": "\n*Toplam:* ${value:,.2f} {emoji} {pnl_usd:+,.2f} ({pnl_pct})",
   "pnl_na_note": "_{count} pozisyon hariç tutuldu (fiyat alınamadı)_",
+  "pnl_delta_line": "Σ Toplam: ${total:,.2f} · 1g: {d1} · 7g: {d7} · 30g: {d30}",
   "addchat_confirm": "✅ `{id}` numaralı chat yetkili listeye eklendi.",
   "addchat_limit": "⚠️ Sınıra ulaşıldı (maksimum {max} chat). Önce /removechat ile bir chat silin.",
   "addchat_format_error": "⚠️ Geçersiz chat ID — tam sayı olmalıdır. Kullanım: /addchat <id>",

@@ -21,6 +21,7 @@ price_cache.json
 bot_config.json
 weekly_log.json
 sentiment_history.json
+portfolio_history.json
 
 # Internal orchestration (not part of the product)
 FABLE_PLAN.md
