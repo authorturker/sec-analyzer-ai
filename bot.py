@@ -3429,6 +3429,23 @@ def cmd_settings() -> str:
     ticker_list = ""
     if cfg["tickers"]:
         ticker_list = " — `" + "  ".join(cfg["tickers"]) + "`"
+    # Active LLM provider display
+    default_prov = cfg.get("default_provider", "")
+    api_keys = cfg.get("api_keys", {})
+    if not default_prov:
+        active_provider = f"— ({t('no_ai_no_keys').split('.')[0].lstrip('🤖 ')})"
+    elif not api_keys.get(default_prov):
+        active_provider = f"{default_prov} (no key)"
+    else:
+        active_provider = default_prov
+    # Registered LLM provider names (names only, no keys/masks)
+    llm_registered = [p for p in _PROVIDERS if api_keys.get(p)]
+    registered_providers = ", ".join(llm_registered) if llm_registered else t("label_off")
+    # Data source: fiscalai key present or EDGAR
+    if api_keys.get(_FISCAL_AI_PROVIDER):
+        data_source = "fiscalai ✓ (EDGAR fallback)"
+    else:
+        data_source = "EDGAR"
     return t("settings_block",
              model=cfg['model'],
              lookback=cfg['days_lookback'],
@@ -3440,7 +3457,10 @@ def cmd_settings() -> str:
              schedule=cfg.get('schedule') or t("label_off"),
              alarm=t("label_on") if cfg.get('alarm_on') else t("label_off"),
              digest=t("label_on") if cfg.get('weekly_digest') else t("label_off"),
-             prompt_count=len(cfg.get('custom_prompts', {})))
+             prompt_count=len(cfg.get('custom_prompts', {})),
+             active_provider=active_provider,
+             registered_providers=registered_providers,
+             data_source=data_source)
 
 def cmd_status() -> str:
     snap = status_snapshot()
