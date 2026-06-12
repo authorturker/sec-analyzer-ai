@@ -88,7 +88,7 @@ class TestCmdSetsource:
     def test_invalid_arg_rejected(self, bot, monkeypatch, tmp_path):
         self._fresh(bot, monkeypatch, tmp_path)
         out = bot.cmd_setsource(["/setsource", "both"])
-        assert bot.t("setsource_invalid", valid="auto | fiscalai | edgar") in out
+        assert bot.t("setsource_invalid", valid="auto | fiscalai | twelvedata | edgar") in out
 
     def test_set_edgar(self, bot, monkeypatch, tmp_path):
         self._fresh(bot, monkeypatch, tmp_path)
@@ -106,7 +106,7 @@ class TestCmdSetsource:
         bot.mutate_cfg(lambda c: c.update({"api_keys": {}}))
         bot._cfg_cache = None
         out = bot.cmd_setsource(["/setsource", "fiscalai"])
-        assert bot.t("setsource_no_key") in out
+        assert bot.t("setsource_no_key", provider="fiscalai") in out
 
     def test_set_fiscalai_with_key_ok(self, bot, monkeypatch, tmp_path):
         """fiscalai selected with key → normal ok response."""
@@ -115,7 +115,7 @@ class TestCmdSetsource:
         bot._cfg_cache = None
         out = bot.cmd_setsource(["/setsource", "fiscalai"])
         assert bot.t("setsource_ok", source="fiscalai") in out
-        assert bot.t("setsource_no_key") not in out
+        assert bot.t("setsource_no_key", provider="fiscalai") not in out
 
     def test_persistence(self, bot, monkeypatch, tmp_path):
         """Value survives config reload after /setsource."""
