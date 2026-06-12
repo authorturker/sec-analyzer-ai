@@ -78,6 +78,7 @@ _alarm_lock      = threading.Lock()     # _pending_alarms (interactive alarm)
 _watchword_lock  = threading.Lock()     # watchword_seen.json dedup state (G1)
 _phistory_lock   = threading.Lock()     # portfolio_history.json (J4)
 _fiscal_memo_lock = threading.Lock()    # in-memory Fiscal AI memo cache (J5)
+_twelve_memo_lock = threading.Lock()    # in-memory Twelve Data memo cache (L1)
 _stop_event  = threading.Event()
 _ctx         = threading.local()    # per-thread reactive context (I1): _ctx.chat_id
 
@@ -268,9 +269,10 @@ _CFG_DEFAULTS = {
     "api_keys":               {},   # {provider: key} (J2)
     "default_provider":       "",   # active LLM provider name (J2)
     "no_keys_warned_date":    "",   # YYYY-MM-DD of last NO_KEYS reminder (J3 spam gate)
-    "fiscal_auth_warned_date": "",  # YYYY-MM-DD of last Fiscal AI auth warning (J5)
-    "wizard_step":             "",  # active wizard step: "lang"|"api"|"forms"|"tickers"|"" (K1)
-    "facts_source":            "auto",  # data source preference: "auto"|"fiscalai"|"edgar" (K4)
+    "fiscal_auth_warned_date": "",   # YYYY-MM-DD of last Fiscal AI auth warning (J5)
+    "twelve_auth_warned_date": "",   # YYYY-MM-DD of last Twelve Data auth warning (L1)
+    "wizard_step":             "",   # active wizard step: "lang"|"api"|"forms"|"tickers"|"" (K1)
+    "facts_source":            "auto",  # data source preference: "auto"|"fiscalai"|"twelvedata"|"edgar" (L1)
 }
 _cfg_cache: dict | None = None
 
@@ -1588,13 +1590,16 @@ def _handle_pending_key(chat_id: str, key_text: str, msg: dict):
     _tg_delete_msg(chat_id, msg.get("message_id"))
     def _do(c: dict):
         c.setdefault("api_keys", {})[provider] = key_text
-        # fiscalai is a data provider — never set as default LLM provider (J5)
-        if not c.get("default_provider") and provider != _FISCAL_AI_PROVIDER:
+        # data providers are never set as default LLM provider (J5 + L1)
+        if not c.get("default_provider") and provider not in _DATA_PROVIDERS:
             c["default_provider"] = provider
     mutate_cfg(_do)
     if provider == _FISCAL_AI_PROVIDER:
         with _fiscal_memo_lock:
             _fiscal_memo.clear()
+    elif provider == _TWELVE_DATA_PROVIDER:
+        with _twelve_memo_lock:
+            _twelve_memo.clear()
     tg(t("addapi_saved", provider=provider, masked_key=_mask_key(key_text)))
     # If wizard's API step is active, prompt to add more or skip (K1)
     if WIZARD.get("step") == "api":
@@ -2009,10 +2014,15 @@ def fetch_xbrl_facts(filing) -> dict | None:  # type: ignore[type-arg]
         return None
 
 
-# ─── Fiscal AI optional facts source (J5) ─────────────────
+# ─── Grounding data providers (J5 + L1) ───────────────────
 
 _FISCAL_AI_PROVIDER   = "fiscalai"
+_TWELVE_DATA_PROVIDER = "twelvedata"
+# Ordered tuple: auto mode tries providers left-to-right; first with a key wins.
+_DATA_PROVIDERS: tuple[str, ...] = (_FISCAL_AI_PROVIDER, _TWELVE_DATA_PROVIDER)
+
 _FISCAL_AI_BASE       = "https://api.fiscal.ai"
+_TWELVE_DATA_BASE     = "https://api.twelvedata.com"
 _FISCAL_FACTS_MINIMUM = 4       # min concepts for fiscal response to be accepted
 
 # In-memory memo: {(ticker_upper, period_end_YYYY-MM-DD): dict | None}
@@ -2204,6 +2214,227 @@ def fetch_fiscal_facts(ticker: str, period_end: str) -> "dict | None":
     with _fiscal_memo_lock:
         _fiscal_memo[cache_k] = result
     return result
+
+
+# ─── Twelve Data optional facts source (L1) ────────────────
+
+# In-memory memo: {(ticker_upper, period_end_YYYY-MM-DD): dict | None}
+_twelve_memo: dict = {}
+
+# Concept field-name mapping: Twelve Data key → internal XBRL concept name
+_TWELVE_INCOME_MAP: dict[str, str] = {
+    "revenue":                    "Revenues",
+    "total_revenue":              "Revenues",
+    "net_revenue":                "Revenues",
+    "gross_profit":               "GrossProfit",
+    "operating_income":           "OperatingIncomeLoss",
+    "ebit":                       "OperatingIncomeLoss",
+    "net_income":                 "NetIncomeLoss",
+    "net_income_applicable_to_common_shareholders": "NetIncomeLoss",
+    "diluted_eps":                "EarningsPerShareDiluted",
+    "eps_diluted":                "EarningsPerShareDiluted",
+    "basic_and_diluted_eps":      "EarningsPerShareDiluted",
+}
+_TWELVE_BALANCE_MAP: dict[str, str] = {
+    "cash_and_equivalents":             "CashAndCashEquivalentsAtCarryingValue",
+    "cash_and_cash_equivalents":        "CashAndCashEquivalentsAtCarryingValue",
+    "total_assets":                     "Assets",
+    "total_liabilities":                "Liabilities",
+    "total_equity":                     "StockholdersEquity",
+    "total_stockholders_equity":        "StockholdersEquity",
+    "shareholders_equity":              "StockholdersEquity",
+}
+
+
+def _parse_twelve_response(income_data, balance_data, period_end: str) -> "dict | None":
+    """PURE: merge Twelve Data income + balance for period_end; validate ≥ threshold.
+
+    income_data / balance_data: raw response dicts (any type safe).
+    Twelve Data wraps period lists in {"data": [...]} — each item has "fiscal_date".
+    Returns normalized {concept: (value, "USD", period_end)} or None.
+    None when < _FISCAL_FACTS_MINIMUM concepts found.
+    """
+    if not period_end:
+        return None
+    target = period_end[:10]
+
+    def _extract(raw, field_map: dict) -> dict:
+        if not isinstance(raw, dict):
+            return {}
+        data_list = raw.get("data") if isinstance(raw.get("data"), list) else []
+        for record in data_list:
+            if not isinstance(record, dict):
+                continue
+            fd = str(record.get("fiscal_date") or record.get("date") or "")[:10]
+            if fd != target:
+                continue
+            result: dict[str, float] = {}
+            for field, concept in field_map.items():
+                raw_val = record.get(field)
+                if raw_val is not None:
+                    try:
+                        result[concept] = float(raw_val)
+                    except (TypeError, ValueError):
+                        pass
+            return result
+        return {}
+
+    merged = {**_extract(income_data, _TWELVE_INCOME_MAP),
+              **_extract(balance_data, _TWELVE_BALANCE_MAP)}
+    if len(merged) < _FISCAL_FACTS_MINIMUM:
+        return None
+    return {concept: (val, "USD", period_end) for concept, val in merged.items()}
+
+
+def _check_twelve_auth_reminder() -> None:
+    """Send daily warning when Twelve Data key is rejected (401/403). L1 spam gate."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if get_cfg().get("twelve_auth_warned_date", "") == today:
+        return
+    mutate_cfg(lambda c: c.update({"twelve_auth_warned_date": today}))
+    tg(t("twelvedata_auth_error"))
+
+
+def fetch_twelvedata_facts(ticker: str, period_end: str,
+                           period_hint: str = "") -> "dict | None":
+    """IO: fetch standardized financials from Twelve Data for (ticker, period_end).
+
+    period_hint: "annual" or "quarterly" — passed as ?period= to halve HTTP calls.
+    Returns normalized facts dict (same 9-concept format as EDGAR XBRL) or None.
+    None on: no key, no period_end, period mismatch, 4xx/5xx, timeout, < 4 concepts.
+    In-memory memo cache: (ticker_upper, period_end) — no persistent file.
+    Max 2 HTTP per unique (ticker, period_end) pair.
+    Auth (401/403): treated as plan-level rejection — daily warning, silent fallback.
+    """
+    if not period_end:
+        return None
+    key = get_cfg().get("api_keys", {}).get(_TWELVE_DATA_PROVIDER, "")
+    if not key:
+        return None
+    cache_k = (ticker.upper(), period_end[:10])
+    with _twelve_memo_lock:
+        if cache_k in _twelve_memo:
+            return _twelve_memo[cache_k]
+
+    period_param = period_hint if period_hint in ("annual", "quarterly") else ""
+    endpoints = []
+    for ep in ("income_statement", "balance_sheet"):
+        url = (f"{_TWELVE_DATA_BASE}/{ep}"
+               f"?symbol={ticker}&apikey={key}"
+               + (f"&period={period_param}" if period_param else ""))
+        endpoints.append((url, ep))
+
+    income_data: "dict | None" = None
+    balance_data: "dict | None" = None
+    for url, which in endpoints:
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code in (401, 403):
+                _check_twelve_auth_reminder()
+                log.debug(f"fetch_twelvedata_facts {which}: {r.status_code} — auth/plan fail")
+                with _twelve_memo_lock:
+                    _twelve_memo[cache_k] = None
+                return None
+            if r.status_code == 404:
+                log.debug(f"fetch_twelvedata_facts {which}: 404 {ticker} — not found")
+                with _twelve_memo_lock:
+                    _twelve_memo[cache_k] = None
+                return None
+            if not r.ok:
+                log.debug(f"fetch_twelvedata_facts {which}: {r.status_code} — fallback")
+                with _twelve_memo_lock:
+                    _twelve_memo[cache_k] = None
+                return None
+            try:
+                body = r.json()
+            except Exception:
+                log.debug(f"fetch_twelvedata_facts {which}: JSON parse error")
+                with _twelve_memo_lock:
+                    _twelve_memo[cache_k] = None
+                return None
+            # Twelve Data returns {"code":4xx,"status":"error"} for plan errors
+            if isinstance(body, dict) and body.get("status") == "error":
+                code = body.get("code", 0)
+                if code in (401, 403, 429) or 400 <= code < 500:
+                    _check_twelve_auth_reminder()
+                    log.debug(f"fetch_twelvedata_facts {which}: API error {code} — auth/plan")
+                    with _twelve_memo_lock:
+                        _twelve_memo[cache_k] = None
+                    return None
+                log.debug(f"fetch_twelvedata_facts {which}: API error {code} — fallback")
+                with _twelve_memo_lock:
+                    _twelve_memo[cache_k] = None
+                return None
+        except Exception as exc:
+            log.debug(f"fetch_twelvedata_facts {which}: {exc}")
+            with _twelve_memo_lock:
+                _twelve_memo[cache_k] = None
+            return None
+        if which == "income_statement":
+            income_data = body
+        else:
+            balance_data = body
+
+    result = _parse_twelve_response(income_data, balance_data, period_end)
+    with _twelve_memo_lock:
+        _twelve_memo[cache_k] = result
+    return result
+
+
+# ─── Data source chain (L1) ────────────────────────────────
+
+def _data_source_chain() -> "list[str]":
+    """PURE: ordered list of data provider names to try for this request.
+
+    "edgar"      → [] (user forced EDGAR; no data-provider HTTP)
+    "fiscalai"   → ["fiscalai"] if key present, else []
+    "twelvedata" → ["twelvedata"] if key present, else []
+    "auto"       → _DATA_PROVIDERS in order, keep only those with keys
+    unknown      → same as "auto" + log.warning
+    """
+    cfg = get_cfg()
+    src = cfg.get("facts_source", "auto")
+    api_keys = cfg.get("api_keys", {})
+
+    if src == "edgar":
+        return []
+    if src in (_FISCAL_AI_PROVIDER, _TWELVE_DATA_PROVIDER):
+        return [src] if api_keys.get(src) else []
+    if src == "auto":
+        return [p for p in _DATA_PROVIDERS if api_keys.get(p)]
+    log.warning(f"_data_source_chain: unknown facts_source {src!r}, treating as auto")
+    return [p for p in _DATA_PROVIDERS if api_keys.get(p)]
+
+
+def _data_source_label() -> str:
+    """PURE: human-readable data source label for /settings.
+
+    Derived from facts_source cfg + which provider keys are present.
+    Examples:
+      edgar                          → "EDGAR"
+      fiscalai  (key)                → "fiscalai ✓ (EDGAR fallback)"
+      fiscalai  (no key)             → "fiscalai (no key → EDGAR)"
+      twelvedata (key)               → "twelvedata ✓ (EDGAR fallback)"
+      twelvedata (no key)            → "twelvedata (no key → EDGAR)"
+      auto (fai key)                 → "auto → fiscalai → EDGAR"
+      auto (td key)                  → "auto → twelvedata → EDGAR"
+      auto (both keys)               → "auto → fiscalai → twelvedata → EDGAR"
+      auto (no keys)                 → "auto → EDGAR"
+    """
+    cfg = get_cfg()
+    src = cfg.get("facts_source", "auto")
+    api_keys = cfg.get("api_keys", {})
+
+    if src == "edgar":
+        return "EDGAR"
+    if src in (_FISCAL_AI_PROVIDER, _TWELVE_DATA_PROVIDER):
+        has_key = bool(api_keys.get(src))
+        return f"{src} ✓ (EDGAR fallback)" if has_key else f"{src} (no key → EDGAR)"
+    # auto or unknown → zincir
+    chain = [p for p in _DATA_PROVIDERS if api_keys.get(p)]
+    if not chain:
+        return "auto → EDGAR"
+    return "auto → " + " → ".join(chain) + " → EDGAR"
 
 
 # ─── Numeric verification (F3) ────────────────────────────
@@ -2639,21 +2870,39 @@ def fetch_new_filings(ticker: str, forms: list, lookback_days: int,
                                     text = text[:max_chars_per]
                             else:
                                 text = None
-                            # F2 + J5: XBRL/Fiscal AI grounding.
-                            # Fiscal AI tried first (if key present); falls back
-                            # to EDGAR XBRL. 8-K/Form 4/etc. never grounded.
+                            # F2 + L1: XBRL/data-provider grounding.
+                            # _data_source_chain() returns ordered providers to
+                            # try; first successful facts wins; EDGAR XBRL is
+                            # the unconditional fallback. 8-K/Form 4/etc. skip.
                             facts_block = ""
                             if fetch_text and form in _XBRL_FORMS:
+                                # Derive period_end: prefer period_of_report
+                                _por = getattr(f, "period_of_report", None)
+                                if _por and hasattr(_por, "isoformat"):
+                                    _por = _por.isoformat()
+                                period_end_str = str(_por)[:10] if _por else ds
+                                _period_hint = (
+                                    "annual" if form in ("10-K", "20-F", "11-K")
+                                    else "quarterly"
+                                )
                                 fiscal_facts = None
-                                if _fiscal_enabled():
-                                    # Derive period_end: prefer period_of_report
-                                    _por = getattr(f, "period_of_report", None)
-                                    if _por and hasattr(_por, "isoformat"):
-                                        _por = _por.isoformat()
-                                    period_end_str = str(_por)[:10] if _por else ds
-                                    fiscal_facts = fetch_fiscal_facts(ticker, period_end_str)
+                                _facts_source_name = ""
+                                for _dp in _data_source_chain():
+                                    if _dp == _FISCAL_AI_PROVIDER:
+                                        fiscal_facts = fetch_fiscal_facts(
+                                            ticker, period_end_str)
+                                    elif _dp == _TWELVE_DATA_PROVIDER:
+                                        fiscal_facts = fetch_twelvedata_facts(
+                                            ticker, period_end_str, _period_hint)
+                                    if fiscal_facts is not None:
+                                        _facts_source_name = (
+                                            "Fiscal AI" if _dp == _FISCAL_AI_PROVIDER
+                                            else "Twelve Data"
+                                        )
+                                        break
                                 if fiscal_facts is not None:
-                                    facts_block = format_facts_block(fiscal_facts, source="Fiscal AI")
+                                    facts_block = format_facts_block(
+                                        fiscal_facts, source=_facts_source_name)
                                 else:
                                     facts_block = format_facts_block(
                                         fetch_xbrl_facts(f) or {}
@@ -3459,15 +3708,8 @@ def cmd_settings() -> str:
     # Registered LLM provider names (names only, no keys/masks)
     llm_registered = [p for p in _PROVIDERS if api_keys.get(p)]
     registered_providers = ", ".join(llm_registered) if llm_registered else t("label_off")
-    # Data source: 5-state label from facts_source cfg + key presence
-    _src = cfg.get("facts_source", "auto")
-    _has_fai = bool(api_keys.get(_FISCAL_AI_PROVIDER))
-    if _src == "edgar":
-        data_source = "EDGAR"
-    elif _src == "fiscalai":
-        data_source = "fiscalai ✓ (EDGAR fallback)" if _has_fai else "fiscalai (no key → EDGAR)"
-    else:  # "auto" or unknown — most conservative, preserves today's behaviour
-        data_source = "auto → fiscalai ✓ (EDGAR fallback)" if _has_fai else "auto → EDGAR"
+    # Data source label via pure helper (L1 — combinatoric states)
+    data_source = _data_source_label()
     return t("settings_block",
              model=cfg['model'],
              lookback=cfg['days_lookback'],
@@ -3563,8 +3805,8 @@ def cmd_setrawmax(parts: list) -> str:
         return t("rawmax_invalid")
 
 def cmd_setsource(parts: list) -> str:
-    """Set preferred data source for grounding facts: auto | fiscalai | edgar."""
-    _VALID = ("auto", "fiscalai", "edgar")
+    """Set preferred data source for grounding facts: auto | fiscalai | twelvedata | edgar."""
+    _VALID = ("auto",) + _DATA_PROVIDERS + ("edgar",)
     cfg = get_cfg()
     if len(parts) < 2:
         return t("setsource_current",
@@ -3574,8 +3816,9 @@ def cmd_setsource(parts: list) -> str:
     if val not in _VALID:
         return t("setsource_invalid", valid=" | ".join(_VALID))
     mutate_cfg(lambda c: c.update({"facts_source": val}))
-    if val == "fiscalai" and not cfg.get("api_keys", {}).get(_FISCAL_AI_PROVIDER):
-        return t("setsource_no_key")
+    # Warn when a data provider is selected but the key is not present
+    if val in _DATA_PROVIDERS and not cfg.get("api_keys", {}).get(val):
+        return t("setsource_no_key", provider=val)
     return t("setsource_ok", source=val)
 
 
@@ -4605,7 +4848,7 @@ def cmd_addapi(parts: list, chat_id: str, msg: dict) -> str:
     Rejected in group chats (members can see message before deletion).
     fiscalai is a data provider (not LLM) — accepted here but not in /setapi.
     """
-    valid = list(_PROVIDERS.keys()) + [_FISCAL_AI_PROVIDER]
+    valid = list(_PROVIDERS.keys()) + list(_DATA_PROVIDERS)
     if msg.get("chat", {}).get("type", "private") != "private":
         return t("addapi_group_rejected")
     if len(parts) < 2:
@@ -4621,13 +4864,16 @@ def cmd_addapi(parts: list, chat_id: str, msg: dict) -> str:
         _tg_delete_msg(chat_id, msg.get("message_id"))
         def _do(c: dict):
             c.setdefault("api_keys", {})[provider] = key
-            # fiscalai is a data provider — never set as default LLM provider (J5)
-            if not c.get("default_provider") and provider != _FISCAL_AI_PROVIDER:
+            # data providers are never set as default LLM provider (J5 + L1)
+            if not c.get("default_provider") and provider not in _DATA_PROVIDERS:
                 c["default_provider"] = provider
         mutate_cfg(_do)
         if provider == _FISCAL_AI_PROVIDER:
             with _fiscal_memo_lock:
                 _fiscal_memo.clear()
+        elif provider == _TWELVE_DATA_PROVIDER:
+            with _twelve_memo_lock:
+                _twelve_memo.clear()
         return t("addapi_saved", provider=provider, masked_key=_mask_key(key))
     # Two-message form: register pending entry
     with _pending_lock:
@@ -4646,12 +4892,13 @@ def cmd_apis() -> str:
         if key:
             star = " ⭐" if prov == default else ""
             rows.append(t("apis_row", provider=prov, masked_key=_mask_key(key), star=star))
-    # Data providers section (J5)
-    fiscal_key = api_keys.get(_FISCAL_AI_PROVIDER, "")
-    if fiscal_key:
-        rows.append(t("apis_data_row",
-                      provider=_FISCAL_AI_PROVIDER,
-                      masked_key=_mask_key(fiscal_key)))
+    # Data providers section (J5 + L1)
+    for _dp in _DATA_PROVIDERS:
+        _dp_key = api_keys.get(_dp, "")
+        if _dp_key:
+            rows.append(t("apis_data_row",
+                          provider=_dp,
+                          masked_key=_mask_key(_dp_key)))
     if not rows:
         return t("apis_empty")
     return t("apis_header") + "\n" + "\n".join(rows)
@@ -4659,14 +4906,14 @@ def cmd_apis() -> str:
 
 def cmd_setapi(parts: list) -> str:
     """Admin: /setapi <provider> — change the default LLM provider.
-    fiscalai is a data provider and cannot be set as default LLM (J5).
+    Data providers (fiscalai, twelvedata) cannot be set as default LLM (L1).
     """
     valid = list(_PROVIDERS.keys())
     if len(parts) < 2:
         return t("setapi_usage", providers=", ".join(valid))
     provider = parts[1].lower()
-    if provider == _FISCAL_AI_PROVIDER:
-        return t("setapi_fiscalai_rejected")
+    if provider in _DATA_PROVIDERS:
+        return t("setapi_data_provider_rejected", provider=provider)
     if provider not in _PROVIDERS or not _get_provider_key(provider):
         return t("setapi_unknown", provider=provider)
     mutate_cfg(lambda c: c.update({"default_provider": provider}))
@@ -4675,9 +4922,9 @@ def cmd_setapi(parts: list) -> str:
 
 def cmd_delapi(parts: list) -> str:
     """Admin: /delapi <provider> — delete an API key.
-    Accepts fiscalai (data provider) in addition to LLM providers (J5).
+    Accepts data providers (fiscalai, twelvedata) in addition to LLM providers (L1).
     """
-    all_valid = list(_PROVIDERS.keys()) + [_FISCAL_AI_PROVIDER]
+    all_valid = list(_PROVIDERS.keys()) + list(_DATA_PROVIDERS)
     if len(parts) < 2:
         return t("delapi_usage", providers=", ".join(all_valid))
     provider = parts[1].lower()
@@ -4693,6 +4940,9 @@ def cmd_delapi(parts: list) -> str:
     if provider == _FISCAL_AI_PROVIDER:
         with _fiscal_memo_lock:
             _fiscal_memo.clear()
+    elif provider == _TWELVE_DATA_PROVIDER:
+        with _twelve_memo_lock:
+            _twelve_memo.clear()
     return t("delapi_done", provider=provider)
 
 

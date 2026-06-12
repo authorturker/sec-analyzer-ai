@@ -174,10 +174,10 @@
   "rawmax_set": "✅ Raw filing store capped at `{n}` entries (oldest evicted first).",
   "rawmax_unlimited": "✅ Raw filing store: unlimited (no eviction).",
   "rawmax_invalid": "❌ Provide a number between 0 and 100000.",
-  "setsource_current": "Data source: `{source}`\nValid options: `{valid}`\n\nUse `/setsource edgar|fiscalai|auto` to change.",
+  "setsource_current": "Data source: `{source}`\nValid options: `{valid}`\n\nUse `/setsource edgar|fiscalai|twelvedata|auto` to change.",
   "setsource_ok": "✅ Data source set to `{source}`.",
   "setsource_invalid": "❌ Invalid source. Valid options: `{valid}`",
-  "setsource_no_key": "✅ Data source set to `fiscalai` — but no Fiscal AI key found.\nAdd one with `/addapi fiscalai <key>`. Until then, EDGAR XBRL will be used.",
+  "setsource_no_key": "✅ Data source set to `{provider}` — but no {provider} key found.\nAdd one with `/addapi {provider} <key>`. Until then, EDGAR XBRL will be used.",
   "price_action_line": "{emoji} *Price action:* `{pct}%` ({start_date} → {end_date})",
   "priceaction_usage": "Usage: `/priceaction on` or `/priceaction off`\nCurrent: `{current}`",
   "priceaction_enabled": "✅ Price action snippet enabled.",
@@ -218,7 +218,7 @@
   "report_footer": "*This report was generated automatically. Not investment advice.*",
   "report_caption": "📋 SEC Analysis Report — {date}",
   "unverified_figures": "⚠️ Could not verify against filing data: {items}",
-  "help_block": "🤖 *SEC Analyzer Bot v4.0*\n\n*Scans:*\n`Any news?` · `Check` · `/sec`\n`Insider` · `/insider` · `Check all` · `/all`\n`/sentiment` — portfolio insider score\n`/sentiment trend [days]` — sentiment shift vs N days ago\n\n*On-demand:*\n`/scanticker AAPL` · `/scanticker AAPL 10-K 4`\n`/compare AAPL MSFT 10-K` — side-by-side\n`/checkprice AAPL [days]` · `/checknews AAPL [count]`\n\n*Tickers:*\n`/addticker AAPL MSFT` · `/removeticker AAPL` · `/listtickers`\n\n*Groups:*\n`/addgroup tech AAPL MSFT` · `/removegroup tech` · `/listgroups`\n`/scangroup tech` · `/scangroup tech 10-K 4`\n\n*Forms:*\n`/listforms` · `/addform SC 13G` · `/removeform 8-K`\n\n*Watchwords:*\n`/addword revenue guidance` · `/removeword revenue` · `/listwords`\n\n*Portfolio:*\n`/addpos AAPL 10 150.00` · `/removepos AAPL` · `/pnl`\n\n*Custom Prompts:*\n`/setprompt 10-K <text>` · `/getprompt 10-K`\n`/resetprompt 10-K` · `/listprompts`\n\n*Schedule:*\n`/setschedule 08:00` · `/setschedule off`\n`/alarm` · `/alarm off`\n`/digest` · `/digest now` · `/digest off`\n\n*Reports:*\n`/report` · `/export` — send analyses as file\n\n*API Keys (admin):*\n`/addapi openrouter sk-or-...` · `/apis` · `/setapi openrouter` · `/delapi openrouter`\n\n*Chats (admin):*\n`/addchat` · `/removechat` · `/listchats`\n\n*Language:*\n`/setlang en` · `/setlang tr`\n\n*Webhook:*\n`/setwebhook <url>` · `/delwebhook`\n\n`/settings` · `/status`\n`/setmodel` · `/setlookback 60` · `/setchars 15000` · `/setrawmax 200000`\n`/priceaction on|off` · `/setlookforward 5` · `/setsource auto|fiscalai|edgar`\n\n*Active forms:* `{forms}`\n*Tracking:* `{ticker_count}` ticker(s)\n*Language:* `{language}`",
+  "help_block": "🤖 *SEC Analyzer Bot v4.0*\n\n*Scans:*\n`Any news?` · `Check` · `/sec`\n`Insider` · `/insider` · `Check all` · `/all`\n`/sentiment` — portfolio insider score\n`/sentiment trend [days]` — sentiment shift vs N days ago\n\n*On-demand:*\n`/scanticker AAPL` · `/scanticker AAPL 10-K 4`\n`/compare AAPL MSFT 10-K` — side-by-side\n`/checkprice AAPL [days]` · `/checknews AAPL [count]`\n\n*Tickers:*\n`/addticker AAPL MSFT` · `/removeticker AAPL` · `/listtickers`\n\n*Groups:*\n`/addgroup tech AAPL MSFT` · `/removegroup tech` · `/listgroups`\n`/scangroup tech` · `/scangroup tech 10-K 4`\n\n*Forms:*\n`/listforms` · `/addform SC 13G` · `/removeform 8-K`\n\n*Watchwords:*\n`/addword revenue guidance` · `/removeword revenue` · `/listwords`\n\n*Portfolio:*\n`/addpos AAPL 10 150.00` · `/removepos AAPL` · `/pnl`\n\n*Custom Prompts:*\n`/setprompt 10-K <text>` · `/getprompt 10-K`\n`/resetprompt 10-K` · `/listprompts`\n\n*Schedule:*\n`/setschedule 08:00` · `/setschedule off`\n`/alarm` · `/alarm off`\n`/digest` · `/digest now` · `/digest off`\n\n*Reports:*\n`/report` · `/export` — send analyses as file\n\n*API Keys (admin):*\n`/addapi openrouter sk-or-...` · `/apis` · `/setapi openrouter` · `/delapi openrouter`\n\n*Chats (admin):*\n`/addchat` · `/removechat` · `/listchats`\n\n*Language:*\n`/setlang en` · `/setlang tr`\n\n*Webhook:*\n`/setwebhook <url>` · `/delwebhook`\n\n`/settings` · `/status`\n`/setmodel` · `/setlookback 60` · `/setchars 15000` · `/setrawmax 200000`\n`/priceaction on|off` · `/setlookforward 5` · `/setsource auto|fiscalai|twelvedata|edgar`\n\n*Active forms:* `{forms}`\n*Tracking:* `{ticker_count}` ticker(s)\n*Language:* `{language}`",
   "cmd_desc_addword": "Add a keyword phrase to monitor in EDGAR full-text search",
   "cmd_desc_removeword": "Remove a monitored keyword phrase",
   "cmd_desc_listwords": "List all monitored keyword phrases",
@@ -292,6 +292,8 @@
   "no_ai_signal_placeholder": "n/a (AI off)",
 
   "setapi_fiscalai_rejected": "⚠️ `fiscalai` is a data provider, not an LLM provider — it cannot be set as the default AI model. Use `/addapi fiscalai` to configure your key.",
+  "setapi_data_provider_rejected": "⚠️ `{provider}` is a data provider, not an LLM provider — it cannot be set as the default AI model. Use `/addapi {provider}` to configure your key.",
   "apis_data_row": "📊 Data: `{provider}` — `{masked_key}`",
-  "fiscalai_auth_error": "⚠️ *Fiscal AI key rejected (401/403).* Facts will fall back to EDGAR XBRL.\nUpdate your key with `/addapi fiscalai`."
+  "fiscalai_auth_error": "⚠️ *Fiscal AI key rejected (401/403).* Facts will fall back to EDGAR XBRL.\nUpdate your key with `/addapi fiscalai`.",
+  "twelvedata_auth_error": "⚠️ *Twelve Data key rejected (401/403/plan limit).* Facts will fall back to EDGAR XBRL.\nUpdate your key or upgrade your plan, then use `/addapi twelvedata <newkey>`.\nNote: financial statement endpoints require a Grow/Pro+ plan."
 }
