@@ -270,6 +270,7 @@ _CFG_DEFAULTS = {
     "no_keys_warned_date":    "",   # YYYY-MM-DD of last NO_KEYS reminder (J3 spam gate)
     "fiscal_auth_warned_date": "",  # YYYY-MM-DD of last Fiscal AI auth warning (J5)
     "wizard_step":             "",  # active wizard step: "lang"|"api"|"forms"|"tickers"|"" (K1)
+    "facts_source":            "auto",  # data source preference: "auto"|"fiscalai"|"edgar" (K4)
 }
 _cfg_cache: dict | None = None
 
@@ -2055,6 +2056,23 @@ def _get_fiscal_key() -> str:
     return get_cfg().get("api_keys", {}).get(_FISCAL_AI_PROVIDER, "")
 
 
+def _fiscal_enabled() -> bool:
+    """PURE gate: should Fiscal AI fetch run for this request?
+
+    facts_source == "edgar"             → always False (user forced EDGAR)
+    facts_source == "fiscalai" or "auto" → True iff key present
+    unknown value                       → treat as "auto" (preserves today's
+                                          behaviour) + log warning
+    """
+    src = get_cfg().get("facts_source", "auto")
+    if src == "edgar":
+        return False
+    if src in ("fiscalai", "auto"):
+        return bool(_get_fiscal_key())
+    log.warning(f"_fiscal_enabled: unknown facts_source {src!r}, treating as auto")
+    return bool(_get_fiscal_key())
+
+
 def _parse_fiscal_period(data: list, period_end: str, field_map: dict) -> dict:
     """PURE: scan data list for an entry with exact period_end match; map fields.
 
@@ -2627,7 +2645,7 @@ def fetch_new_filings(ticker: str, forms: list, lookback_days: int,
                             facts_block = ""
                             if fetch_text and form in _XBRL_FORMS:
                                 fiscal_facts = None
-                                if _get_fiscal_key():
+                                if _fiscal_enabled():
                                     # Derive period_end: prefer period_of_report
                                     _por = getattr(f, "period_of_report", None)
                                     if _por and hasattr(_por, "isoformat"):
@@ -3441,11 +3459,15 @@ def cmd_settings() -> str:
     # Registered LLM provider names (names only, no keys/masks)
     llm_registered = [p for p in _PROVIDERS if api_keys.get(p)]
     registered_providers = ", ".join(llm_registered) if llm_registered else t("label_off")
-    # Data source: fiscalai key present or EDGAR
-    if api_keys.get(_FISCAL_AI_PROVIDER):
-        data_source = "fiscalai ✓ (EDGAR fallback)"
-    else:
+    # Data source: 5-state label from facts_source cfg + key presence
+    _src = cfg.get("facts_source", "auto")
+    _has_fai = bool(api_keys.get(_FISCAL_AI_PROVIDER))
+    if _src == "edgar":
         data_source = "EDGAR"
+    elif _src == "fiscalai":
+        data_source = "fiscalai ✓ (EDGAR fallback)" if _has_fai else "fiscalai (no key → EDGAR)"
+    else:  # "auto" or unknown — most conservative, preserves today's behaviour
+        data_source = "auto → fiscalai ✓ (EDGAR fallback)" if _has_fai else "auto → EDGAR"
     return t("settings_block",
              model=cfg['model'],
              lookback=cfg['days_lookback'],
@@ -3539,6 +3561,23 @@ def cmd_setrawmax(parts: list) -> str:
         return t("rawmax_set", n=n) if n > 0 else t("rawmax_unlimited")
     except ValueError:
         return t("rawmax_invalid")
+
+def cmd_setsource(parts: list) -> str:
+    """Set preferred data source for grounding facts: auto | fiscalai | edgar."""
+    _VALID = ("auto", "fiscalai", "edgar")
+    cfg = get_cfg()
+    if len(parts) < 2:
+        return t("setsource_current",
+                 source=cfg.get("facts_source", "auto"),
+                 valid=" | ".join(_VALID))
+    val = parts[1].lower()
+    if val not in _VALID:
+        return t("setsource_invalid", valid=" | ".join(_VALID))
+    mutate_cfg(lambda c: c.update({"facts_source": val}))
+    if val == "fiscalai" and not cfg.get("api_keys", {}).get(_FISCAL_AI_PROVIDER):
+        return t("setsource_no_key")
+    return t("setsource_ok", source=val)
+
 
 def cmd_priceaction(parts: list) -> str:
     """Toggle the E1 price action snippet under each filing analysis."""
@@ -4794,6 +4833,7 @@ def _process_update(upd: dict):
         elif komut == "/setlookback":    tg(cmd_setlookback(parts))
         elif komut == "/setchars":       tg(cmd_setchars(parts))
         elif komut == "/setrawmax":      tg(cmd_setrawmax(parts))
+        elif komut == "/setsource":      tg(cmd_setsource(parts))
         elif komut == "/priceaction":    tg(cmd_priceaction(parts))
         elif komut == "/setlookforward": tg(cmd_setlookforward(parts))
         # On-demand scan
