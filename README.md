@@ -10,7 +10,7 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 [![OpenRouter](https://img.shields.io/badge/LLM-OpenRouter%20Free-6c47ff)](https://openrouter.ai)
 [![Telegram](https://img.shields.io/badge/Interface-Telegram-2CA5E0?logo=telegram&logoColor=white)](https://telegram.org)
 [![CI](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-732%20passing-success)](#-tests)
+[![Tests](https://img.shields.io/badge/tests-822%20passing-success)](#-tests)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 </div>
@@ -50,7 +50,7 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 | 📴 **No-AI Mode** | Without any LLM key the bot still runs: delivers raw filing text with a clear ⚠️ label; never goes silent |
 | 📈 **Portfolio History** | Daily portfolio-value snapshots (up to 730 days); `/pnl` shows 1d / 7d / 30d raw-value delta |
 | 📊 **Fiscal AI (optional)** | Optional data source for grounding analysis — falls back to EDGAR XBRL when key absent or period not matched |
-| 🧪 **Tested** | 732 pytest tests for pure helpers, i18n, config cache, thread safety |
+| 🧪 **Tested** | 822 pytest tests for pure helpers, i18n, config cache, thread safety |
 | ⚡ **OpenRouter Free LLM** | openrouter/free, $0 cost |
 | 📱 **Lightweight** | Single 1.8k-line `bot.py`, runs on a mid-range Android phone via Termux |
 
@@ -73,7 +73,7 @@ sec-analyzer/
 ├── lang/
 │   ├── en.json                  # English UI strings (default)
 │   └── tr.json                  # Turkish UI strings
-├── tests/                       # 732 pytest tests (+ 7 opt-in live network tests)
+├── tests/                       # 822 pytest tests (+ 7 opt-in live network tests)
 │   ├── conftest.py
 │   ├── test_alarm_buttons.py    # Interactive alarm + on-demand .md button
 │   ├── test_bootstrap.py        # Minimal .env bootstrap, master-user init, env migration
@@ -84,6 +84,10 @@ sec-analyzer/
 │   ├── test_groups.py           # Watchlist groups
 │   ├── test_hotfixes.py         # Atomic JSON IO, wizard guard, digest week
 │   ├── test_i18n.py             # Language loader, t(), fallback
+│   ├── test_k2_command_surface.py # Command surface inventory; dispatcher↔help parity guard
+│   ├── test_k3_pnl_visual.py   # /pnl monospace table renderer (_pnl_table)
+│   ├── test_k31_qty_col.py     # QTY column clamping formatter (_fmt_qty_col)
+│   ├── test_k4_setsource.py    # facts_source cfg + _fiscal_enabled gate + /setsource command
 │   ├── test_multichat.py        # Multi-chat auth, migration, broadcast
 │   ├── test_multi_llm.py        # Multi-LLM provider abstraction, /addapi, /apis, retry
 │   ├── test_network.py          # Opt-in live endpoint tests (--network flag)
@@ -131,7 +135,7 @@ cp .env.example .env    # then edit .env with your 3 required keys
 python bot.py
 ```
 
-On first run the bot sends a welcome message and launches a bilingual setup wizard — pick a language, choose default form types, add tickers, done.
+On first run the bot sends a welcome message and launches a setup wizard: pick a language first (step 0 is bilingual), then add API keys one by one (type `/skip` to skip any), then choose default form types, then add tickers — done.
 
 ---
 
@@ -279,8 +283,45 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 | `/setlookback 60` | Set lookback window in days (1–365) |
 | `/setchars 15000` | Set max characters per section (1000–50000) |
 | `/setrawmax 500` | Cap in-memory raw-filing cache (0 = unlimited) |
+| `/setsource auto\|fiscalai\|edgar` | Select grounding data source; no argument shows current value |
 | `/priceaction on` / `off` | Toggle the per-filing price-action snippet |
 | `/setlookforward 5` | Days after filing for price change (1–90) |
+
+---
+
+## 🧾 Fiscal AI (Optional Data Source)
+
+Fiscal AI is an **optional grounding data source** — it is not an LLM provider. When a Fiscal AI key is configured, the bot fetches standardized income-statement and balance-sheet figures from Fiscal AI's API *before* calling the LLM and injects them into the analysis prompt, the same way EDGAR XBRL facts are injected. The LLM is instructed to use only these verified figures for numeric claims.
+
+### How to enable
+
+Get a free API key at [api.fiscal.ai](https://api.fiscal.ai) and add it from Telegram (use a private chat — the key message is deleted immediately):
+
+```
+/addapi fiscalai <your-key>
+```
+
+### How to control
+
+```
+/setsource auto       # (default) use Fiscal AI if a key exists, else fall back to EDGAR XBRL
+/setsource fiscalai   # always prefer Fiscal AI (still falls back to EDGAR if period not matched)
+/setsource edgar      # ignore Fiscal AI key entirely — always use EDGAR XBRL
+```
+
+`/setsource` with no argument shows the current value. Check all current settings, including the active data source, with `/settings`.
+
+### Why use Fiscal AI over EDGAR XBRL
+
+- **Standardized values:** Fiscal AI normalizes figures across companies and reporting periods. EDGAR XBRL tags vary — `us-gaap:Revenues`, `us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax`, and a dozen other labels may all mean "revenue" depending on the company.
+- **Cleaner figures for the LLM:** a single unambiguous number produces more grounded, less hallucinated analyses.
+
+### Limits (dürüstlük çiti)
+
+- **Free tier:** 25 companies / 250 API calls per day.
+- **Exact period match required:** if the filing's fiscal period is not matched in Fiscal AI's database the bot falls back silently to EDGAR XBRL — analysis continues without interruption.
+- **Supported form classes:** only 10-K / 10-Q class annual and quarterly reports use grounding. Form 4, 8-K, and other form types are unaffected regardless of the data source setting.
+- **Key storage:** stored in plain text in `bot_config.json` (git-ignored, docker-ignored — never committed).
 
 ---
 
@@ -370,7 +411,9 @@ Restart the bot, and it switches to webhook delivery. Revert with `/delwebhook` 
 
 ---
 
-## 📊 Analysis Output Example
+## 📊 Analysis Output Examples
+
+### SEC Filing Analysis
 
 ```text
 🏢 MU — 10-Q
@@ -405,6 +448,23 @@ Restart the bot, and it switches to webhook delivery. Revert with `/delwebhook` 
 [📄 View original filing]
 ```
 
+### `/pnl` Portfolio P&L
+
+```text
+📊 Portföy K/Z
+
+TICKER   QTY    LAST    VALUE    P&L%
+-------------------------------------
+AAPL      15 $196.45   $2,947  +21.2%
+MSFT       5 $425.20   $2,126  +11.9%
+META       8 $480.00   $3,840   -7.7%
+DELIST     3     n/a      n/a     n/a
+
+Toplam: $8,913  📈 +421 (+5.1%)
+1 pozisyon hariç tutuldu (fiyat alınamadı)
+Δ 1d: 📈 +$42.10 (+0.47%)  ·  7d: n/a  ·  30d: n/a
+```
+
 ---
 
 ## 🧪 Tests
@@ -414,10 +474,10 @@ python -m pytest tests/ -q
 ```
 
 ```
-732 passed, 7 skipped in <3s
+822 passed, 7 skipped in <3s
 ```
 
-The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, `_parse_fiscal_period`, `_parse_fiscal_response`, `_portfolio_history_delta`, …), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the multi-LLM provider abstraction (provider chain, key masking, retry logic), the No-AI mode (raw text delivery, short-circuit, daily reminder gate), the portfolio-history delta helpers, and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline. The 7 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
+The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, `_parse_fiscal_period`, `_parse_fiscal_response`, `_portfolio_history_delta`, `_pnl_table`, `_fmt_qty_col`, `_fiscal_enabled`, …), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the multi-LLM provider abstraction (provider chain, key masking, retry logic), the No-AI mode (raw text delivery, short-circuit, daily reminder gate), the portfolio-history delta helpers, the command surface inventory (dispatcher↔help parity), and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline. The 7 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
 
 ---
 
@@ -440,7 +500,7 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 | `400 Bad Request` on sendMessage | Markdown parse error — bot automatically retries as plain text |
 | Bot goes silent after network error | Reconnects automatically; check `/status` for error count |
 | Webhook not receiving updates | Verify public HTTPS URL; run `/delwebhook` to fall back to polling |
-| Wizard shows English even though I want Turkish | Step 0 of the wizard is bilingual — type `/lang tr` first |
+| Wizard shows English even though I want Turkish | Language selection is the very first wizard step — both English and Turkish options are shown; just pick your language and the rest of the wizard continues in it |
 | `/checkprice` or `/checknews` says "yfinance required" | `pip install yfinance` (optional dep, ~50 MB) |
 | Alarm fires but `/check` finds nothing | Pre-v2.5 bug — update to current release (alarm is now probe-only) |
 | `⚠️ Could not verify against filing data: …` appears in an analysis | The flagged figure was not found in the filing's audited XBRL data or text — treat it with caution; it may be LLM-derived (e.g., a computed total or segment share). Not necessarily wrong, just unverifiable. |
@@ -456,6 +516,14 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 ---
 
 ## 📝 Release Notes
+
+### v4.1
+
+- **Setup wizard reordering (K1):** language selection is now the very first wizard step (step 0 is bilingual). The wizard then loops through API key entry (`/skip` to skip any provider), then form types, then tickers. The `wizard_step` config field makes the wizard restart-safe — a crash or restart resumes at the correct step. The stale `wizard_welcome` message was removed.
+- **Command surface (K2):** a full inventory audit found 6 command groups missing from the help block (watchwords, portfolio, API keys, chats, `/export`, `/setrawmax`). All are now documented. `/settings` output gained three new lines: active LLM provider, all configured provider names, and the active grounding data source. A dispatcher↔help parity regression test (`test_k2_command_surface.py`) guards against future gaps.
+- **`/pnl` monospace table (K3 + K3.1):** `/pnl` now renders a fixed-width table (`_pnl_table`) with aligned TICKER / QTY / LAST / VALUE / P&L% columns. The emoji summary block is separate from the table. QTY values ≥1 M render as `1.2M`; values ≥10 k render as `12.3k` — the column never overflows (`_fmt_qty_col`).
+- **User-selectable facts source (K4):** new `/setsource auto|fiscalai|edgar` command lets users choose the grounding data source without editing config files. The `facts_source` config key (`"auto"` default) is controlled by the new pure gate `_fiscal_enabled()`. `edgar` mode disables Fiscal AI entirely even if a key is present. `auto` and `fiscalai` modes are key-dependent. `/settings` shows the resulting 5-state label. See the **Fiscal AI** section above for details.
+- **+90 tests** (822 total, 7 opt-in network smoke tests).
 
 ### v4.0
 > Note: the v3.x range was skipped. Leftover version labels carried forward from v2.x development had left the codebase self-identifying as an earlier version string; this release unifies all labels at v4.0 to eliminate the ambiguity.
