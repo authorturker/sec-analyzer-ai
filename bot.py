@@ -3433,9 +3433,9 @@ def cmd_settings() -> str:
     default_prov = cfg.get("default_provider", "")
     api_keys = cfg.get("api_keys", {})
     if not default_prov:
-        active_provider = f"— ({t('no_ai_no_keys').split('.')[0].lstrip('🤖 ')})"
+        active_provider = t("settings_provider_none")
     elif not api_keys.get(default_prov):
-        active_provider = f"{default_prov} (no key)"
+        active_provider = t("settings_provider_no_key", provider=default_prov)
     else:
         active_provider = default_prov
     # Registered LLM provider names (names only, no keys/masks)
@@ -3906,47 +3906,95 @@ def compute_pnl_rows(agg: dict, prices: dict) -> list:
     return rows
 
 
+def _fmt_ticker(tk: str, width: int = 6) -> str:
+    """Fit ticker into fixed column: truncate long names to width-1 + '…'."""
+    if len(tk) <= width:
+        return tk.ljust(width)
+    return tk[:width - 1] + "…"
+
+
+def _fmt_value(v: "float | None") -> str:
+    """Format dollar value as rounded integer with thousands separator."""
+    if v is None:
+        return "n/a"
+    return f"${int(round(v)):,}"
+
+
+def _fmt_pct(pct: "float | None") -> str:
+    """Format P&L percent: +12.3% or n/a."""
+    if pct is None:
+        return "n/a"
+    return f"{pct:+.1f}%"
+
+
+def _pnl_table(rows: list) -> str:
+    """PURE: build monospace-aligned P&L table string (no surrounding backticks).
+
+    Column layout (≤38 chars target):
+      TICKER  QTY    LAST   VALUE   P&L%
+    Header + one data row per position.
+    No emojis inside — they break monospace alignment.
+    n/a rows: LAST/VALUE/P&L% shown as 'n/a'.
+    """
+    # Column widths
+    W_TK  = 6   # ticker
+    W_QTY = 5   # qty (right)
+    W_LAS = 7   # last price (right)
+    W_VAL = 8   # value (right)
+    W_PCT = 7   # pnl% (right)
+
+    sep = " "
+    header = (
+        "TICKER".ljust(W_TK) + sep +
+        "QTY".rjust(W_QTY) + sep +
+        "LAST".rjust(W_LAS) + sep +
+        "VALUE".rjust(W_VAL) + sep +
+        "P&L%".rjust(W_PCT)
+    )
+    divider = "-" * len(header)
+    data_lines = []
+    for r in rows:
+        tk_col  = _fmt_ticker(r["ticker"], W_TK)
+        qty_col = _fmt_qty(r["qty"]).rjust(W_QTY)
+        if r["last"] is None:
+            las_col = "n/a".rjust(W_LAS)
+            val_col = "n/a".rjust(W_VAL)
+            pct_col = "n/a".rjust(W_PCT)
+        else:
+            las_col = f"${r['last']:.2f}".rjust(W_LAS)
+            val_col = _fmt_value(r["value"]).rjust(W_VAL)
+            pct_col = _fmt_pct(r["pnl_pct"]).rjust(W_PCT)
+        data_lines.append(
+            tk_col + sep + qty_col + sep + las_col + sep + val_col + sep + pct_col
+        )
+    return "\n".join([header, divider] + data_lines)
+
+
 def format_pnl(rows: list) -> str:
-    """PURE: Markdown P&L summary. Total only over priced rows; n/a footnote."""
+    """PURE: Markdown P&L summary using monospace table. Total only over priced rows; n/a footnote."""
     if not rows:
         return t("pnl_empty")
 
-    lines = [t("pnl_header")]
-    na_count  = 0
-    total_val = 0.0
-    total_pnl = 0.0
-    total_cost = 0.0
+    table_body = _pnl_table(rows)
 
+    na_count   = 0
+    total_val  = 0.0
+    total_pnl  = 0.0
+    total_cost = 0.0
     for r in rows:
-        tk = _md_escape(r["ticker"])
         if r["last"] is None:
-            lines.append(t("pnl_row_na",
-                           ticker=tk,
-                           qty=_fmt_qty(r["qty"]),
-                           avg_cost=r["avg_cost"]))
             na_count += 1
         else:
-            emoji = "📈" if r["pnl_usd"] >= 0 else "📉"
-            pct_str = (f"{r['pnl_pct']:+.2f}%" if r["pnl_pct"] is not None
-                       else "n/a")
-            lines.append(t("pnl_row",
-                           ticker=tk,
-                           qty=_fmt_qty(r["qty"]),
-                           avg_cost=r["avg_cost"],
-                           last=r["last"],
-                           value=r["value"],
-                           emoji=emoji,
-                           pnl_usd=r["pnl_usd"],
-                           pnl_pct=pct_str))
             total_val  += r["value"]
             total_pnl  += r["pnl_usd"]
             total_cost += r["qty"] * r["avg_cost"]
 
     priced = len(rows) - na_count
+    lines = [t("pnl_header"), f"```\n{table_body}\n```"]
+
     if priced > 0:
-        t_emoji  = "📈" if total_pnl >= 0 else "📉"
-        t_pct    = (f"{total_pnl / total_cost * 100.0:+.2f}%"
-                    if total_cost != 0 else "n/a")
+        t_emoji = "📈" if total_pnl >= 0 else "📉"
+        t_pct   = _fmt_pct(total_pnl / total_cost * 100.0 if total_cost != 0 else None)
         lines.append(t("pnl_total",
                        emoji=t_emoji,
                        value=total_val,
@@ -4140,7 +4188,6 @@ def cmd_pnl() -> str:
     col7  = _format_delta(d7[0]  if d7  else None, d7[1]  if d7  else None)
     col30 = _format_delta(d30[0] if d30 else None, d30[1] if d30 else None)
     delta_line = t("pnl_delta_line",
-                   total=today_val,
                    d1=col1, d7=col7, d30=col30)
     return f"{base}\n{delta_line}"
 
