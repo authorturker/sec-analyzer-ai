@@ -10,7 +10,7 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 [![OpenRouter](https://img.shields.io/badge/LLM-OpenRouter%20Free-6c47ff)](https://openrouter.ai)
 [![Telegram](https://img.shields.io/badge/Interface-Telegram-2CA5E0?logo=telegram&logoColor=white)](https://telegram.org)
 [![CI](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-822%20passing-success)](#-tests)
+[![Tests](https://img.shields.io/badge/tests-874%20passing-success)](#-tests)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 </div>
@@ -49,8 +49,8 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 | 🧠 **Multi-LLM** | OpenRouter · Gemini · Anthropic · Groq — add keys with `/addapi`; auto-failover across providers |
 | 📴 **No-AI Mode** | Without any LLM key the bot still runs: delivers raw filing text with a clear ⚠️ label; never goes silent |
 | 📈 **Portfolio History** | Daily portfolio-value snapshots (up to 730 days); `/pnl` shows 1d / 7d / 30d raw-value delta |
-| 📊 **Fiscal AI (optional)** | Optional data source for grounding analysis — falls back to EDGAR XBRL when key absent or period not matched |
-| 🧪 **Tested** | 822 pytest tests for pure helpers, i18n, config cache, thread safety |
+| 📊 **Optional data sources** | Fiscal AI and Twelve Data as alternative grounding sources — auto chain tries each in order; always falls back to EDGAR XBRL |
+| 🧪 **Tested** | 874 pytest tests for pure helpers, i18n, config cache, thread safety |
 | ⚡ **OpenRouter Free LLM** | openrouter/free, $0 cost |
 | 📱 **Lightweight** | Single 1.8k-line `bot.py`, runs on a mid-range Android phone via Termux |
 
@@ -73,7 +73,7 @@ sec-analyzer/
 ├── lang/
 │   ├── en.json                  # English UI strings (default)
 │   └── tr.json                  # Turkish UI strings
-├── tests/                       # 822 pytest tests (+ 7 opt-in live network tests)
+├── tests/                       # 874 pytest tests (+ 9 opt-in live network tests)
 │   ├── conftest.py
 │   ├── test_alarm_buttons.py    # Interactive alarm + on-demand .md button
 │   ├── test_bootstrap.py        # Minimal .env bootstrap, master-user init, env migration
@@ -88,6 +88,7 @@ sec-analyzer/
 │   ├── test_k3_pnl_visual.py   # /pnl monospace table renderer (_pnl_table)
 │   ├── test_k31_qty_col.py     # QTY column clamping formatter (_fmt_qty_col)
 │   ├── test_k4_setsource.py    # facts_source cfg + _fiscal_enabled gate + /setsource command
+│   ├── test_l1_twelvedata.py   # Twelve Data provider: chain matrix, parser fixtures, /setsource, i18n
 │   ├── test_multichat.py        # Multi-chat auth, migration, broadcast
 │   ├── test_multi_llm.py        # Multi-LLM provider abstraction, /addapi, /apis, retry
 │   ├── test_network.py          # Opt-in live endpoint tests (--network flag)
@@ -248,7 +249,7 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 ### API Keys (admin only)
 | Command | Action |
 |---|---|
-| `/addapi <provider> [key]` | Add or update a provider API key — send in a **private chat** (key is deleted from Telegram immediately); providers: `openrouter` `gemini` `anthropic` `groq` `fiscalai` |
+| `/addapi <provider> [key]` | Add or update a provider API key — send in a **private chat** (key is deleted from Telegram immediately); providers: `openrouter` `gemini` `anthropic` `groq` `fiscalai` `twelvedata` |
 | `/apis` | Show all configured providers (masked keys) and the active LLM provider |
 | `/setapi <provider>` | Set the preferred LLM provider (used first; others as fallback) |
 | `/delapi <provider>` | Remove a provider's key |
@@ -283,17 +284,28 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 | `/setlookback 60` | Set lookback window in days (1–365) |
 | `/setchars 15000` | Set max characters per section (1000–50000) |
 | `/setrawmax 500` | Cap in-memory raw-filing cache (0 = unlimited) |
-| `/setsource auto\|fiscalai\|edgar` | Select grounding data source; no argument shows current value |
+| `/setsource auto\|fiscalai\|twelvedata\|edgar` | Select grounding data source; no argument shows current value |
 | `/priceaction on` / `off` | Toggle the per-filing price-action snippet |
 | `/setlookforward 5` | Days after filing for price change (1–90) |
 
 ---
 
-## 🧾 Fiscal AI (Optional Data Source)
+## 🧾 Optional Data Sources
 
-Fiscal AI is an **optional grounding data source** — it is not an LLM provider. When a Fiscal AI key is configured, the bot fetches standardized income-statement and balance-sheet figures from Fiscal AI's API *before* calling the LLM and injects them into the analysis prompt, the same way EDGAR XBRL facts are injected. The LLM is instructed to use only these verified figures for numeric claims.
+The bot supports two optional grounding sources in addition to EDGAR XBRL: **Fiscal AI** and **Twelve Data**. Neither is an LLM provider — they supply standardized financial figures that are injected into the analysis prompt before the LLM call, grounding numeric claims in audited data.
 
-### How to enable
+### Choosing a source
+
+```
+/setsource auto            # (default) try fiscalai → twelvedata → EDGAR XBRL in order
+/setsource fiscalai        # always prefer Fiscal AI; falls back to EDGAR if period not matched
+/setsource twelvedata      # always prefer Twelve Data; falls back to EDGAR if period not matched
+/setsource edgar           # EDGAR XBRL only — ignore all optional data source keys
+```
+
+`/setsource` with no argument shows the current value. `auto` mode only tries providers for which a key is configured; if neither key is present it goes straight to EDGAR XBRL. Check all settings, including the resolved data-source label, with `/settings`.
+
+### Fiscal AI
 
 Get a free API key at [api.fiscal.ai](https://api.fiscal.ai) and add it from Telegram (use a private chat — the key message is deleted immediately):
 
@@ -301,26 +313,32 @@ Get a free API key at [api.fiscal.ai](https://api.fiscal.ai) and add it from Tel
 /addapi fiscalai <your-key>
 ```
 
-### How to control
+**Why Fiscal AI over EDGAR XBRL:** Fiscal AI normalizes figures across companies and reporting periods. EDGAR XBRL tags vary — `us-gaap:Revenues`, `us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax`, and a dozen other labels may all mean "revenue" depending on the company. A single unambiguous number produces more grounded, less hallucinated analyses.
 
-```
-/setsource auto       # (default) use Fiscal AI if a key exists, else fall back to EDGAR XBRL
-/setsource fiscalai   # always prefer Fiscal AI (still falls back to EDGAR if period not matched)
-/setsource edgar      # ignore Fiscal AI key entirely — always use EDGAR XBRL
-```
-
-`/setsource` with no argument shows the current value. Check all current settings, including the active data source, with `/settings`.
-
-### Why use Fiscal AI over EDGAR XBRL
-
-- **Standardized values:** Fiscal AI normalizes figures across companies and reporting periods. EDGAR XBRL tags vary — `us-gaap:Revenues`, `us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax`, and a dozen other labels may all mean "revenue" depending on the company.
-- **Cleaner figures for the LLM:** a single unambiguous number produces more grounded, less hallucinated analyses.
-
-### Limits (dürüstlük çiti)
+**Limits:**
 
 - **Free tier:** 25 companies / 250 API calls per day.
-- **Exact period match required:** if the filing's fiscal period is not matched in Fiscal AI's database the bot falls back silently to EDGAR XBRL — analysis continues without interruption.
+- **Exact period match required:** if the filing's fiscal period is not matched in Fiscal AI's database the bot falls back silently to EDGAR XBRL.
 - **Supported form classes:** only 10-K / 10-Q class annual and quarterly reports use grounding. Form 4, 8-K, and other form types are unaffected regardless of the data source setting.
+- **Key storage:** stored in plain text in `bot_config.json` (git-ignored, docker-ignored — never committed).
+
+### Twelve Data
+
+Get an API key at [twelvedata.com](https://twelvedata.com) and add it:
+
+```
+/addapi twelvedata <your-key>
+```
+
+Twelve Data provides income-statement and balance-sheet figures via its `/income_statement` and `/balance_sheet` endpoints. The bot maps up to 9 financial concepts (revenues, gross profit, operating income, net income, diluted EPS, cash, total assets, total liabilities, stockholders' equity) to the same normalized format used for Fiscal AI and EDGAR XBRL — the analysis pipeline is identical regardless of which source supplies the figures.
+
+In `auto` mode, Fiscal AI is tried first (if a key exists); Twelve Data is tried second; EDGAR XBRL is the final fallback. All three share the same chain: if the active source returns no data for a filing's exact period, the next source in the chain is tried automatically.
+
+**Limits (dürüstlük çiti):**
+
+- **Plan requirement:** financial statement endpoints (`/income_statement`, `/balance_sheet`) are **not available on the free Basic plan** — a Grow or Pro+ plan is required (100 credits per symbol per endpoint). On a Basic plan the API returns a plan-error response; the bot detects this, emits a one-per-day warning, and falls back silently to EDGAR XBRL.
+- **Exact period match required:** same rule as Fiscal AI — nearest-period matching is not used; if the filing's exact `fiscal_date` is absent from the response the result is discarded and the chain falls through.
+- **Supported form classes:** same as Fiscal AI — only 10-K / 10-Q class forms.
 - **Key storage:** stored in plain text in `bot_config.json` (git-ignored, docker-ignored — never committed).
 
 ---
@@ -474,10 +492,10 @@ python -m pytest tests/ -q
 ```
 
 ```
-822 passed, 7 skipped in <3s
+874 passed, 9 skipped in <3s
 ```
 
-The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, `_parse_fiscal_period`, `_parse_fiscal_response`, `_portfolio_history_delta`, `_pnl_table`, `_fmt_qty_col`, `_fiscal_enabled`, …), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the multi-LLM provider abstraction (provider chain, key masking, retry logic), the No-AI mode (raw text delivery, short-circuit, daily reminder gate), the portfolio-history delta helpers, the command surface inventory (dispatcher↔help parity), and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline. The 7 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
+The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, `_parse_fiscal_period`, `_parse_fiscal_response`, `_portfolio_history_delta`, `_pnl_table`, `_fmt_qty_col`, `_fiscal_enabled`, `_data_source_chain`, `_data_source_label`, `_parse_twelve_response`, …), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the multi-LLM provider abstraction (provider chain, key masking, retry logic), the No-AI mode (raw text delivery, short-circuit, daily reminder gate), the portfolio-history delta helpers, the command surface inventory (dispatcher↔help parity), the data-source chain matrix (all modes × key combinations, ordered fallback, Twelve Data parser fixtures), and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline. The 9 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
 
 ---
 
@@ -511,11 +529,20 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 | Analysis says `⚠️ AI mode off — no API key configured` | No LLM key is set; use `/addapi openrouter sk-or-v1-...` (or any other provider) in a private chat |
 | All providers failed — you see raw text with a retry button | Every configured LLM key returned an error; tap the retry button or check keys with `/apis` |
 | `fiscalai key rejected (401/403)` in analysis | Your Fiscal AI key is invalid or over quota — update it with `/addapi fiscalai <newkey>` or remove it with `/delapi fiscalai`; analysis falls back to EDGAR XBRL automatically |
+| `⚠️ Twelve Data key rejected` warning in analysis | Your Twelve Data plan does not include financial statement endpoints (Grow/Pro+ required) — or the key is invalid. The bot will fall back to EDGAR XBRL and warn once per day. Update with `/addapi twelvedata <newkey>` or switch away from Twelve Data with `/setsource auto` |
 | `/pnl` delta shows a jump after adding a position | This is expected: the Δ columns show raw total-value change, not time-weighted return — adding shares increases the total, which registers as a positive delta |
 
 ---
 
 ## 📝 Release Notes
+
+### v4.2
+
+- **Twelve Data as second grounding data provider (L1):** Twelve Data is now supported as an alternative grounding source alongside Fiscal AI. The bot fetches income-statement and balance-sheet figures from Twelve Data's API and maps them to the same 9-concept normalized format used for Fiscal AI and EDGAR XBRL.
+- **Data-source chain architecture (`_data_source_chain`):** the old binary `_fiscal_enabled()` gate is replaced by an ordered chain. In `auto` mode the bot tries providers left-to-right (fiscalai → twelvedata) and stops at the first that returns a result for the exact filing period. EDGAR XBRL remains the unconditional final fallback in all modes.
+- **`/setsource` expanded to four values:** `auto` (default) · `fiscalai` · `twelvedata` · `edgar`. Selecting a provider without a key is accepted with a warning; EDGAR XBRL is used until the key is added.
+- **Plan-layer honesty:** Twelve Data's financial statement endpoints require a Grow or Pro+ plan (not available on the free Basic tier). When the API returns a plan-error response, the bot emits a one-per-day warning and falls back silently to EDGAR XBRL — it never retries or prompts repeatedly.
+- **+52 tests** (874 total, 9 opt-in network smoke tests): `_data_source_chain` mode × key matrix, `_parse_twelve_response` fixtures (exact match, period mismatch, below-threshold, error body), chain ordered fallback, `/setsource twelvedata`, all `_data_source_label` states, `/addapi twelvedata`, `/setapi twelvedata` rejection, i18n parity.
 
 ### v4.1
 
