@@ -3927,6 +3927,39 @@ def _fmt_pct(pct: "float | None") -> str:
     return f"{pct:+.1f}%"
 
 
+def _fmt_qty_col(qty: float, width: int = 5) -> str:
+    """Cosmetic: fit qty into fixed column width for monospace table.
+
+    Abbreviates when _fmt_qty output exceeds width:
+      ≥ 1 000 000  → '1.2M' (or '123M' if needed)
+      ≥    10 000  → '12.3k' (or '123k' if needed)
+      < 10 000     → reduce decimal places (dp=3 → 2 → 1 → 0)
+
+    PURELY cosmetic — P&L/VALUE calculations always use raw qty.
+    """
+    raw = _fmt_qty(qty)
+    if len(raw) <= width:
+        return raw.rjust(width)
+    if qty >= 1_000_000:
+        s = f"{qty / 1_000_000:.1f}M"
+        if len(s) > width:
+            s = f"{int(round(qty / 1_000_000))}M"
+    elif qty >= 10_000:
+        s = f"{qty / 1_000:.1f}k"
+        if len(s) > width:
+            s = f"{int(round(qty / 1_000))}k"
+    else:
+        s = raw
+        for dp in range(3, -1, -1):
+            candidate = f"{qty:.{dp}f}"
+            if len(candidate) <= width:
+                s = candidate
+                break
+        else:
+            s = str(int(round(qty)))
+    return s.rjust(width)
+
+
 def _pnl_table(rows: list) -> str:
     """PURE: build monospace-aligned P&L table string (no surrounding backticks).
 
@@ -3955,7 +3988,7 @@ def _pnl_table(rows: list) -> str:
     data_lines = []
     for r in rows:
         tk_col  = _fmt_ticker(r["ticker"], W_TK)
-        qty_col = _fmt_qty(r["qty"]).rjust(W_QTY)
+        qty_col = _fmt_qty_col(r["qty"], W_QTY)
         if r["last"] is None:
             las_col = "n/a".rjust(W_LAS)
             val_col = "n/a".rjust(W_VAL)
