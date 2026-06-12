@@ -160,3 +160,107 @@ class TestWelcomeFirstRun:
             strings = bot._load_lang(code)
             assert "env_import_done" in strings, \
                 f"Missing 'env_import_done' in {code}.json"
+
+
+# ─── K1 — Setup wizard reordering ────────────────────────────
+class TestWizardK1:
+    """Tests for K1: wizard order lang → api → forms → tickers."""
+
+    def _reset(self, bot, monkeypatch, tmp_path):
+        monkeypatch.setattr(bot, "CONFIG_FILE", tmp_path / "bot_config.json")
+        bot._cfg_cache = None
+        bot.WIZARD.clear()
+
+    def test_start_wizard_sends_lang_menu_only(self, bot, monkeypatch, tmp_path):
+        """First launch: only lang menu is sent (no welcome_bootstrap yet)."""
+        self._reset(bot, monkeypatch, tmp_path)
+        sent = []
+        monkeypatch.setattr(bot, "tg", lambda msg, **kw: sent.append(msg))
+        bot.start_wizard()
+        assert len(sent) == 1
+        assert bot.t("wizard_lang_menu") in sent[0]
+        assert bot.WIZARD.get("step") == "lang"
+        assert bot.get_cfg_value("wizard_step") == "lang"
+
+    def test_lang_choice_advances_to_api(self, bot, monkeypatch, tmp_path):
+        """After /lang en → wizard moves to api step and sends welcome+api menu."""
+        self._reset(bot, monkeypatch, tmp_path)
+        sent = []
+        monkeypatch.setattr(bot, "tg", lambda msg, **kw: sent.append(msg))
+        bot.start_wizard()
+        sent.clear()
+        handled = bot.wizard_handle("/lang en", ["/lang", "en"], chat_id="111", msg={})
+        assert handled is True
+        assert bot.WIZARD.get("step") == "api"
+        assert bot.get_cfg_value("wizard_step") == "api"
+        assert any(bot.t("welcome_bootstrap", master_chat_id=bot.MASTER_CHAT_ID) in m for m in sent)
+
+    def test_api_skip_advances_to_forms(self, bot, monkeypatch, tmp_path):
+        """During api step: /skip → forms step."""
+        self._reset(bot, monkeypatch, tmp_path)
+        sent = []
+        monkeypatch.setattr(bot, "tg", lambda msg, **kw: sent.append(msg))
+        bot.WIZARD["step"] = "api"
+        handled = bot.wizard_handle("/skip", ["/skip"], chat_id="111", msg={})
+        assert handled is True
+        assert bot.WIZARD.get("step") == "forms"
+        assert bot.get_cfg_value("wizard_step") == "forms"
+
+    def test_forms_usedefaults_advances_to_tickers(self, bot, monkeypatch, tmp_path):
+        """During forms step: /usedefaults → tickers step."""
+        self._reset(bot, monkeypatch, tmp_path)
+        sent = []
+        monkeypatch.setattr(bot, "tg", lambda msg, **kw: sent.append(msg))
+        bot.WIZARD["step"] = "forms"
+        handled = bot.wizard_handle("/usedefaults", ["/usedefaults"], chat_id="111", msg={})
+        assert handled is True
+        assert bot.WIZARD.get("step") == "tickers"
+        assert bot.get_cfg_value("wizard_step") == "tickers"
+        assert bot.get_cfg_value("default_forms") == bot.DEFAULT_FORMS
+
+    def test_tickers_skip_completes_wizard(self, bot, monkeypatch, tmp_path):
+        """During tickers step: /skip → wizard complete, first_run=False."""
+        self._reset(bot, monkeypatch, tmp_path)
+        sent = []
+        monkeypatch.setattr(bot, "tg", lambda msg, **kw: sent.append(msg))
+        bot.WIZARD["step"] = "tickers"
+        handled = bot.wizard_handle("/skip", ["/skip"], chat_id="111", msg={})
+        assert handled is True
+        assert "step" not in bot.WIZARD
+        assert bot.get_cfg_value("first_run") is False
+        assert bot.get_cfg_value("wizard_step") == ""
+        assert any(bot.t("wizard_complete") in m for m in sent)
+
+    def test_restart_mid_api_resumes(self, bot, monkeypatch, tmp_path):
+        """On restart with wizard_step='api' in cfg, _show_wizard_step_menu restores state."""
+        self._reset(bot, monkeypatch, tmp_path)
+        bot.mutate_cfg(lambda c: c.update({"first_run": True, "wizard_step": "api"}))
+        sent = []
+        monkeypatch.setattr(bot, "tg", lambda msg, **kw: sent.append(msg))
+        wizard_step = bot.get_cfg_value("wizard_step")
+        assert wizard_step in ("api", "forms", "tickers")
+        bot.WIZARD["step"] = wizard_step
+        bot._show_wizard_step_menu(wizard_step)
+        assert bot.WIZARD.get("step") == "api"
+        assert len(sent) >= 1
+
+    def test_old_config_no_wizard(self, bot, monkeypatch, tmp_path):
+        """Config with first_run=False → wizard_handle returns False (inactive)."""
+        self._reset(bot, monkeypatch, tmp_path)
+        bot.mutate_cfg(lambda c: c.update({"first_run": False, "wizard_step": ""}))
+        # WIZARD is empty → wizard_handle returns False
+        handled = bot.wizard_handle("/help", ["/help"], chat_id="111", msg={})
+        assert handled is False
+
+    def test_api_menu_keys_exist(self, bot):
+        """New i18n keys wizard_api_menu, wizard_api_more, wizard_api_existing present in both langs."""
+        for code in ("en", "tr"):
+            strings = bot._load_lang(code)
+            for key in ("wizard_api_menu", "wizard_api_more", "wizard_api_existing"):
+                assert key in strings, f"Missing '{key}' in {code}.json"
+
+    def test_wizard_welcome_removed_from_lang(self, bot):
+        """wizard_welcome (dead key) removed from both lang files."""
+        for code in ("en", "tr"):
+            strings = bot._load_lang(code)
+            assert "wizard_welcome" not in strings, f"Dead key 'wizard_welcome' still in {code}.json"

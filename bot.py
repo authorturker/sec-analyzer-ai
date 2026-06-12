@@ -269,6 +269,7 @@ _CFG_DEFAULTS = {
     "default_provider":       "",   # active LLM provider name (J2)
     "no_keys_warned_date":    "",   # YYYY-MM-DD of last NO_KEYS reminder (J3 spam gate)
     "fiscal_auth_warned_date": "",  # YYYY-MM-DD of last Fiscal AI auth warning (J5)
+    "wizard_step":             "",  # active wizard step: "lang"|"api"|"forms"|"tickers"|"" (K1)
 }
 _cfg_cache: dict | None = None
 
@@ -1594,6 +1595,9 @@ def _handle_pending_key(chat_id: str, key_text: str, msg: dict):
         with _fiscal_memo_lock:
             _fiscal_memo.clear()
     tg(t("addapi_saved", provider=provider, masked_key=_mask_key(key_text)))
+    # If wizard's API step is active, prompt to add more or skip (K1)
+    if WIZARD.get("step") == "api":
+        tg(t("wizard_api_more"))
 
 
 def _handle_retry_callback(cq: dict):
@@ -4231,34 +4235,80 @@ def background_thread():
 WIZARD: dict = {}
 
 def start_wizard():
-    # Step 0: language. Until the user picks, all UI is bilingual.
+    """Step 1: language picker. Bilingual until the user picks. Persists wizard_step."""
     WIZARD["step"] = "lang"
+    mutate_cfg(lambda c: c.update({"wizard_step": "lang"}))
     tg(t("wizard_lang_menu"))
 
-def _advance_to_forms_step():
-    """Move from Step 0/1 to Step 2 (forms). Sends localized welcome + form menu."""
-    WIZARD["step"] = "forms"
-    tg(t("wizard_welcome") + t("wizard_form_menu"))
+def _advance_to_api_step():
+    """After language chosen: welcome (in selected lang) + API key menu. Persists step."""
+    WIZARD["step"] = "api"
+    mutate_cfg(lambda c: c.update({"wizard_step": "api"}))
+    api_keys = get_cfg().get("api_keys", {})
+    llm_keys = {p: k for p, k in api_keys.items() if p in _PROVIDERS and k}
+    if llm_keys:
+        masked = ", ".join(f"`{p}` ({_mask_key(k)})" for p, k in llm_keys.items())
+        tg(t("welcome_bootstrap", master_chat_id=MASTER_CHAT_ID)
+           + "\n\n" + t("wizard_api_existing", masked_providers=masked))
+    else:
+        tg(t("welcome_bootstrap", master_chat_id=MASTER_CHAT_ID)
+           + "\n\n" + t("wizard_api_menu"))
 
-def wizard_handle(text: str, parts: list) -> bool:
+def _advance_to_forms_step():
+    """Move to forms step. Persists wizard_step."""
+    WIZARD["step"] = "forms"
+    mutate_cfg(lambda c: c.update({"wizard_step": "forms"}))
+    tg(t("wizard_form_menu"))
+
+def _show_wizard_step_menu(step: str):
+    """On restart: re-display the menu for the current wizard step."""
+    if step == "api":
+        _advance_to_api_step()
+    elif step == "forms":
+        tg(t("wizard_form_menu"))
+    elif step == "tickers":
+        tg(t("wizard_ticker_menu"))
+    else:
+        start_wizard()
+
+def wizard_handle(text: str, parts: list, chat_id: str = "", msg: dict | None = None) -> bool:
+    """Route wizard-step messages. Returns True if handled."""
     step = WIZARD.get("step")
     if not step: return False
+    if msg is None: msg = {}
 
-    # Step 0 — language picker (bilingual UI)
+    # Step 1 — language picker (bilingual UI)
     if step == "lang":
         if parts and parts[0].lower() == "/lang" and len(parts) >= 2:
             code = parts[1].lower().strip()
             if code in SUPPORTED_LANGS:
                 set_lang(code)
-                _advance_to_forms_step()
+                _advance_to_api_step()
                 return True
         tg(t("wizard_lang_unknown"))
         return True
 
+    # Step 2 — API key loop (optional; /skip to continue)
+    if step == "api":
+        if parts and parts[0].lower() == "/addapi":
+            result = cmd_addapi(parts, chat_id, msg)
+            tg(result)
+            # One-message form (key inline) → key saved → prompt for more
+            if len(parts) >= 3:
+                tg(t("wizard_api_more"))
+            # Two-message form → addapi_prompt shown; wizard_api_more sent by _handle_pending_key
+            return True
+        if text == "/skip":
+            _advance_to_forms_step()
+            return True
+        tg(t("wizard_api_menu"))
+        return True
+
+    # Step 3 — form selection
     if step == "forms":
         if text == "/usedefaults":
-            update_cfg(default_forms=DEFAULT_FORMS, first_run=False)
             WIZARD["step"] = "tickers"
+            mutate_cfg(lambda c: c.update({"default_forms": DEFAULT_FORMS, "wizard_step": "tickers"}))
             tg(t("wizard_forms_set", forms="  ".join(DEFAULT_FORMS))
                + t("wizard_ticker_menu"))
             return True
@@ -4271,21 +4321,25 @@ def wizard_handle(text: str, parts: list) -> bool:
             if not valid:
                 tg(t("wizard_no_valid_forms") + t("wizard_form_menu"))
                 return True
-            update_cfg(default_forms=valid, first_run=False)
             WIZARD["step"] = "tickers"
+            mutate_cfg(lambda c: c.update({"default_forms": valid, "wizard_step": "tickers"}))
             tg(t("wizard_forms_set", forms="  ".join(valid))
                + t("wizard_ticker_menu"))
             return True
         tg(t("wizard_use_default_or_setforms"))
         return True
+
+    # Step 4 — tickers
     if step == "tickers":
         if text == "/skip":
             WIZARD.pop("step", None)
+            mutate_cfg(lambda c: c.update({"first_run": False, "wizard_step": ""}))
             tg(t("wizard_complete"))
             return True
         if parts and parts[0].lower() == "/addticker" and len(parts) >= 2:
             result = cmd_addticker(parts)
             WIZARD.pop("step", None)
+            mutate_cfg(lambda c: c.update({"first_run": False, "wizard_step": ""}))
             tg(result + "\n\n" + t("wizard_complete"))
             return True
         tg(t("wizard_use_addticker_or_skip"))
@@ -4569,7 +4623,7 @@ def _process_update(upd: dict):
                 with _pending_lock:
                     _pending_api_key.pop(chat_id, None)
 
-        if wizard_handle(text, parts):   return
+        if wizard_handle(text, parts, chat_id=chat_id, msg=msg):   return
 
         # Tickers
         if   komut == "/addticker":      tg(cmd_addticker(parts))
@@ -4750,8 +4804,12 @@ def main():
 
     cfg = get_cfg()
     if cfg.get("first_run", True):
-        tg(t("welcome_bootstrap", master_chat_id=MASTER_CHAT_ID))
-        start_wizard()
+        wizard_step = cfg.get("wizard_step", "")
+        if wizard_step in ("api", "forms", "tickers"):
+            WIZARD["step"] = wizard_step
+            _show_wizard_step_menu(wizard_step)
+        else:
+            start_wizard()
     else:
         tg(t("bot_active"))
 
