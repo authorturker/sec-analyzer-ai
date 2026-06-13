@@ -5174,9 +5174,11 @@ def _process_update(upd: dict):
                 elif komut == "/removechat":
                     tg(handler(parts, chat_id))
                 else:
-                    tg(handler(parts))
+                    result = handler(parts)
+                    if result: tg(result)
             else:
-                tg(handler())
+                result = handler()
+                if result: tg(result)
         # Commands with special return/side-effect handling
         elif komut == "/scangroup":
             cmd_scangroup(parts)
