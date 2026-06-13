@@ -273,6 +273,7 @@ _CFG_DEFAULTS = {
     "twelve_auth_warned_date": "",   # YYYY-MM-DD of last Twelve Data auth warning (L1)
     "wizard_step":             "",   # active wizard step: "lang"|"api"|"forms"|"tickers"|"" (K1)
     "facts_source":            "auto",  # data source preference: "auto"|"fiscalai"|"twelvedata"|"edgar" (L1)
+    "provider_models":         {},   # per-provider model override: {"openrouter": "model-name", ...}
 }
 _cfg_cache: dict | None = None
 
@@ -1399,6 +1400,29 @@ _PROVIDERS: dict = {
     },
 }
 
+# Available models per provider (user-selectable via /setapi)
+_PROVIDER_MODELS: dict[str, list[str]] = {
+    "openrouter": [
+        "openrouter/auto",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "google/gemma-3-27b-it:free",
+        "deepseek/deepseek-chat-v3-0324:free",
+    ],
+    "groq": [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "mixtral-8x7b-32768",
+    ],
+    "anthropic": [
+        "claude-haiku-4-5-20251001",
+        "claude-sonnet-4-20250514",
+    ],
+    "gemini": [
+        "gemini-2.0-flash",
+        "gemini-2.5-flash-preview-04-17",
+    ],
+}
+
 # Sentinel returned by _llm_one on 401 (invalid key) — distinct from None (other failure).
 _AUTH_FAIL = object()
 
@@ -1489,6 +1513,14 @@ def _parse_gemini_resp(body: dict) -> str:
     return (parts_list[0].get("text", "") if parts_list else "").strip()
 
 
+def _get_provider_model(provider: str) -> str:
+    """Return the active model for a provider: config override → _PROVIDERS default."""
+    stored = get_cfg_value("provider_models", {}).get(provider)
+    if stored:
+        return stored
+    return _PROVIDERS.get(provider, {}).get("model", "")
+
+
 def _llm_one(istem: str, model: str, provider: str):
     """Single-attempt LLM call to *provider*.
 
@@ -1508,7 +1540,7 @@ def _llm_one(istem: str, model: str, provider: str):
         return None
 
     ptype = prov["type"]
-    p_model = model if provider == "openrouter" else prov["model"]
+    p_model = _get_provider_model(provider) or model
 
     if ptype == "openai":
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
@@ -4992,7 +5024,10 @@ def cmd_apis() -> str:
 
 
 def cmd_setapi(parts: list) -> str:
-    """Admin: /setapi <provider> — change the default LLM provider.
+    """Admin: /setapi <provider> [model] — change the default LLM provider and model.
+
+    /setapi openrouter                     → set provider, show model menu
+    /setapi openrouter meta-llama/...      → set provider + model inline
     Data providers (fiscalai, twelvedata) cannot be set as default LLM (L1).
     """
     valid = list(_PROVIDERS.keys())
@@ -5003,8 +5038,27 @@ def cmd_setapi(parts: list) -> str:
         return t("setapi_data_provider_rejected", provider=provider)
     if provider not in _PROVIDERS or not _get_provider_key(provider):
         return t("setapi_unknown", provider=provider)
+    # If model specified inline, set both provider and model
+    if len(parts) >= 3:
+        model = " ".join(parts[2:])
+        mutate_cfg(lambda c: c.update({
+            "default_provider": provider,
+            "provider_models": {**c.get("provider_models", {}), provider: model},
+        }))
+        return t("setapi_done_model", provider=provider, model=model)
+    # No model specified — set provider, show model menu
     mutate_cfg(lambda c: c.update({"default_provider": provider}))
-    return t("setapi_done", provider=provider)
+    models = _PROVIDER_MODELS.get(provider, [])
+    if not models:
+        return t("setapi_done", provider=provider)
+    current = _get_provider_model(provider)
+    lines = [t("setapi_done", provider=provider), t("setapi_model_menu",
+             provider=provider, current=current)]
+    for i, m in enumerate(models, 1):
+        marker = " *" if m == current else ""
+        lines.append(f"  {i}. `{m}`{marker}")
+    lines.append(t("setapi_model_hint"))
+    return "\n".join(lines)
 
 
 def cmd_delapi(parts: list) -> str:
@@ -5020,6 +5074,7 @@ def cmd_delapi(parts: list) -> str:
         return t("delapi_unknown", provider=provider)
     def _do(c: dict):
         c.setdefault("api_keys", {}).pop(provider, None)
+        c.setdefault("provider_models", {}).pop(provider, None)
         if c.get("default_provider") == provider:
             remaining = [p for p in _PROVIDERS if c.get("api_keys", {}).get(p)]
             c["default_provider"] = remaining[0] if remaining else ""
