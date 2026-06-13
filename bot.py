@@ -1417,6 +1417,21 @@ def _mask_key(key: str) -> str:
         return "…"
     return key[:4] + "…"
 
+# Provider-specific key prefix expectations (non-fatal — advisory warning)
+_PROVIDER_KEY_PREFIXES: dict[str, str] = {
+    "openrouter": "sk-or-v1-",
+    "anthropic":  "sk-ant-",
+    "groq":       "gsk_",
+}
+
+def _validate_provider_key(provider: str, key: str) -> str | None:
+    """Warn if key doesn't match expected prefix for provider. Returns i18n msg or None."""
+    expected = _PROVIDER_KEY_PREFIXES.get(provider)
+    if expected and not key.startswith(expected):
+        return t("addapi_key_prefix_warn",
+                 provider=provider, expected=expected, got=key[:6] + "…")
+    return None
+
 
 def _get_provider_key(provider: str) -> str:
     """Return the API key for *provider*.
@@ -1529,7 +1544,8 @@ def _llm_one(istem: str, model: str, provider: str):
     elif ptype == "gemini":
         headers  = {"Content-Type": "application/json"}
         payload  = {
-            "contents": [{"parts": [{"text": f"{system_message()}\n\n{istem}"}]}],
+            "systemInstruction": {"parts": [{"text": system_message()}]},
+            "contents": [{"parts": [{"text": istem}]}],
             "generationConfig": {"maxOutputTokens": 1200, "temperature": 0.2},
         }
         endpoint = prov["endpoint"].format(model=prov["model"]) + f"?key={key}"
@@ -1602,6 +1618,9 @@ def _handle_pending_key(chat_id: str, key_text: str, msg: dict):
         with _twelve_memo_lock:
             _twelve_memo.clear()
     tg(t("addapi_saved", provider=provider, masked_key=_mask_key(key_text)))
+    prefix_warn = _validate_provider_key(provider, key_text)
+    if prefix_warn:
+        tg(prefix_warn)
     # If wizard's API step is active, prompt to add more or skip (K1)
     if WIZARD.get("step") == "api":
         tg(t("wizard_api_more"))
@@ -3275,6 +3294,33 @@ def _md_escape(text: str) -> str:
         text = text.replace(ch, "\\" + ch)
     return text
 
+def _digest_pnl_summary() -> str:
+    """Compact P&L one-liner for the weekly digest. Empty if no portfolio or no yfinance."""
+    if not YF_OK:
+        return ""
+    cfg = get_cfg()
+    lots = cfg.get("portfolio", [])
+    if not lots:
+        return ""
+    agg = aggregate_positions(lots)
+    prices: dict[str, "float | None"] = {}
+    for ticker in agg:
+        prices[ticker] = fetch_last_close(ticker)
+        time.sleep(0.5)
+    rows = compute_pnl_rows(agg, prices)
+    priced = [r for r in rows if r["last"] is not None]
+    if not priced:
+        return ""
+    total_val = sum(r["value"] for r in priced)
+    total_pnl = sum(r["pnl_usd"] for r in priced)
+    total_cost = sum(r["qty"] * r["avg_cost"] for r in priced)
+    t_emoji = "📈" if total_pnl >= 0 else "📉"
+    t_pct = _fmt_pct(total_pnl / total_cost * 100.0 if total_cost != 0 else None)
+    return t("digest_pnl_line",
+             emoji=t_emoji, value=f"${total_val:,.0f}",
+             pnl_usd=f"{total_pnl:+,.0f}", pnl_pct=t_pct)
+
+
 def send_weekly_digest():
     data = get_weekly_log()
     if not data:
@@ -3296,6 +3342,10 @@ def send_weekly_digest():
         for k in entries:
             snippet = _md_escape(k["analiz"][:120].replace("\n", " "))
             lines.append(f"  • {k['form']} ({k['tarih']}): {snippet}...")
+
+    pnl_line = _digest_pnl_summary()
+    if pnl_line:
+        lines.append(f"\n{pnl_line}")
 
     tg("\n".join(lines))
     clear_weekly_log()
@@ -4909,7 +4959,9 @@ def cmd_addapi(parts: list, chat_id: str, msg: dict) -> str:
         elif provider == _TWELVE_DATA_PROVIDER:
             with _twelve_memo_lock:
                 _twelve_memo.clear()
-        return t("addapi_saved", provider=provider, masked_key=_mask_key(key))
+        prefix_warn = _validate_provider_key(provider, key)
+        saved_msg = t("addapi_saved", provider=provider, masked_key=_mask_key(key))
+        return f"{saved_msg}\n{prefix_warn}" if prefix_warn else saved_msg
     # Two-message form: register pending entry
     with _pending_lock:
         _pending_api_key[chat_id] = {"provider": provider, "expires": time.time() + 120}
