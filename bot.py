@@ -384,11 +384,12 @@ def _is_valid_chat_id(v) -> bool:
 
 def _is_authorized(chat_id: str) -> bool:
     """Return True if chat_id is in the authorized chat_ids list."""
-    return str(chat_id) in [str(c) for c in get_cfg().get("chat_ids", [])]
+    ids = get_cfg_value("chat_ids", [])
+    return str(chat_id) in {str(c) for c in ids}
 
 def _is_admin(chat_id: str) -> bool:
     """Return True if chat_id is the first (admin) entry in chat_ids."""
-    ids = get_cfg().get("chat_ids", [])
+    ids = get_cfg_value("chat_ids", [])
     return bool(ids) and str(chat_id) == str(ids[0])
 
 def _migrate_chat_ids():
@@ -501,7 +502,7 @@ def get_lang() -> str:
     """Return active language code, cached."""
     global _current_lang
     if _current_lang is None:
-        _current_lang = get_cfg().get("language", DEFAULT_LANG)
+        _current_lang = get_cfg_value("language", DEFAULT_LANG)
         if _current_lang not in SUPPORTED_LANGS:
             _current_lang = DEFAULT_LANG
     return _current_lang
@@ -597,8 +598,8 @@ def retry(fn, *, attempts: int = 4, base: int = 5, cap: int = 120,
             if on_error is not None:
                 try:
                     on_error(e, attempt)
-                except Exception:
-                    pass
+                except Exception as cb_err:
+                    log.debug(f"retry on_error callback failed: {cb_err}")
             last = attempt == attempts - 1
             wait = _backoff(attempt, base, cap)
             log.error(f"{label} (attempt {attempt+1}/{attempts}): {e}"
@@ -1044,7 +1045,7 @@ def _tg_to(chat_id: str, text: str):
 def broadcast(text: str):
     """Send `text` to ALL authorized chat_ids (proactive/background messages).
     Each chat's failure is isolated — one blocked bot does not stop the rest."""
-    for cid in get_cfg().get("chat_ids", []):
+    for cid in get_cfg_value("chat_ids", []):
         try:
             _tg_to(str(cid), text)
         except Exception as e:
@@ -1081,7 +1082,7 @@ def _tg_send_document_to(chat_id: str, filename: str, content: str, caption: str
 def tg_send_document(filename: str, content: str, caption: str = ""):
     """Send a document to the reactive context chat, or broadcast if no context."""
     cid = getattr(_ctx, "chat_id", None)
-    chats = [cid] if cid else [str(c) for c in get_cfg().get("chat_ids", [])]
+    chats = [cid] if cid else [str(c) for c in get_cfg_value("chat_ids", [])]
     for chat in chats:
         try:
             _tg_send_document_to(str(chat), filename, content, caption)
@@ -1179,7 +1180,7 @@ def _tg_with_keyboard_to(chat_id: str, text: str, keyboard: dict | None):
 def tg_with_keyboard(text: str, keyboard: dict | None):
     """Send message+keyboard to the reactive context chat, or broadcast if no context."""
     cid = getattr(_ctx, "chat_id", None)
-    chats = [cid] if cid else [str(c) for c in get_cfg().get("chat_ids", [])]
+    chats = [cid] if cid else [str(c) for c in get_cfg_value("chat_ids", [])]
     for chat in chats:
         try:
             _tg_with_keyboard_to(str(chat), text, keyboard)
@@ -1663,7 +1664,7 @@ def _deliver_raw_text(body: str, ticker: str, form: str, date_str: str, warn_key
     safe_body = (body or "").strip()
 
     cid = getattr(_ctx, "chat_id", None)
-    chats = [cid] if cid else [str(c) for c in get_cfg().get("chat_ids", [])]
+    chats = [cid] if cid else [str(c) for c in get_cfg_value("chat_ids", [])]
 
     if not safe_body:
         tg(warning)
@@ -1921,14 +1922,16 @@ def fetch_xbrl_facts(filing) -> dict | None:  # type: ignore[type-arg]
         raw: dict[str, list[tuple]] = {}
 
         # Access the internal facts dict; attribute name varies across versions.
-        _facts_dict: dict = {}
+        _facts_iterable: list = []
         if hasattr(xbrl, "_facts"):
-            _facts_dict = xbrl._facts  # v5 (and likely v4)
-        elif hasattr(xbrl, "facts") and hasattr(xbrl.facts, "_facts_cache"):
-            pass  # FactsView; iterate below via get_facts()
-        # If neither worked, _facts_dict stays empty → returns None gracefully.
+            _facts_iterable = list(xbrl._facts.items())  # v5 (and likely v4)
+        elif hasattr(xbrl, "facts") and hasattr(xbrl.facts, "get_facts"):
+            # FactsView (edgartools v3): iterate via get_facts()
+            _facts_iterable = [(f.element_id, f) for f in xbrl.facts.get_facts()
+                               if hasattr(f, "element_id")]
+        # If neither worked, _facts_iterable stays empty → returns None gracefully.
 
-        for _key, fact in _facts_dict.items():
+        for _key, fact in _facts_iterable:
             # Normalise concept: strip namespace prefix.
             concept: str = getattr(fact, "element_id", "") or ""
             if ":" in concept:
@@ -2027,6 +2030,34 @@ _FISCAL_FACTS_MINIMUM = 4       # min concepts for fiscal response to be accepte
 
 # In-memory memo: {(ticker_upper, period_end_YYYY-MM-DD): dict | None}
 _fiscal_memo: dict = {}
+_NEGATIVE_MEMO_TTL = 3600  # seconds — transient API failures expire after 1 hour
+
+
+def _memo_get(memo: dict, key: tuple):
+    """Read from memo cache; return (found: bool, value).
+
+    found=False → cache miss, caller should fetch.
+    found=True, value=None → negative cache hit (within TTL or permanent).
+    found=True, value=dict → successful result (permanent).
+    """
+    if key not in memo:
+        return False, None
+    entry = memo[key]
+    if isinstance(entry, tuple):
+        value, ts = entry
+        if time.time() - ts > _NEGATIVE_MEMO_TTL:
+            memo.pop(key, None)
+            return False, None
+        return True, value
+    return True, entry
+
+
+def _memo_set(memo: dict, key: tuple, value, negative: bool = False):
+    """Write to memo cache. negative=True stores with TTL timestamp."""
+    if negative and value is None:
+        memo[key] = (None, time.time())
+    else:
+        memo[key] = value
 
 # Concept field-name mapping: Fiscal AI key → internal XBRL concept name
 _FISCAL_INCOME_MAP: dict[str, str] = {
@@ -2160,8 +2191,9 @@ def fetch_fiscal_facts(ticker: str, period_end: str) -> "dict | None":
         return None
     cache_k = (ticker.upper(), period_end[:10])
     with _fiscal_memo_lock:
-        if cache_k in _fiscal_memo:
-            return _fiscal_memo[cache_k]
+        found, cached = _memo_get(_fiscal_memo, cache_k)
+        if found:
+            return cached
 
     headers = {"X-Api-Key": key, "Accept": "application/json"}
     period_types = "annual,quarterly,semi-annual,ltm,latest"
@@ -2181,29 +2213,29 @@ def fetch_fiscal_facts(ticker: str, period_end: str) -> "dict | None":
                 _check_fiscal_auth_reminder()
                 log.debug(f"fetch_fiscal_facts {which}: {r.status_code} — auth fail")
                 with _fiscal_memo_lock:
-                    _fiscal_memo[cache_k] = None
+                    _memo_set(_fiscal_memo, cache_k, None, negative=True)
                 return None
             if r.status_code == 404:
                 log.debug(f"fetch_fiscal_facts {which}: 404 {ticker} — not found")
                 with _fiscal_memo_lock:
-                    _fiscal_memo[cache_k] = None
+                    _memo_set(_fiscal_memo, cache_k, None, negative=True)
                 return None
             if not r.ok:
                 log.debug(f"fetch_fiscal_facts {which}: {r.status_code} — fallback")
                 with _fiscal_memo_lock:
-                    _fiscal_memo[cache_k] = None
+                    _memo_set(_fiscal_memo, cache_k, None, negative=True)
                 return None
             try:
                 body = r.json()
             except Exception:
                 log.debug(f"fetch_fiscal_facts {which}: JSON parse error")
                 with _fiscal_memo_lock:
-                    _fiscal_memo[cache_k] = None
+                    _memo_set(_fiscal_memo, cache_k, None, negative=True)
                 return None
         except Exception as exc:
             log.debug(f"fetch_fiscal_facts {which}: {exc}")
             with _fiscal_memo_lock:
-                _fiscal_memo[cache_k] = None
+                _memo_set(_fiscal_memo, cache_k, None, negative=True)
             return None
         if which == "income":
             income_data = body
@@ -2212,7 +2244,7 @@ def fetch_fiscal_facts(ticker: str, period_end: str) -> "dict | None":
 
     result = _parse_fiscal_response(income_data, balance_data, period_end)
     with _fiscal_memo_lock:
-        _fiscal_memo[cache_k] = result
+        _memo_set(_fiscal_memo, cache_k, result)
     return result
 
 
@@ -2313,8 +2345,9 @@ def fetch_twelvedata_facts(ticker: str, period_end: str,
         return None
     cache_k = (ticker.upper(), period_end[:10])
     with _twelve_memo_lock:
-        if cache_k in _twelve_memo:
-            return _twelve_memo[cache_k]
+        found, cached = _memo_get(_twelve_memo, cache_k)
+        if found:
+            return cached
 
     period_param = period_hint if period_hint in ("annual", "quarterly") else ""
     endpoints = []
@@ -2333,24 +2366,24 @@ def fetch_twelvedata_facts(ticker: str, period_end: str,
                 _check_twelve_auth_reminder()
                 log.debug(f"fetch_twelvedata_facts {which}: {r.status_code} — auth/plan fail")
                 with _twelve_memo_lock:
-                    _twelve_memo[cache_k] = None
+                    _memo_set(_twelve_memo, cache_k, None, negative=True)
                 return None
             if r.status_code == 404:
                 log.debug(f"fetch_twelvedata_facts {which}: 404 {ticker} — not found")
                 with _twelve_memo_lock:
-                    _twelve_memo[cache_k] = None
+                    _memo_set(_twelve_memo, cache_k, None, negative=True)
                 return None
             if not r.ok:
                 log.debug(f"fetch_twelvedata_facts {which}: {r.status_code} — fallback")
                 with _twelve_memo_lock:
-                    _twelve_memo[cache_k] = None
+                    _memo_set(_twelve_memo, cache_k, None, negative=True)
                 return None
             try:
                 body = r.json()
             except Exception:
                 log.debug(f"fetch_twelvedata_facts {which}: JSON parse error")
                 with _twelve_memo_lock:
-                    _twelve_memo[cache_k] = None
+                    _memo_set(_twelve_memo, cache_k, None, negative=True)
                 return None
             # Twelve Data returns {"code":4xx,"status":"error"} for plan errors
             if isinstance(body, dict) and body.get("status") == "error":
@@ -2359,16 +2392,16 @@ def fetch_twelvedata_facts(ticker: str, period_end: str,
                     _check_twelve_auth_reminder()
                     log.debug(f"fetch_twelvedata_facts {which}: API error {code} — auth/plan")
                     with _twelve_memo_lock:
-                        _twelve_memo[cache_k] = None
+                        _memo_set(_twelve_memo, cache_k, None, negative=True)
                     return None
                 log.debug(f"fetch_twelvedata_facts {which}: API error {code} — fallback")
                 with _twelve_memo_lock:
-                    _twelve_memo[cache_k] = None
+                    _memo_set(_twelve_memo, cache_k, None, negative=True)
                 return None
         except Exception as exc:
             log.debug(f"fetch_twelvedata_facts {which}: {exc}")
             with _twelve_memo_lock:
-                _twelve_memo[cache_k] = None
+                _memo_set(_twelve_memo, cache_k, None, negative=True)
             return None
         if which == "income_statement":
             income_data = body
@@ -2377,7 +2410,7 @@ def fetch_twelvedata_facts(ticker: str, period_end: str,
 
     result = _parse_twelve_response(income_data, balance_data, period_end)
     with _twelve_memo_lock:
-        _twelve_memo[cache_k] = result
+        _memo_set(_twelve_memo, cache_k, result)
     return result
 
 
@@ -3274,7 +3307,7 @@ def cmd_digest(parts: list) -> str:
         return t("digest_disabled")
     if len(parts) >= 2 and parts[1].lower() == "now":
         send_weekly_digest()
-        return ""
+        return t("digest_sent")
     update_cfg(weekly_digest=True)
     return t("digest_enabled")
 
@@ -4054,7 +4087,7 @@ def cmd_addchat(parts: list, caller_id: str) -> str:
         new_id = str(int(parts[1]))          # validate: must be an integer
     except ValueError:
         return t("addchat_format_error")
-    ids = [str(c) for c in get_cfg().get("chat_ids", [])]
+    ids = [str(c) for c in get_cfg_value("chat_ids", [])]
     if len(ids) >= _CHAT_MAX:
         return t("addchat_limit", max=_CHAT_MAX)
     if new_id in ids:
@@ -4073,7 +4106,7 @@ def cmd_removechat(parts: list, caller_id: str) -> str:
         return t("removechat_format_error")
     if rem_id == str(caller_id):
         return t("removechat_self_remove")
-    ids = [str(c) for c in get_cfg().get("chat_ids", [])]
+    ids = [str(c) for c in get_cfg_value("chat_ids", [])]
     if rem_id not in ids:
         return t("removechat_not_found", id=rem_id)
     def _remove(c: dict):
@@ -4084,7 +4117,7 @@ def cmd_removechat(parts: list, caller_id: str) -> str:
 
 def cmd_listchats() -> str:
     """List all authorized chat IDs. Admin only."""
-    ids = get_cfg().get("chat_ids", [])
+    ids = get_cfg_value("chat_ids", [])
     if not ids:
         return t("listchats_empty")
     rows = []
@@ -4683,6 +4716,8 @@ def wizard_handle(text: str, parts: list, chat_id: str = "", msg: dict | None = 
         if text == "/skip":
             _advance_to_forms_step()
             return True
+        if text.startswith("/"):
+            return False
         tg(t("wizard_api_menu"))
         return True
 
@@ -4949,6 +4984,13 @@ def cmd_delapi(parts: list) -> str:
 def _process_update(upd: dict):
     global _webhook_active
 
+    # Lazy cleanup: purge expired pending API key entries (M1.7)
+    now = time.time()
+    with _pending_lock:
+        expired = [cid for cid, e in _pending_api_key.items() if now > e["expires"]]
+        for cid in expired:
+            _pending_api_key.pop(cid, None)
+
     # Callback query (inline button)
     cq = upd.get("callback_query")
     if cq:
@@ -5014,99 +5056,97 @@ def _process_update(upd: dict):
 
         if wizard_handle(text, parts, chat_id=chat_id, msg=msg):   return
 
-        # Tickers
-        if   komut == "/addticker":      tg(cmd_addticker(parts))
-        elif komut == "/removeticker":   tg(cmd_removeticker(parts))
-        elif komut == "/listtickers":    tg(cmd_listtickers())
-        # Groups
-        elif komut == "/addgroup":       tg(cmd_addgroup(parts))
-        elif komut == "/removegroup":    tg(cmd_removegroup(parts))
-        elif komut == "/listgroups":     tg(cmd_listgroups())
-        elif komut == "/scangroup":      cmd_scangroup(parts)
-        # Forms
-        elif komut == "/listforms":      tg(cmd_listforms())
-        elif komut == "/addform":        tg(cmd_addform(parts))
-        elif komut == "/removeform":     tg(cmd_removeform(parts))
-        # Watchwords (G1)
-        elif komut == "/addword":        tg(cmd_addword(parts))
-        elif komut == "/removeword":     tg(cmd_removeword(parts))
-        elif komut == "/listwords":      tg(cmd_listwords())
-        # Portfolio P&L (G2)
-        elif komut == "/addpos":         tg(cmd_addpos(parts))
-        elif komut == "/removepos":      tg(cmd_removepos(parts))
-        elif komut == "/pnl":            tg(cmd_pnl())
-        # Multi-LLM API management (J2) — admin only
-        elif komut == "/addapi":
-            if _is_admin(chat_id):  tg(cmd_addapi(parts, chat_id, msg))
-            else:                   tg(t("unauthorized_admin"))
-        elif komut == "/apis":
-            if _is_admin(chat_id):  tg(cmd_apis())
-            else:                   tg(t("unauthorized_admin"))
-        elif komut == "/setapi":
-            if _is_admin(chat_id):  tg(cmd_setapi(parts))
-            else:                   tg(t("unauthorized_admin"))
-        elif komut == "/delapi":
-            if _is_admin(chat_id):  tg(cmd_delapi(parts))
-            else:                   tg(t("unauthorized_admin"))
-        # Multi-chat admin (I1)
-        elif komut == "/addchat":
-            if _is_admin(chat_id):  tg(cmd_addchat(parts, chat_id))
-            else:                   tg(t("unauthorized_admin"))
-        elif komut == "/removechat":
-            if _is_admin(chat_id):  tg(cmd_removechat(parts, chat_id))
-            else:                   tg(t("unauthorized_admin"))
-        elif komut == "/listchats":
-            if _is_admin(chat_id):  tg(cmd_listchats())
-            else:                   tg(t("unauthorized_admin"))
-        # Custom prompts
-        elif komut == "/setprompt":      tg(cmd_setprompt(parts))
-        elif komut == "/getprompt":      tg(cmd_getprompt(parts))
-        elif komut == "/resetprompt":    tg(cmd_resetprompt(parts))
-        elif komut == "/listprompts":    tg(cmd_listprompts())
-        # Schedule, alarm, digest
-        elif komut == "/setschedule":    tg(cmd_setschedule(parts))
-        elif komut == "/alarm":          tg(cmd_alarm(parts))
+        # ── Command dispatch table ──────────────────────────────────────
+        # Each entry: command → (handler, needs_parts, admin_only)
+        # handler(parts) for needs_parts=True, handler() otherwise.
+        # Commands with special return handling or side effects stay as elif.
+        _CMDS: dict[str, tuple] = {
+            "/addticker":    (cmd_addticker,    True,  False),
+            "/removeticker": (cmd_removeticker, True,  False),
+            "/listtickers":  (cmd_listtickers,  False, False),
+            "/addgroup":     (cmd_addgroup,     True,  False),
+            "/removegroup":  (cmd_removegroup,  True,  False),
+            "/listgroups":   (cmd_listgroups,   False, False),
+            "/listforms":    (cmd_listforms,    False, False),
+            "/addform":      (cmd_addform,      True,  False),
+            "/removeform":   (cmd_removeform,   True,  False),
+            "/addword":      (cmd_addword,      True,  False),
+            "/removeword":   (cmd_removeword,   True,  False),
+            "/listwords":    (cmd_listwords,    False, False),
+            "/addpos":       (cmd_addpos,       True,  False),
+            "/removepos":    (cmd_removepos,    True,  False),
+            "/pnl":          (cmd_pnl,          False, False),
+            "/setprompt":    (cmd_setprompt,    True,  False),
+            "/getprompt":    (cmd_getprompt,    True,  False),
+            "/resetprompt":  (cmd_resetprompt,  True,  False),
+            "/listprompts":  (cmd_listprompts,  False, False),
+            "/setschedule":  (cmd_setschedule,  True,  False),
+            "/alarm":        (cmd_alarm,        True,  False),
+            "/setwebhook":   (cmd_setwebhook,   True,  False),
+            "/delwebhook":   (cmd_delwebhook,   False, False),
+            "/settings":     (cmd_settings,     False, False),
+            "/status":       (cmd_status,       False, False),
+            "/setlang":      (cmd_setlang,      True,  False),
+            "/setmodel":     (cmd_setmodel,     True,  False),
+            "/setlookback":  (cmd_setlookback,  True,  False),
+            "/setchars":     (cmd_setchars,     True,  False),
+            "/setrawmax":    (cmd_setrawmax,    True,  False),
+            "/setsource":    (cmd_setsource,    True,  False),
+            "/priceaction":  (cmd_priceaction,  True,  False),
+            "/setlookforward":(cmd_setlookforward,True, False),
+            "/scanticker":   (cmd_scanticker,   True,  False),
+            "/compare":      (cmd_compare,      True,  False),
+            "/checkprice":   (cmd_checkprice,   True,  False),
+            "/checknews":    (cmd_checknews,    True,  False),
+            # Admin-only commands
+            "/addapi":       (cmd_addapi,       True,  True),
+            "/apis":         (cmd_apis,         False, True),
+            "/setapi":       (cmd_setapi,       True,  True),
+            "/delapi":       (cmd_delapi,       True,  True),
+            "/addchat":      (cmd_addchat,      True,  True),
+            "/removechat":   (cmd_removechat,   True,  True),
+            "/listchats":    (cmd_listchats,    False, True),
+        }
+
+        entry = _CMDS.get(komut)
+        if entry:
+            handler, needs_parts, admin_only = entry
+            if admin_only and not _is_admin(chat_id):
+                tg(t("unauthorized_admin"))
+            elif needs_parts:
+                # /addapi and /addchat need extra args beyond parts
+                if komut == "/addapi":
+                    tg(handler(parts, chat_id, msg))
+                elif komut == "/addchat":
+                    tg(handler(parts, chat_id))
+                elif komut == "/removechat":
+                    tg(handler(parts, chat_id))
+                else:
+                    tg(handler(parts))
+            else:
+                tg(handler())
+        # Commands with special return/side-effect handling
+        elif komut == "/scangroup":
+            cmd_scangroup(parts)
         elif komut == "/digest":
             r = cmd_digest(parts)
             if r: tg(r)
-        # Report / export
-        elif komut == "/report":         cmd_report()
-        elif komut == "/export":         cmd_export()
-        # Webhook
-        elif komut == "/setwebhook":     tg(cmd_setwebhook(parts))
-        elif komut == "/delwebhook":     tg(cmd_delwebhook())
-        # Settings, status, language
-        elif komut == "/settings":       tg(cmd_settings())
-        elif komut == "/status":         tg(cmd_status())
-        elif komut == "/setlang":        tg(cmd_setlang(parts))
-        elif komut == "/setmodel":       tg(cmd_setmodel(parts))
-        elif komut == "/setlookback":    tg(cmd_setlookback(parts))
-        elif komut == "/setchars":       tg(cmd_setchars(parts))
-        elif komut == "/setrawmax":      tg(cmd_setrawmax(parts))
-        elif komut == "/setsource":      tg(cmd_setsource(parts))
-        elif komut == "/priceaction":    tg(cmd_priceaction(parts))
-        elif komut == "/setlookforward": tg(cmd_setlookforward(parts))
-        # On-demand scan
-        elif komut == "/scanticker":     cmd_scanticker(parts)
-        elif komut == "/compare":        cmd_compare(parts)
-        elif komut == "/checkprice":     cmd_checkprice(parts)
-        elif komut == "/checknews":      cmd_checknews(parts)
-        # Help
+        elif komut == "/report":
+            cmd_report()
+        elif komut == "/export":
+            cmd_export()
+        # Natural-language and keyword triggers (not dict-dispatchable)
         elif text in ["/start", "/help"]:
             tg(help_msg())
-        # Sentiment
         elif any(s in text for s in ["/sentiment", "sentiment", "sentiment score"]):
             if len(parts) >= 2 and parts[1].lower() == "trend":
                 cmd_sentiment_trend(parts)
             else:
                 cmd_sentiment()
-        # Combined scan
         elif any(s in text for s in ["check all","scan all","everything","/all"]):
             cmd_sec(); cmd_insider()
-        # Insider only
         elif any(s in text for s in ["insider","form4","/insider","/form4"]):
             cmd_insider()
-        # Default scan
         elif any(s in text for s in ["any news","check","scan","sec",
                                        "filings","/sec","/check","/scan"]):
             cmd_sec()

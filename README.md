@@ -536,6 +536,18 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 
 ## 📝 Release Notes
 
+### v4.3
+
+- **External audit triage (12 LLM auditors, 32 recommendations):** 8 accepted, 24 rejected. Key rejections: single-file architecture (deliberate Termux choice), async/SQLite/Strategy (over-engineering for single-user bot). Key acceptances implemented below.
+- **`_facts_dict` FactsView fix (M1.1):** edgartools v3's FactsView path now iterates via `get_facts()` instead of silently returning None. XBRL grounding was disabled for v3 users.
+- **`cmd_digest now` UX fix (M1.2):** `/digest now` now sends a confirmation message instead of silent success.
+- **`get_cfg()` → `get_cfg_value()` optimization (M1.3):** 10 hot-path functions no longer trigger `copy.deepcopy()` on every call. `_is_authorized` now uses O(1) set lookup.
+- **Command dispatch dict refactor (M1.4):** 42 commands moved from `elif` chain to `_CMDS` dict — single registration point.
+- **Negative cache TTL (M1.5):** Fiscal AI and Twelve Data memo caches now expire `None` entries after 1 hour. Transient API failures no longer cause permanent data loss.
+- **`retry()` on_error logging (M1.6):** Silent exception swallowing in `on_error` callbacks replaced with `log.debug`.
+- **`_pending_api_key` lazy cleanup (M1.7):** Expired pending entries purged on each update processing cycle.
+- **+1 i18n key** (`digest_sent` EN+TR).
+
 ### v4.2
 
 - **Twelve Data as second grounding data provider (L1):** Twelve Data is now supported as an alternative grounding source alongside Fiscal AI. The bot fetches income-statement and balance-sheet figures from Twelve Data's API and maps them to the same 9-concept normalized format used for Fiscal AI and EDGAR XBRL.

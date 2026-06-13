@@ -194,6 +194,7 @@
   "digest_disabled": "✅ Haftalık özet kapatıldı.",
   "digest_enabled": "✅ Haftalık özet açıldı — her Pazar 09:00'da gönderilecek.\nHemen göndermek için `/digest now` yaz.",
   "digest_no_data": "Haftalık özet: gönderilecek veri yok.",
+  "digest_sent": "✅ Haftalık özet gönderildi.",
   "digest_title_block": "📋 *Haftalık SEC Özeti*\n📅 {start} — {end}\nToplam: *{count}* dosya analiz edildi\n{sep}",
   "setlang_usage": "Kullanım: `/setlang en` veya `/setlang tr`\nMevcut: `{current}`\nDesteklenen: `{supported}`",
   "lang_set": "✅ Dil `{lang}` ({name}) olarak ayarlandı.",

@@ -194,6 +194,7 @@
   "digest_disabled": "✅ Weekly digest disabled.",
   "digest_enabled": "✅ Weekly digest enabled — will be sent every Sunday at 09:00.\nUse `/digest now` to send immediately.",
   "digest_no_data": "Weekly digest: no data to send.",
+  "digest_sent": "✅ Weekly digest sent.",
   "digest_title_block": "📋 *Weekly SEC Digest*\n📅 {start} — {end}\nTotal: *{count}* filing(s) analyzed\n{sep}",
   "setlang_usage": "Usage: `/setlang en` or `/setlang tr`\nCurrent: `{current}`\nSupported: `{supported}`",
   "lang_set": "✅ Language set to `{lang}` ({name}).",
