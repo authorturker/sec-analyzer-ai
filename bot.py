@@ -44,6 +44,8 @@ BASE_DIR    = Path.home() / "sec-analyzer"
 OUTPUT_DIR  = BASE_DIR / "reports"
 CACHE_FILE  = BASE_DIR / "cache.json"
 CONFIG_FILE = BASE_DIR / "bot_config.json"
+CHAT_DIR    = BASE_DIR / "chats"
+CHAT_DIR.mkdir(parents=True, exist_ok=True)
 PREV_DIR    = BASE_DIR / "previous_filings"
 WEEKLY_LOG  = BASE_DIR / "weekly_log.json"
 SENT_HIST   = BASE_DIR / "sentiment_history.json"
@@ -373,6 +375,63 @@ def get_cfg_value(key: str, default=None):
     """Read a single top-level config key under _cfg_lock — no deep-copy overhead."""
     with _cfg_lock:
         return _load_cfg_locked().get(key, default)
+
+# ─── Per-chat config (isolation for /addchat users) ───────
+# Per-chat files store user-specific data: tickers, portfolio, custom_prompts.
+# Global config stores shared state: api_keys, language, model, schedule.
+
+_CHAT_PER_USER_KEYS = {"tickers", "portfolio", "custom_prompts", "default_forms"}
+_CHAT_DEFAULTS = {
+    "tickers": [],
+    "portfolio": [],
+    "custom_prompts": {},
+    "default_forms": DEFAULT_FORMS,
+}
+
+def _chat_cfg_path(chat_id: str) -> Path:
+    return CHAT_DIR / f"chat_{chat_id}.json"
+
+def _load_chat_cfg(chat_id: str) -> dict:
+    """Load per-chat config, creating with defaults if missing."""
+    path = _chat_cfg_path(chat_id)
+    data = _read_json(path, {})
+    if not isinstance(data, dict):
+        data = {}
+    for k, v in _CHAT_DEFAULTS.items():
+        data.setdefault(k, copy.deepcopy(v))
+    return data
+
+def _save_chat_cfg(chat_id: str, cfg: dict):
+    _atomic_write_json(_chat_cfg_path(chat_id), cfg)
+
+def _has_chat_cfg(chat_id: str) -> bool:
+    return _chat_cfg_path(chat_id).exists()
+
+def get_chat_cfg() -> dict:
+    """Return per-chat config if _ctx.chat_id is set and chat has its own config.
+    Falls back to global config (shared state)."""
+    cid = getattr(_ctx, "chat_id", None)
+    if cid and _has_chat_cfg(cid):
+        with _cfg_lock:
+            return copy.deepcopy(_load_chat_cfg(cid))
+    return get_cfg()
+
+def mutate_chat_cfg(fn) -> dict:
+    """Like mutate_cfg but writes to per-chat config when context exists."""
+    cid = getattr(_ctx, "chat_id", None)
+    if cid and _has_chat_cfg(cid):
+        with _cfg_lock:
+            cfg = _load_chat_cfg(cid)
+            fn(cfg)
+            _save_chat_cfg(cid, cfg)
+            return copy.deepcopy(cfg)
+    return mutate_cfg(fn)
+
+def init_chat_config(chat_id: str):
+    """Create per-chat config for a newly added user (empty defaults)."""
+    path = _chat_cfg_path(chat_id)
+    if not path.exists():
+        _save_chat_cfg(chat_id, copy.deepcopy(_CHAT_DEFAULTS))
 
 # ─── Chat ID authorization helpers (I1) ──────────────────
 
@@ -3103,11 +3162,12 @@ def scan_ticker(ticker: str, forms: list,
     Top-level orchestration: fetch → analyze → send for one ticker.
     Returns True if at least one new filing was processed.
     """
-    cfg      = get_cfg()
+    g_cfg    = get_cfg()
+    cfg      = get_chat_cfg()
     cache_dict = load_cache()
 
     found = fetch_new_filings(
-        ticker, forms, cfg["days_lookback"],
+        ticker, forms, g_cfg["days_lookback"],
         cache_dict, use_cache, quiet,
     )
 
@@ -3121,7 +3181,7 @@ def scan_ticker(ticker: str, forms: list,
     for form, date_str, text, facts_block in found:
         analysis, diff = analyze_filing(
             ticker, form, date_str, text,
-            cfg["max_chars"], cfg["model"], cfg["custom_prompts"],
+            g_cfg["max_chars"], g_cfg["model"], cfg.get("custom_prompts", {}),
             facts_block=facts_block,
         )
         if analysis is None:
@@ -3182,7 +3242,7 @@ def probe_new_filings_for_watchlist(form_override: list | None = None) -> list:
 
 # ─── Top-level scan commands ──────────────────────────────
 def cmd_sec(form_override=None, quiet=False):
-    cfg    = get_cfg()
+    cfg    = get_chat_cfg()
     items  = cfg["tickers"]
     forms = form_override or cfg["default_forms"]
     if not items:
@@ -3330,7 +3390,7 @@ def _digest_pnl_summary() -> str:
     """Compact P&L one-liner for the weekly digest. Empty if no portfolio or no yfinance."""
     if not YF_OK:
         return ""
-    cfg = get_cfg()
+    cfg = get_chat_cfg()
     lots = cfg.get("portfolio", [])
     if not lots:
         return ""
@@ -3432,14 +3492,14 @@ def cmd_setprompt(parts: list) -> str:
     m = _match_form(parts[1].upper())
     if not m: return t("unknown_form_named", form=parts[1])
     prompt = " ".join(parts[2:])
-    mutate_cfg(lambda c: c["custom_prompts"].update({m: prompt}))
+    mutate_chat_cfg(lambda c: c["custom_prompts"].update({m: prompt}))
     return t("prompt_saved", form=m, prompt=prompt)
 
 def cmd_getprompt(parts: list) -> str:
     if len(parts) < 2: return t("getprompt_usage")
     m = _match_form(parts[1].upper())
     if not m: return t("unknown_form_named", form=parts[1])
-    prompt = get_cfg()["custom_prompts"].get(m)
+    prompt = get_chat_cfg()["custom_prompts"].get(m)
     if not prompt:
         return t("no_custom_prompt", form=m)
     return t("custom_prompt_show", form=m, prompt=prompt)
@@ -3448,11 +3508,11 @@ def cmd_resetprompt(parts: list) -> str:
     if len(parts) < 2: return t("resetprompt_usage")
     m = _match_form(parts[1].upper())
     if not m: return t("unknown_form_named", form=parts[1])
-    mutate_cfg(lambda c: c["custom_prompts"].pop(m, None))
+    mutate_chat_cfg(lambda c: c["custom_prompts"].pop(m, None))
     return t("prompt_reset", form=m)
 
 def cmd_listprompts() -> str:
-    custom = get_cfg()["custom_prompts"]
+    custom = get_chat_cfg()["custom_prompts"]
     if not custom:
         return t("listprompts_empty")
     lines = [t("listprompts_title")]
@@ -3630,7 +3690,7 @@ def cmd_addticker(parts: list) -> str:
             if not valid_ticker(ticker): invalid.append(ticker); continue
             if ticker in c["tickers"]: already_in.append(ticker)
             else: c["tickers"].append(ticker); added.append(ticker)
-    mutate_cfg(_add)
+    mutate_chat_cfg(_add)
     lines = []
     if added:      lines.append(t("ticker_added",   tickers="  ".join(f"`{x}`" for x in added)))
     if already_in: lines.append(t("ticker_already", tickers="  ".join(f"`{x}`" for x in already_in)))
@@ -3645,14 +3705,14 @@ def cmd_removeticker(parts: list) -> str:
             ticker = raw.upper().strip()
             if ticker in c["tickers"]: c["tickers"].remove(ticker); removed.append(ticker)
             else: not_found.append(ticker)
-    mutate_cfg(_remove)
+    mutate_chat_cfg(_remove)
     lines = []
     if removed:  lines.append(t("ticker_removed",       tickers="  ".join(f"`{x}`" for x in removed)))
     if not_found: lines.append(t("ticker_not_found_list", tickers="  ".join(f"`{x}`" for x in not_found)))
     return "\n".join(lines)
 
 def cmd_listtickers() -> str:
-    cfg = get_cfg(); lst = cfg["tickers"]
+    cfg = get_chat_cfg(); lst = cfg["tickers"]
     if not lst: return t("listtickers_empty")
     return t("listtickers_title",
              count=len(lst),
@@ -4175,6 +4235,7 @@ def cmd_addchat(parts: list, caller_id: str) -> str:
     if new_id in ids:
         return t("addchat_already_exists", id=new_id)
     mutate_cfg(lambda c: c["chat_ids"].append(new_id))
+    init_chat_config(new_id)
     return t("addchat_confirm", id=new_id)
 
 
@@ -4474,7 +4535,7 @@ def cmd_addpos(parts: list) -> str:
             portfolio.append(lot)
             outcome.append("ok")
 
-    mutate_cfg(_add)
+    mutate_chat_cfg(_add)
     if outcome and outcome[0] == "limit":
         return t("addpos_limit", max=_PORTFOLIO_MAX)
     return t("addpos_added",
@@ -4495,7 +4556,7 @@ def cmd_removepos(parts: list) -> str:
         c["portfolio"] = [l for l in portfolio if l["ticker"] != ticker]
         removed.append(before - len(c["portfolio"]))
 
-    mutate_cfg(_remove)
+    mutate_chat_cfg(_remove)
     count = removed[0] if removed else 0
     if count == 0:
         return t("removepos_not_found", ticker=_md_escape(ticker))
@@ -4588,7 +4649,7 @@ def _format_delta(abs_d: "float | None", pct_d: "float | None") -> str:
 def cmd_pnl() -> str:
     if not YF_OK:
         return t("yfinance_missing", cmd="/pnl")
-    cfg  = get_cfg()
+    cfg  = get_chat_cfg()
     lots = cfg.get("portfolio", [])
     if not lots:
         return t("pnl_empty")
