@@ -175,7 +175,7 @@ class TestWizardK1:
         """First launch: only lang menu is sent (no welcome_bootstrap yet)."""
         self._reset(bot, monkeypatch, tmp_path)
         sent = []
-        monkeypatch.setattr(bot, "tg", lambda msg, **kw: sent.append(msg))
+        monkeypatch.setattr(bot, "_tg_to_master", lambda msg: sent.append(msg))
         bot.start_wizard()
         assert len(sent) == 1
         assert bot.t("wizard_lang_menu") in sent[0]
@@ -187,19 +187,21 @@ class TestWizardK1:
         self._reset(bot, monkeypatch, tmp_path)
         sent = []
         monkeypatch.setattr(bot, "tg", lambda msg, **kw: sent.append(msg))
+        monkeypatch.setattr(bot, "_tg_to_master", lambda msg: sent.append(msg))
         bot.start_wizard()
         sent.clear()
         handled = bot.wizard_handle("/lang en", ["/lang", "en"], chat_id="111", msg={})
         assert handled is True
         assert bot.WIZARD.get("step") == "api"
         assert bot.get_cfg_value("wizard_step") == "api"
-        assert any(bot.t("welcome_bootstrap", master_chat_id=bot.MASTER_CHAT_ID) in m for m in sent)
+        assert any(bot.t("welcome_bootstrap", master_chat_id=bot.MASTER_CHAT_ID, version=bot.__version__) in m for m in sent)
 
     def test_api_skip_advances_to_forms(self, bot, monkeypatch, tmp_path):
         """During api step: /skip → forms step."""
         self._reset(bot, monkeypatch, tmp_path)
         sent = []
         monkeypatch.setattr(bot, "tg", lambda msg, **kw: sent.append(msg))
+        monkeypatch.setattr(bot, "_tg_to_master", lambda msg: sent.append(msg))
         bot.WIZARD["step"] = "api"
         handled = bot.wizard_handle("/skip", ["/skip"], chat_id="111", msg={})
         assert handled is True
@@ -236,7 +238,7 @@ class TestWizardK1:
         self._reset(bot, monkeypatch, tmp_path)
         bot.mutate_cfg(lambda c: c.update({"first_run": True, "wizard_step": "api"}))
         sent = []
-        monkeypatch.setattr(bot, "tg", lambda msg, **kw: sent.append(msg))
+        monkeypatch.setattr(bot, "_tg_to_master", lambda msg: sent.append(msg))
         wizard_step = bot.get_cfg_value("wizard_step")
         assert wizard_step in ("api", "forms", "tickers")
         bot.WIZARD["step"] = wizard_step

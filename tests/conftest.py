@@ -29,6 +29,7 @@ def _install_stubs():
         fake_edgar = types.ModuleType("edgar")
         fake_edgar.Company      = lambda *a, **k: None
         fake_edgar.set_identity = lambda *a, **k: None
+        fake_edgar.find         = lambda *a, **k: []
         sys.modules["edgar"] = fake_edgar
 
 

@@ -269,9 +269,37 @@ class TestSentimentNoAi:
         monkeypatch.setattr(bot, "_tg_to", lambda cid, text: sent.append(text))
         monkeypatch.setattr(bot.time, "sleep", lambda *a: None)
 
-        # Fake Form 4 filing fetch
-        monkeypatch.setattr(bot, "fetch_new_filings",
-                            lambda ticker, forms, **k: [("4", "2024-01-01", "tx", "")])
+        # Mock Company and Form 4 filings with get_ownership_summary
+        class MockTx:
+            code = "S"
+            insider_name = "Test Insider"
+            shares = 1000
+            price_per_share = 150.0
+            transaction_type = "sale"
+
+        class MockSummary:
+            insider_name = "Test Insider"
+            position = "Director"
+            reporting_date = "2024-01-01"
+            transactions = [MockTx()]
+
+        class MockObj:
+            def get_ownership_summary(self):
+                return MockSummary()
+
+        class MockFiling:
+            def obj(self):
+                return MockObj()
+
+        class MockFilings:
+            def head(self, n):
+                return [MockFiling()]
+
+        class MockCompany:
+            def get_filings(self, form):
+                return MockFilings()
+
+        monkeypatch.setattr(bot, "Company", lambda tk: MockCompany())
         monkeypatch.setattr(bot, "append_sentiment", lambda *a, **k: None)
 
         bot.mutate_cfg(lambda c: c.update({"tickers": ["AAPL"], "model": "m",
@@ -296,8 +324,21 @@ class TestSentimentNoAi:
 
         monkeypatch.setattr(bot.requests, "post", spy_post)
         monkeypatch.setattr(bot.time, "sleep", lambda *a: None)
-        monkeypatch.setattr(bot, "fetch_new_filings",
-                            lambda ticker, forms, **k: [("4", "2024-01-01", "tx", "")])
+
+        class MockTx:
+            code = "S"; insider_name = "X"; shares = 100; price_per_share = 100.0; transaction_type = "sale"
+        class MockSummary:
+            insider_name = "X"; position = "Dir"; reporting_date = "2024-01-01"; transactions = [MockTx()]
+        class MockObj:
+            def get_ownership_summary(self): return MockSummary()
+        class MockFiling:
+            def obj(self): return MockObj()
+        class MockFilings:
+            def head(self, n): return [MockFiling()]
+        class MockCompany:
+            def get_filings(self, form): return MockFilings()
+
+        monkeypatch.setattr(bot, "Company", lambda tk: MockCompany())
         monkeypatch.setattr(bot, "append_sentiment", lambda *a, **k: None)
         bot.mutate_cfg(lambda c: c.update({"tickers": ["AAPL"], "model": "m",
                                             "days_lookback": 30}))

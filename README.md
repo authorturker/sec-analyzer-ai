@@ -30,6 +30,7 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 | 📈 **Price action** | Filing date → +N day stock change appended automatically (free, no API key) |
 | 💹 **On-demand prices** | `/checkprice AAPL [days]` — last-N-day window summary (yfinance) |
 | 📰 **Yahoo Finance news** | `/checknews AAPL [count]` — latest headlines with publisher links (yfinance) |
+| 📑 **Financial Sheets** | `/sheet AAPL` — income statement + balance sheet + cash flow from EDGAR |
 | 🧠 **Smart Caching** | Never re-analyzes a filing already processed; old entries auto-pruned |
 | 🤖 **Guided Setup** | First-run wizard, starts with language picker — no config file editing needed |
 | ⚙️ **Full Telegram Control** | Manage tickers, forms, model, language, schedule, prompts from chat |
@@ -39,18 +40,19 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 | ✏️ **Custom Prompts** | Override the analysis prompt per form type |
 | 📄 **Inline Original** | Button after each analysis to receive the raw filing as `.txt` |
 | 📋 **Markdown Reports** | `/report` sends this week's full analyses as a `.md` file |
+| 📤 **CSV Export** | `/export` sends the weekly log as a downloadable CSV file |
 | 🔔 **Webhook Mode** | Optional — faster response, lower battery use |
 | 📡 **Health Monitoring** | `/status` shows uptime, error counts, last scan/alarm times |
 | 🧾 **Grounded Analysis** | 10-K/10-Q/20-F analyses are grounded in audited XBRL facts injected into the prompt |
 | ✅ **Numeric Verification** | Figures in the LLM output are checked against XBRL facts and the filing text; unverifiable ones are flagged with ⚠️ |
 | 🔎 **Keyword Alerts** | Watch any phrase across ALL EDGAR filings (`/addword`); hourly full-text search alert, no LLM cost |
 | 💼 **Portfolio P&L** | Track positions with `/addpos`; `/pnl` shows unrealized profit/loss per ticker (yfinance, optional dep) |
-| 👥 **Multi-Chat** | Share the bot with up to 5 chats (`/addchat`); alerts broadcast to all, replies stay private to the asking chat |
-| 🧠 **Multi-LLM** | OpenRouter · Gemini · Anthropic · Groq — add keys with `/addapi`; auto-failover across providers |
+| 👥 **Multi-Chat** | Share the bot with up to 5 chats (`/addchat`); each user has their own tickers, groups, watchwords, alarm, model, API keys, digest — alerts and scans are per-user |
+| 🧠 **Multi-LLM** | OpenRouter · Gemini · Anthropic · Groq · DeepSeek — add keys with `/addapi`; auto-failover across providers |
 | 📴 **No-AI Mode** | Without any LLM key the bot still runs: delivers raw filing text with a clear ⚠️ label; never goes silent |
 | 📈 **Portfolio History** | Daily portfolio-value snapshots (up to 730 days); `/pnl` shows 1d / 7d / 30d raw-value delta |
-| 📊 **Optional data sources** | Fiscal AI and Twelve Data as alternative grounding sources — auto chain tries each in order; always falls back to EDGAR XBRL |
-| 🧪 **Tested** | 874 pytest tests for pure helpers, i18n, config cache, thread safety |
+| 📊 **Grounded Analysis** | 10-K/10-Q/20-F analyses are grounded in audited XBRL facts from EDGAR |
+| 🧪 **Tested** | 720 pytest tests for pure helpers, i18n, config cache, thread safety |
 | ⚡ **OpenRouter Free LLM** | openrouter/free, $0 cost |
 | 📱 **Lightweight** | Single 1.8k-line `bot.py`, runs on a mid-range Android phone via Termux |
 
@@ -73,22 +75,18 @@ sec-analyzer/
 ├── lang/
 │   ├── en.json                  # English UI strings (default)
 │   └── tr.json                  # Turkish UI strings
-├── tests/                       # 874 pytest tests (+ 9 opt-in live network tests)
+├── tests/                       # 720 pytest tests (+ 6 opt-in live network tests)
 │   ├── conftest.py
 │   ├── test_alarm_buttons.py    # Interactive alarm + on-demand .md button
 │   ├── test_bootstrap.py        # Minimal .env bootstrap, master-user init, env migration
 │   ├── test_cfg.py              # Config cache + atomic mutate
 │   ├── test_checkprice_news.py  # /checkprice + /checknews formatters
-│   ├── test_compare.py          # /compare prompt builder
-│   ├── test_fiscal_ai.py        # Fiscal AI optional facts source, fallback chain
 │   ├── test_groups.py           # Watchlist groups
 │   ├── test_hotfixes.py         # Atomic JSON IO, wizard guard, digest week
 │   ├── test_i18n.py             # Language loader, t(), fallback
 │   ├── test_k2_command_surface.py # Command surface inventory; dispatcher↔help parity guard
 │   ├── test_k3_pnl_visual.py   # /pnl monospace table renderer (_pnl_table)
 │   ├── test_k31_qty_col.py     # QTY column clamping formatter (_fmt_qty_col)
-│   ├── test_k4_setsource.py    # facts_source cfg + _fiscal_enabled gate + /setsource command
-│   ├── test_l1_twelvedata.py   # Twelve Data provider: chain matrix, parser fixtures, /setsource, i18n
 │   ├── test_multichat.py        # Multi-chat auth, migration, broadcast
 │   ├── test_multi_llm.py        # Multi-LLM provider abstraction, /addapi, /apis, retry
 │   ├── test_network.py          # Opt-in live endpoint tests (--network flag)
@@ -116,6 +114,7 @@ Runtime files (created automatically under `~/sec-analyzer/`, **not** in the rep
 ├── weekly_log.json         # Buffer for digest + /report
 ├── sentiment_history.json  # /sentiment trend history
 ├── price_cache.json        # Filing price-action snippets cache
+├── portfolio_history.json  # Daily portfolio-value snapshots for /pnl delta
 ├── watchword_seen.json     # Watchword dedup state
 ├── previous_filings/       # For risk-factor diff
 └── reports/
@@ -171,7 +170,7 @@ The key message is deleted from Telegram immediately after saving. You can add m
 
 Everything else — tickers, default forms, model, schedule, language, custom prompts, webhook URL, price-action lookforward, raw-filing cap (default 100), cache TTL — is managed live via Telegram commands and stored in `~/sec-analyzer/bot_config.json`.
 
-**Multi-chat:** authorized chats are stored as a `chat_ids` list in `bot_config.json`. The first element is the admin; only the admin can run `/addchat`, `/removechat`, and `/listchats`. Proactive messages (alerts, scheduled scans) broadcast to all authorized chats; command replies go only to the chat that sent the command. All authorized chats share the same watchlist, language, and settings. If your existing config has a single `TELEGRAM_CHAT_ID`, the bot migrates it automatically on first start — no action required. Maximum 5 authorized chats.
+**Multi-chat:** authorized chats are stored as a `chat_ids` list in `bot_config.json`. The first element is the admin; only the admin can run `/addchat`, `/removechat`, and `/listchats`. Proactive messages (alerts, scheduled scans) broadcast to all authorized chats; command replies go only to the chat that sent the command. Each authorized chat has its own independent settings: tickers, groups, watchwords, portfolio, API keys, alarm, model, schedule, price action, custom prompts, and weekly digest. Language and wizard settings are shared globally. Maximum 5 authorized chats.
 
 ---
 
@@ -179,9 +178,9 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 ### Scans
 | Command | Action |
 |---|---|
-| `Any news?` · `Check` · `/sec` | Scan watchlist with default forms |
-| `Insider` · `/insider` | Form 4 only across watchlist |
-| `Check all` · `/all` | SEC + Insider combined |
+| `/scan` | Scan watchlist with default forms |
+| `/insider` | Form 4 only across watchlist |
+| `/all` | SEC + Insider combined |
 | `/sentiment` | Portfolio-wide insider sentiment score |
 | `/sentiment trend [days]` | Compare current sentiment vs. N days ago (default 30) |
 | `/scanticker AAPL` | Scan single ticker, default forms, not added to watchlist |
@@ -189,6 +188,14 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 | `/compare AAPL MSFT [FORM]` | Side-by-side comparison (default form: 10-K) |
 | `/checkprice AAPL [days]` | Last-N-day price summary — change, open/close, high/low (default 7) |
 | `/checknews AAPL [count]` | Recent Yahoo Finance headlines + publisher links (default 5, max 20) |
+| `/sheet AAPL` | Financial statements from EDGAR (default: last 4 years, yearly) |
+| `/sheet AAPL 2020-2023 yearly` | Financial statements for a specific year range |
+| `/sheet AAPL quarterly` | Quarterly financial statements |
+| `/fulltext AAPL` | Send latest filing as a `.md` file |
+| `/fulltext AAPL 10-Q` | Send specific form type as `.md` |
+| `/fulltext AAPL` | Send latest filing as a `.md` file |
+| `/search Apple` | Search SEC database by company name |
+| `/company AAPL` | Show company info from EDGAR |
 
 ### Ticker Management
 | Command | Action |
@@ -226,6 +233,7 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 | Command | Action |
 |---|---|
 | `/report` | Send this week's full analyses as a `.md` file |
+| `/export` | Send the weekly log as a downloadable CSV file |
 | *(inline button after analysis)* | Receive the raw filing as a `.txt` |
 
 ### Scheduling & Alerts
@@ -246,10 +254,10 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 | `/removeword <phrase>` | Stop watching a phrase |
 | `/listwords` | Show all watched phrases |
 
-### API Keys (admin only)
+### API Keys
 | Command | Action |
 |---|---|
-| `/addapi <provider> [key]` | Add or update a provider API key — send in a **private chat** (key is deleted from Telegram immediately); providers: `openrouter` `gemini` `anthropic` `groq` `fiscalai` `twelvedata` |
+| `/addapi <provider> [key]` | Add or update a provider API key — send in a **private chat** (key is deleted from Telegram immediately); providers: `openrouter` `gemini` `anthropic` `groq` `deepseek` |
 | `/apis` | Show all configured providers (masked keys) and the active LLM provider |
 | `/setapi <provider>` | Set the preferred LLM provider (used first; others as fallback) |
 | `/delapi <provider>` | Remove a provider's key |
@@ -284,62 +292,12 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 | `/setlookback 60` | Set lookback window in days (1–365) |
 | `/setchars 15000` | Set max characters per section (1000–50000) |
 | `/setrawmax 500` | Cap in-memory raw-filing cache (0 = unlimited) |
-| `/setsource auto\|fiscalai\|twelvedata\|edgar` | Select grounding data source; no argument shows current value |
 | `/priceaction on` / `off` | Toggle the per-filing price-action snippet |
 | `/setlookforward 5` | Days after filing for price change (1–90) |
 
 ---
 
 ## 🧾 Optional Data Sources
-
-The bot supports two optional grounding sources in addition to EDGAR XBRL: **Fiscal AI** and **Twelve Data**. Neither is an LLM provider — they supply standardized financial figures that are injected into the analysis prompt before the LLM call, grounding numeric claims in audited data.
-
-### Choosing a source
-
-```
-/setsource auto            # (default) try fiscalai → twelvedata → EDGAR XBRL in order
-/setsource fiscalai        # always prefer Fiscal AI; falls back to EDGAR if period not matched
-/setsource twelvedata      # always prefer Twelve Data; falls back to EDGAR if period not matched
-/setsource edgar           # EDGAR XBRL only — ignore all optional data source keys
-```
-
-`/setsource` with no argument shows the current value. `auto` mode only tries providers for which a key is configured; if neither key is present it goes straight to EDGAR XBRL. Check all settings, including the resolved data-source label, with `/settings`.
-
-### Fiscal AI
-
-Get a free API key at [api.fiscal.ai](https://api.fiscal.ai) and add it from Telegram (use a private chat — the key message is deleted immediately):
-
-```
-/addapi fiscalai <your-key>
-```
-
-**Why Fiscal AI over EDGAR XBRL:** Fiscal AI normalizes figures across companies and reporting periods. EDGAR XBRL tags vary — `us-gaap:Revenues`, `us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax`, and a dozen other labels may all mean "revenue" depending on the company. A single unambiguous number produces more grounded, less hallucinated analyses.
-
-**Limits:**
-
-- **Free tier:** 25 companies / 250 API calls per day.
-- **Exact period match required:** if the filing's fiscal period is not matched in Fiscal AI's database the bot falls back silently to EDGAR XBRL.
-- **Supported form classes:** only 10-K / 10-Q class annual and quarterly reports use grounding. Form 4, 8-K, and other form types are unaffected regardless of the data source setting.
-- **Key storage:** stored in plain text in `bot_config.json` (git-ignored, docker-ignored — never committed).
-
-### Twelve Data
-
-Get an API key at [twelvedata.com](https://twelvedata.com) and add it:
-
-```
-/addapi twelvedata <your-key>
-```
-
-Twelve Data provides income-statement and balance-sheet figures via its `/income_statement` and `/balance_sheet` endpoints. The bot maps up to 9 financial concepts (revenues, gross profit, operating income, net income, diluted EPS, cash, total assets, total liabilities, stockholders' equity) to the same normalized format used for Fiscal AI and EDGAR XBRL — the analysis pipeline is identical regardless of which source supplies the figures.
-
-In `auto` mode, Fiscal AI is tried first (if a key exists); Twelve Data is tried second; EDGAR XBRL is the final fallback. All three share the same chain: if the active source returns no data for a filing's exact period, the next source in the chain is tried automatically.
-
-**Limits (dürüstlük çiti):**
-
-- **Plan requirement:** financial statement endpoints (`/income_statement`, `/balance_sheet`) are **not available on the free Basic plan** — a Grow or Pro+ plan is required (100 credits per symbol per endpoint). On a Basic plan the API returns a plan-error response; the bot detects this, emits a one-per-day warning, and falls back silently to EDGAR XBRL.
-- **Exact period match required:** same rule as Fiscal AI — nearest-period matching is not used; if the filing's exact `fiscal_date` is absent from the response the result is discarded and the chain falls through.
-- **Supported form classes:** same as Fiscal AI — only 10-K / 10-Q class forms.
-- **Key storage:** stored in plain text in `bot_config.json` (git-ignored, docker-ignored — never committed).
 
 ---
 
@@ -492,10 +450,10 @@ python -m pytest tests/ -q
 ```
 
 ```
-874 passed, 9 skipped in <3s
+749 passed, 6 skipped in <3s
 ```
 
-The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, `_parse_fiscal_period`, `_parse_fiscal_response`, `_portfolio_history_delta`, `_pnl_table`, `_fmt_qty_col`, `_fiscal_enabled`, `_data_source_chain`, `_data_source_label`, `_parse_twelve_response`, …), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the multi-LLM provider abstraction (provider chain, key masking, retry logic), the No-AI mode (raw text delivery, short-circuit, daily reminder gate), the portfolio-history delta helpers, the command surface inventory (dispatcher↔help parity), the data-source chain matrix (all modes × key combinations, ordered fallback, Twelve Data parser fixtures), and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline. The 9 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
+The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, `_portfolio_history_delta`, `_pnl_table`, `_fmt_qty_col`, `_should_run_scheduled_scan`), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the per-chat config lock-discipline (TOCTOU flip, single-acquire proof), the chat-data purge (`_purge_chat_data` idempotency, re-add freshness), the per-chat scheduled-scan dedup (multi-chat gate, 90s boundary), the version label single-source (render correctness, placeholder leak), the multi-LLM provider abstraction (provider chain, key masking, retry logic), the No-AI mode (raw text delivery, short-circuit, daily reminder gate), the portfolio-history delta helpers, the command surface inventory (dispatcher↔help parity), and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline. The 6 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
 
 ---
 
@@ -524,17 +482,66 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 | `⚠️ Could not verify against filing data: …` appears in an analysis | The flagged figure was not found in the filing's audited XBRL data or text — treat it with caution; it may be LLM-derived (e.g., a computed total or segment share). Not necessarily wrong, just unverifiable. |
 | `/pnl` shows `n/a` for a ticker | yfinance has no data for it (delisted or non-US listing) — the total skips that row; also check `pip install yfinance` |
 | Watchword alert fires but nothing analyzed | By design: keyword alerts are probe-only (no LLM); run `/scanticker` on the company if you want an analysis |
-| Bot doesn't respond in a new chat | The chat isn't authorized — the admin must run `/addchat <id>` first; unauthorized chats are ignored silently by design |
-| `/addchat` says limit reached | Cap is 5 chats; remove one with `/removechat` first |
-| Analysis says `⚠️ AI mode off — no API key configured` | No LLM key is set; use `/addapi openrouter sk-or-v1-...` (or any other provider) in a private chat |
-| All providers failed — you see raw text with a retry button | Every configured LLM key returned an error; tap the retry button or check keys with `/apis` |
-| `fiscalai key rejected (401/403)` in analysis | Your Fiscal AI key is invalid or over quota — update it with `/addapi fiscalai <newkey>` or remove it with `/delapi fiscalai`; analysis falls back to EDGAR XBRL automatically |
-| `⚠️ Twelve Data key rejected` warning in analysis | Your Twelve Data plan does not include financial statement endpoints (Grow/Pro+ required) — or the key is invalid. The bot will fall back to EDGAR XBRL and warn once per day. Update with `/addapi twelvedata <newkey>` or switch away from Twelve Data with `/setsource auto` |
-| `/pnl` delta shows a jump after adding a position | This is expected: the Δ columns show raw total-value change, not time-weighted return — adding shares increases the total, which registers as a positive delta |
 
 ---
 
 ## 📝 Release Notes
+
+### v4.7
+
+- **DEF 14A proxy analysis:** when a DEF 14A filing is encountered during scan, the bot extracts proxy data directly from EDGAR using edgartools (CEO name, total compensation, executive comp table, pay vs performance, company/peer TSR) and sends it to the user. LLM analysis is skipped for proxy statements — structured data is shown instead.
+- **`/fulltext TICKER [FORM]`** — new command to send the latest filing as a `.md` file. Uses `filing.markdown()` from edgartools. Default form: 10-K.
+- **DeepSeek AI provider added:** DeepSeek is now available as an LLM provider alongside OpenRouter, Groq, Anthropic, and Gemini. Models: `deepseek-v4-flash` (default), `deepseek-v4-pro`. Uses OpenAI-compatible API at `api.deepseek.com`. Add with `/addapi deepseek <key>`.
+- **`_collect_8k_text` updated:** now uses `filing.markdown()` instead of `filing.text()` for richer formatting with tables and headers.
+- **Per-chat config lock-discipline hardened** — `get_chat_cfg`/`mutate_chat_cfg`/`init_chat_config` now run under a single `_cfg_lock` (RLock) hold; TOCTOU windows closed.
+- **Chat-removal data purge** — `/removechat` now deletes `chat_<id>.json` + `weekly_log_<id>.json`; plaintext api_keys leak and re-add stale-data resurrection fixed.
+- **Per-chat scheduled-scan dedup** — same-schedule multi-chat scans no longer suppress each other (global gate moved to per-chat `last_sched_scan` dict).
+- **Version label single-sourced** — all user-facing `v4.7` labels fed from `__version__` via `{version}` placeholder; no hardcoded version in lang files.
+- **Test count:** 749 passing, 6 skipped (755 collected).
+
+### v4.6
+
+- **Fiscal AI and Twelve Data removed:** the bot now uses EDGAR XBRL as the sole financial data source. All Fiscal AI and Twelve Data API code, config keys, and lang strings have been removed.
+- **`/setsource` and `/setdataapi` removed:** no longer needed — EDGAR XBRL is the only data source.
+- **`/sheet` rewritten with edgartools:** now uses `company.get_financials()` from edgartools to fetch income statement, balance sheet, and cash flow data directly from EDGAR. Shows revenue, gross profit, operating income, net income, EPS, cash, assets, liabilities, equity, and cash flow items. No API key required.
+- **`facts_source` config removed:** removed from both global and per-chat config.
+- **`_data_source_chain()` and `_data_source_label()` removed:** no longer needed.
+- **`/settings` simplified:** removed "Default Data" line (always EDGAR XBRL).
+- **`/apis` simplified:** removed data providers section (fiscalai, twelvedata no longer listed).
+- **Test files removed:** `test_fiscal_ai.py`, `test_l1_twelvedata.py`, `test_k4_setsource.py` no longer applicable.
+- **Test count:** 720 passing, 6 skipped.
+
+### v4.5
+
+- **Per-user config isolation expanded:** each authorized chat now has its own independent settings for: `tickers`, `portfolio`, `custom_prompts`, `default_forms`, `alarm_on`, `price_action_enabled`, `model`, `schedule`, `api_keys`, `groups`, `weekly_digest`, and `watchwords`. Previously groups, weekly digest, and watchwords were shared globally.
+- **Per-user API keys:** `/addapi` is no longer admin-only — each user can add their own LLM provider keys independently.
+- **Per-user background scans:** the background thread now iterates over each authorized chat independently — scheduled scans, hourly alarms, watchword alerts, and weekly digests run per-user using that user's tickers, forms, and preferences. Messages are sent only to the relevant chat, not broadcast.
+- **Per-chat weekly log:** digest, `/report`, and `/export` now use per-chat log files — each user sees only their own analyzed filings.
+- **`/help` and `/status` fix:** these commands now show the requesting user's own ticker count, forms, and settings instead of the master user's.
+- **`/scan` model fix:** scan now uses the requesting user's model setting instead of the global one.
+- **`/setmodel` fix:** now correctly saves to per-chat config instead of global config.
+- **`/addapi` access fix:** no longer restricted to admin only — all authorized users can manage their own API keys.
+- **edgartools `.latest(1)` fix:** `company.get_filings(form).latest(1)` now correctly wraps a single `Filing` object in a list, fixing `'EntityFilling' object is not iterable` errors during scans.
+- **Background alarm fix:** `format_alarm_alert` (undefined function) replaced with `send_alarm_alert` in the background thread.
+- **Test count:** 720 passing, 6 skipped.
+
+### v4.4
+
+- **OpenRouter model alternatives:** `openrouter/free` and `openrouter/owl-alpha` added to the selectable model list.
+- **`/sheet TICKER [year-range] [quarterly|yearly]`** — displays income statement, balance sheet, and cash flow data from EDGAR via edgartools. Default: last 4 years, yearly. Shows revenue, gross profit, operating income, net income, EPS, cash, assets, liabilities, equity, and cash flow items. No API key required.
+- **`/digest now` fix:** digest now sends even when no filings were analyzed that week — still shows the P&L summary. Empty weeks display "no new filings" instead of silent no-op.
+- **Digest P&L intervals:** weekly digest P&L block now shows time-based deltas: 1W, 6M, YTD, 1Y (in addition to the total line).
+- **`/settings` output enhanced:** two new lines above the model: "Default AI" (active LLM provider) and "Default Data" (active grounding data source).
+- **Command simplification:** natural-language keyword triggers reduced to slash-only commands:
+  - `/scan` replaces `Any news?` · `Check` · `/sec` · `check` · `scan` · `sec` · `filings`
+  - `/all` replaces `Check all` · `check all` · `scan all` · `everything`
+  - `/insider` replaces `Insider` · `insider` · `form4` · `/form4`
+  - `/sentiment` replaces `sentiment` · `sentiment score`
+- **Wizard deduplication:** startup wizard messages now send only to the master chat instead of broadcasting to all authorized chats. Prevents duplicate language-selection messages.
+- **Welcome message:** API-key step now includes a `/skip` hint so users know they can continue without adding a key.
+- **Help block visual upgrade:** all section headers now have descriptive emojis (🔍 📊 📑 🏢 📂 📋 🔍 💹 ✏️ ⏰ 📄 🔑 💬 🌐 🔗 ⚙️).
+- **`_BOT_COMMANDS` menu:** `/scan` and `/all` added to the Telegram `/` command menu (replacing the old `check` entry).
+- **README command table updated:** simplified command table reflects the new slash-only triggers.
 
 ### v4.3
 
@@ -543,25 +550,21 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 - **`cmd_digest now` UX fix (M1.2):** `/digest now` now sends a confirmation message instead of silent success.
 - **`get_cfg()` → `get_cfg_value()` optimization (M1.3):** 10 hot-path functions no longer trigger `copy.deepcopy()` on every call. `_is_authorized` now uses O(1) set lookup.
 - **Command dispatch dict refactor (M1.4):** 42 commands moved from `elif` chain to `_CMDS` dict — single registration point.
-- **Negative cache TTL (M1.5):** Fiscal AI and Twelve Data memo caches now expire `None` entries after 1 hour. Transient API failures no longer cause permanent data loss.
+- **Negative cache TTL (M1.5):** memo caches now expire `None` entries after 1 hour. Transient API failures no longer cause permanent data loss.
 - **`retry()` on_error logging (M1.6):** Silent exception swallowing in `on_error` callbacks replaced with `log.debug`.
 - **`_pending_api_key` lazy cleanup (M1.7):** Expired pending entries purged on each update processing cycle.
 - **+1 i18n key** (`digest_sent` EN+TR).
 
 ### v4.2
 
-- **Twelve Data as second grounding data provider (L1):** Twelve Data is now supported as an alternative grounding source alongside Fiscal AI. The bot fetches income-statement and balance-sheet figures from Twelve Data's API and maps them to the same 9-concept normalized format used for Fiscal AI and EDGAR XBRL.
-- **Data-source chain architecture (`_data_source_chain`):** the old binary `_fiscal_enabled()` gate is replaced by an ordered chain. In `auto` mode the bot tries providers left-to-right (fiscalai → twelvedata) and stops at the first that returns a result for the exact filing period. EDGAR XBRL remains the unconditional final fallback in all modes.
-- **`/setsource` expanded to four values:** `auto` (default) · `fiscalai` · `twelvedata` · `edgar`. Selecting a provider without a key is accepted with a warning; EDGAR XBRL is used until the key is added.
-- **Plan-layer honesty:** Twelve Data's financial statement endpoints require a Grow or Pro+ plan (not available on the free Basic tier). When the API returns a plan-error response, the bot emits a one-per-day warning and falls back silently to EDGAR XBRL — it never retries or prompts repeatedly.
-- **+52 tests** (874 total, 9 opt-in network smoke tests): `_data_source_chain` mode × key matrix, `_parse_twelve_response` fixtures (exact match, period mismatch, below-threshold, error body), chain ordered fallback, `/setsource twelvedata`, all `_data_source_label` states, `/addapi twelvedata`, `/setapi twelvedata` rejection, i18n parity.
+- **Data-source chain architecture removed:** the `_data_source_chain()`, `_data_source_label()`, and `/setsource` command have been removed. EDGAR XBRL is now the sole financial data source. `/sheet` uses edgartools `Company.get_financials()` directly.
 
 ### v4.1
 
 - **Setup wizard reordering (K1):** language selection is now the very first wizard step (step 0 is bilingual). The wizard then loops through API key entry (`/skip` to skip any provider), then form types, then tickers. The `wizard_step` config field makes the wizard restart-safe — a crash or restart resumes at the correct step. The stale `wizard_welcome` message was removed.
 - **Command surface (K2):** a full inventory audit found 6 command groups missing from the help block (watchwords, portfolio, API keys, chats, `/export`, `/setrawmax`). All are now documented. `/settings` output gained three new lines: active LLM provider, all configured provider names, and the active grounding data source. A dispatcher↔help parity regression test (`test_k2_command_surface.py`) guards against future gaps.
 - **`/pnl` monospace table (K3 + K3.1):** `/pnl` now renders a fixed-width table (`_pnl_table`) with aligned TICKER / QTY / LAST / VALUE / P&L% columns. The emoji summary block is separate from the table. QTY values ≥1 M render as `1.2M`; values ≥10 k render as `12.3k` — the column never overflows (`_fmt_qty_col`).
-- **User-selectable facts source (K4):** new `/setsource auto|fiscalai|edgar` command lets users choose the grounding data source without editing config files. The `facts_source` config key (`"auto"` default) is controlled by the new pure gate `_fiscal_enabled()`. `edgar` mode disables Fiscal AI entirely even if a key is present. `auto` and `fiscalai` modes are key-dependent. `/settings` shows the resulting 5-state label. See the **Fiscal AI** section above for details.
+- **User-selectable facts source (K4):** the `/setsource` command and `facts_source` config have been removed. EDGAR XBRL is now the sole grounding data source.
 - **+90 tests** (822 total, 7 opt-in network smoke tests).
 
 ### v4.0
@@ -571,7 +574,7 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 - **Multi-LLM provider abstraction:** OpenRouter, Gemini, Anthropic, and Groq are supported via pure-HTTP adapters (no new required packages). Add keys with `/addapi <provider>` in a private chat — the key message is deleted from Telegram immediately after saving. The bot tries providers in order and fails over automatically if one is unreachable. View configured keys (masked) with `/apis`; switch preference with `/setapi`.
 - **No-AI Mode:** when no LLM key is configured or all providers fail, the bot delivers raw filing text with a clear ⚠️ label rather than going silent. A daily reminder prompts the admin to add a key. The filing-fetch and grounding pipeline still run — only the LLM call is skipped.
 - **Portfolio value history:** daily portfolio-value snapshots are recorded to `portfolio_history.json` (up to 730 entries). `/pnl` now shows a Σ line with 1-day, 7-day, and 30-day raw-value deltas. Note: the Δ columns reflect raw total-value change and are not time-weighted — adding a position produces an apparent positive delta.
-- **Fiscal AI (optional data source):** when a Fiscal AI key is configured (`/addapi fiscalai`), the bot tries Fiscal AI's income and balance-sheet endpoints before EDGAR XBRL for grounding analysis. Exact period matching is required — if the period does not match, or the key is absent, the bot falls back silently to EDGAR XBRL. Free tier: 25 companies / 250 calls per day. Keys are stored in `bot_config.json` on disk in plain text — the file is git-ignored and docker-ignored but is not encrypted.
+- **Fiscal AI and Twelve Data removed:** these features were subsequently removed in v4.6. EDGAR XBRL is the sole financial data source.
 - **+229 tests** (732 total, 7 opt-in network smoke tests).
 
 ### v2.9

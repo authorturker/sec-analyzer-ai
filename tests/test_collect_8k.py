@@ -16,6 +16,9 @@ class MockAttachment:
     def text(self):
         return self._text
 
+    def markdown(self):
+        return self._text
+
 
 class MockFiling:
     def __init__(self, primary_text, attachments=None, *, no_attachments_attr=False):
@@ -24,6 +27,9 @@ class MockFiling:
         self._no_attachments_attr = no_attachments_attr
 
     def text(self):
+        return self._primary
+
+    def markdown(self):
         return self._primary
 
     @property

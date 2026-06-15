@@ -90,6 +90,7 @@ class TestCorruptionRecoveryIntegration:
 
     def test_get_weekly_log_recovers_from_corruption(self, bot, tmp_path, monkeypatch):
         monkeypatch.setattr(bot, "WEEKLY_LOG", tmp_path / "weekly_log.json")
+        monkeypatch.setattr(bot._ctx, "chat_id", None)
         (tmp_path / "weekly_log.json").write_text("not json")
         assert bot.get_weekly_log() == []
         assert (tmp_path / "weekly_log.json.corrupt").exists()

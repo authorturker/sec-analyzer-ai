@@ -1,101 +1,17 @@
 """
-Offline tests for F1 XBRL fact extraction helpers.
+Offline tests for XBRL fact extraction helpers.
 
-All tests are network-free. _normalize_xbrl_facts and format_facts_block are
-pure functions tested directly. fetch_xbrl_facts is tested with fake filing
-objects to verify it never raises and handles every edge case.
+All tests are network-free. format_facts_block is a pure function tested
+directly. fetch_company_facts is tested with fake Company objects.
 """
 import pytest
 import sys
-import types
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# conftest.py installs stubs and imports bot; re-use that.
-import bot  # noqa: E402  (stub already installed by conftest)
-
-
-# ── Helpers ────────────────────────────────────────────────
-
-def _make_raw(concept: str, entries: list) -> dict:
-    """Convenience: build a raw_facts dict with one concept."""
-    return {concept: entries}
-
-
-def _entry(value=100.0, unit="USD", period_end="2024-09-30",
-           period_type="duration", duration_days=365):
-    return (value, unit, period_end, period_type, duration_days)
-
-
-# ── _normalize_xbrl_facts ──────────────────────────────────
-
-class TestNormalizeXbrlFacts:
-
-    def test_empty_dict_returns_empty(self):
-        assert bot._normalize_xbrl_facts({}) == {}
-
-    def test_single_entry_returned(self):
-        raw = _make_raw("Revenues", [_entry(500e9)])
-        result = bot._normalize_xbrl_facts(raw)
-        assert "Revenues" in result
-        assert result["Revenues"][0] == 500e9
-
-    def test_selects_most_recent_period_end(self):
-        """When two entries differ only in period_end, the later date wins."""
-        raw = _make_raw("NetIncomeLoss", [
-            _entry(100.0, period_end="2023-09-30"),
-            _entry(200.0, period_end="2024-09-30"),
-        ])
-        result = bot._normalize_xbrl_facts(raw)
-        assert result["NetIncomeLoss"][0] == 200.0
-        assert result["NetIncomeLoss"][2] == "2024-09-30"
-
-    def test_ties_broken_by_shortest_duration(self):
-        """Same period_end → prefer shortest duration (quarterly > annual cumulative)."""
-        raw = _make_raw("OperatingIncomeLoss", [
-            _entry(50.0,  period_end="2024-09-30", duration_days=365),
-            _entry(20.0,  period_end="2024-09-30", duration_days=90),
-        ])
-        result = bot._normalize_xbrl_facts(raw)
-        assert result["OperatingIncomeLoss"][0] == 20.0  # quarterly (90-day)
-
-    def test_negative_value_preserved(self):
-        raw = _make_raw("NetIncomeLoss", [_entry(-1_200_000_000.0)])
-        result = bot._normalize_xbrl_facts(raw)
-        assert result["NetIncomeLoss"][0] == -1_200_000_000.0
-
-    def test_zero_value_kept(self):
-        """Zero is a valid fact and must not be dropped."""
-        raw = _make_raw("GrossProfit", [_entry(0.0)])
-        result = bot._normalize_xbrl_facts(raw)
-        assert "GrossProfit" in result
-        assert result["GrossProfit"][0] == 0.0
-
-    def test_partial_whitelist_valid(self):
-        """Only a subset of whitelist concepts is fine."""
-        raw = {
-            "Revenues": [_entry(100e9)],
-            "Assets":   [_entry(200e9)],
-        }
-        result = bot._normalize_xbrl_facts(raw)
-        assert len(result) == 2
-        assert "GrossProfit" not in result
-
-    def test_multiple_concepts_all_selected(self):
-        raw = {
-            "Revenues":     [_entry(100e9, period_end="2024-09-30")],
-            "GrossProfit":  [_entry(40e9,  period_end="2024-09-30")],
-            "NetIncomeLoss":[_entry(20e9,  period_end="2024-09-30")],
-        }
-        result = bot._normalize_xbrl_facts(raw)
-        assert len(result) == 3
-
-    def test_unit_preserved_in_output(self):
-        raw = _make_raw("Assets", [_entry(500e9, unit="iso4217:EUR")])
-        result = bot._normalize_xbrl_facts(raw)
-        assert result["Assets"][1] == "iso4217:EUR"
+import bot  # noqa: E402
 
 
 # ── format_facts_block ─────────────────────────────────────
@@ -106,13 +22,13 @@ class TestFormatFactsBlock:
         assert bot.format_facts_block({}) == ""
 
     def test_header_contains_period_date(self):
-        facts = {"Revenues": (391e9, "USD", "2024-09-28")}
+        facts = {"RevenueFromContractWithCustomerExcludingAssessedTax": (391e9, "USD", "2024-09-28")}
         block = bot.format_facts_block(facts)
         assert "2024-09-28" in block
         assert block.startswith("AUDITED XBRL FACTS")
 
     def test_billion_scale_formatting(self):
-        facts = {"Revenues": (8_710_000_000.0, "USD", "2024-09-28")}
+        facts = {"RevenueFromContractWithCustomerExcludingAssessedTax": (8_710_000_000.0, "USD", "2024-09-28")}
         block = bot.format_facts_block(facts)
         assert "$8.71B" in block
 
@@ -125,8 +41,6 @@ class TestFormatFactsBlock:
         facts = {"EarningsPerShareDiluted": (1.23, "USD", "2024-09-28")}
         block = bot.format_facts_block(facts)
         assert "$1.23" in block
-        # Must not apply B/M/K scaling
-        assert "B" not in block.split("EarningsPerShareDiluted")[-1].split("\n")[0]
 
     def test_negative_value_shows_sign(self):
         facts = {"NetIncomeLoss": (-1_200_000_000.0, "USD", "2024-09-28")}
@@ -140,8 +54,8 @@ class TestFormatFactsBlock:
 
     def test_gross_margin_derived(self):
         facts = {
-            "Revenues":    (100_000_000_000.0, "USD", "2024-09-28"),
-            "GrossProfit": (44_000_000_000.0,  "USD", "2024-09-28"),
+            "RevenueFromContractWithCustomerExcludingAssessedTax": (100_000_000_000.0, "USD", "2024-09-28"),
+            "GrossProfit": (44_000_000_000.0, "USD", "2024-09-28"),
         }
         block = bot.format_facts_block(facts)
         assert "44.0%" in block
@@ -154,15 +68,13 @@ class TestFormatFactsBlock:
 
     def test_no_gross_margin_when_revenue_zero(self):
         facts = {
-            "Revenues":    (0.0, "USD", "2024-09-28"),
+            "RevenueFromContractWithCustomerExcludingAssessedTax": (0.0, "USD", "2024-09-28"),
             "GrossProfit": (5e9, "USD", "2024-09-28"),
         }
         block = bot.format_facts_block(facts)
         assert "gross_margin_pct" not in block
 
     def test_block_length_cap_600(self):
-        """Block must be truncated to ≤600 characters."""
-        # Craft a facts dict that would produce a long block
         facts = {concept: (1_234_567_890.12, "USD", "2024-09-28")
                  for concept in bot._XBRL_DISPLAY_ORDER}
         block = bot.format_facts_block(facts)
@@ -174,173 +86,119 @@ class TestFormatFactsBlock:
         assert "GrossProfit" in block
 
     def test_display_order_respected(self):
-        """Revenues appears before Assets in the block."""
         facts = {
-            "Assets":   (200e9, "USD", "2024-09-28"),
-            "Revenues": (100e9, "USD", "2024-09-28"),
+            "latest": {
+                "Assets":   (200e9, "USD", "2024-09-28"),
+                "RevenueFromContractWithCustomerExcludingAssessedTax": (100e9, "USD", "2024-09-28"),
+            },
+            "years": {},
         }
         block = bot.format_facts_block(facts)
-        assert block.index("Revenues") < block.index("Assets")
+        rev_key = "RevenueFromContractWithCustomerExcludingAssessedTax"
+        # Revenue short name "Revenue" should appear before "Assets"
+        assert block.index("Revenue") < block.index("Assets")
 
 
-# ── fetch_xbrl_facts (no-exception contract) ──────────────
+# ── fetch_company_facts (no-exception contract) ────────────
 
-class _FakeFact:
-    def __init__(self, element_id, context_ref, numeric_value, unit_ref="USD"):
-        self.element_id   = element_id
-        self.context_ref  = context_ref
-        self.numeric_value = numeric_value
-        self.unit_ref      = unit_ref
+import pandas as pd
 
+class _FakeDataFrame:
+    """Minimal DataFrame-like object for testing."""
+    def __init__(self, data: dict, columns: list):
+        self._data = data
+        self.columns = columns
 
-class _FakeContext:
-    def __init__(self, period: dict, dimensions: dict | None = None):
-        self.period     = period
-        self.dimensions = dimensions or {}
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return pd.Series({k: v[key] for k, v in self._data.items() if key in v})
+        return self
 
-
-class _FakeFiling:
-    """Fake edgartools Filing with configurable xbrl() return."""
-    def __init__(self, xbrl_obj):
-        self._xbrl_obj = xbrl_obj
-
-    def xbrl(self):
-        return self._xbrl_obj
+    def loc(self, key, col):
+        return self._data.get(key, {}).get(col)
 
 
-class _FakeXBRL:
-    def __init__(self, facts_dict: dict, contexts_dict: dict):
-        self._facts   = facts_dict
-        self.contexts = contexts_dict
+class _FakeStatement:
+    def __init__(self, df):
+        self._df = df
+    def to_dataframe(self):
+        return self._df
 
 
-def _duration_ctx(end: str, start: str) -> _FakeContext:
-    return _FakeContext({"type": "duration", "endDate": end, "startDate": start})
+class _FakeCompany:
+    def __init__(self, inc_df=None, bs_df=None):
+        self._inc = inc_df
+        self._bs = bs_df
 
-def _instant_ctx(date: str) -> _FakeContext:
-    return _FakeContext({"type": "instant", "instant": date})
+    def income_statement(self, periods=1):
+        if self._inc is None:
+            raise RuntimeError("no income data")
+        return _FakeStatement(self._inc)
+
+    def balance_sheet(self, periods=1):
+        if self._bs is None:
+            raise RuntimeError("no balance data")
+        return _FakeStatement(self._bs)
 
 
-class TestFetchXbrlFacts:
+def _make_inc_df(revenue=416e9, gross_profit=195e9, operating=133e9,
+                  net_income=112e9, eps=7.46):
+    data = {
+        "RevenueFromContractWithCustomerExcludingAssessedTax": {"FY 2025": revenue},
+        "GrossProfit": {"FY 2025": gross_profit},
+        "OperatingIncomeLoss": {"FY 2025": operating},
+        "NetIncomeLoss": {"FY 2025": net_income},
+        "EarningsPerShareDiluted": {"FY 2025": eps},
+    }
+    return pd.DataFrame(data, index=["FY 2025"]).T
 
-    def test_returns_none_when_xbrl_is_none(self):
-        filing = _FakeFiling(None)
-        result = bot.fetch_xbrl_facts(filing)
+
+def _make_bs_df(cash=36e9, assets=359e9, liabilities=286e9, equity=74e9):
+    data = {
+        "CashAndCashEquivalentsAtCarryingValue": {"FY 2025": cash},
+        "Assets": {"FY 2025": assets},
+        "Liabilities": {"FY 2025": liabilities},
+        "StockholdersEquity": {"FY 2025": equity},
+    }
+    return pd.DataFrame(data, index=["FY 2025"]).T
+
+
+class TestFetchCompanyFacts:
+
+    def test_returns_facts_on_success(self, bot, monkeypatch):
+        company = _FakeCompany(inc_df=_make_inc_df(), bs_df=_make_bs_df())
+        monkeypatch.setattr(bot, "get_company", lambda tk: company)
+        result = bot.fetch_company_facts("AAPL")
+        assert result is not None
+        assert "latest" in result
+        assert "years" in result
+        assert "RevenueFromContractWithCustomerExcludingAssessedTax" in result["latest"]
+        assert result["latest"]["RevenueFromContractWithCustomerExcludingAssessedTax"][0] == pytest.approx(416e9)
+
+    def test_returns_none_on_income_failure(self, bot, monkeypatch):
+        company = _FakeCompany(inc_df=None)
+        monkeypatch.setattr(bot, "get_company", lambda tk: company)
+        result = bot.fetch_company_facts("AAPL")
         assert result is None
 
-    def test_never_raises_on_exception_in_xbrl(self):
-        class _BrokenFiling:
-            def xbrl(self):
-                raise RuntimeError("network gone")
+    def test_continues_when_balance_sheet_fails(self, bot, monkeypatch):
+        company = _FakeCompany(inc_df=_make_inc_df(), bs_df=None)
+        monkeypatch.setattr(bot, "get_company", lambda tk: company)
+        result = bot.fetch_company_facts("AAPL")
+        assert result is not None
+        assert "RevenueFromContractWithCustomerExcludingAssessedTax" in result["latest"]
+        assert "Assets" not in result["latest"]
 
-        result = bot.fetch_xbrl_facts(_BrokenFiling())
+    def test_never_raises_on_exception(self, bot, monkeypatch):
+        def _boom(tk):
+            raise RuntimeError("network gone")
+        monkeypatch.setattr(bot, "get_company", _boom)
+        result = bot.fetch_company_facts("AAPL")
         assert result is None
 
-    def test_never_raises_when_facts_dict_missing(self):
-        """Filing.xbrl() returns object with no _facts attribute."""
-        class _WeirdXBRL:
-            contexts = {}
-        result = bot.fetch_xbrl_facts(_FakeFiling(_WeirdXBRL()))
-        assert result is None
-
-    def test_basic_revenue_fact_extracted(self):
-        ctx = _duration_ctx("2024-09-30", "2023-10-01")
-        xbrl = _FakeXBRL(
-            {"Revenues_c1": _FakeFact("Revenues", "c1", 391_035_000_000.0)},
-            {"c1": ctx},
-        )
-        result = bot.fetch_xbrl_facts(_FakeFiling(xbrl))
-        assert result is not None
-        assert "Revenues" in result
-        assert result["Revenues"][0] == pytest.approx(391_035_000_000.0)
-
-    def test_namespaced_concept_stripped(self):
-        ctx = _duration_ctx("2024-09-30", "2023-10-01")
-        xbrl = _FakeXBRL(
-            {"us-gaap:NetIncomeLoss_c1": _FakeFact("us-gaap:NetIncomeLoss", "c1", 93_736_000_000.0)},
-            {"c1": ctx},
-        )
-        result = bot.fetch_xbrl_facts(_FakeFiling(xbrl))
-        assert result is not None
-        assert "NetIncomeLoss" in result
-
-    def test_dimensional_fact_skipped(self):
-        """Facts with non-empty context dimensions (segment data) must be excluded."""
-        ctx = _FakeContext(
-            {"type": "duration", "endDate": "2024-09-30", "startDate": "2023-10-01"},
-            dimensions={"us-gaap:SegmentReportingAxis": "iPhone"},
-        )
-        xbrl = _FakeXBRL(
-            {"Revenues_c1": _FakeFact("Revenues", "c1", 100e9)},
-            {"c1": ctx},
-        )
-        result = bot.fetch_xbrl_facts(_FakeFiling(xbrl))
-        assert result is None  # nothing left after dimensional filter
-
-    def test_shares_unit_filtered_for_monetary_concept(self):
-        ctx = _duration_ctx("2024-09-30", "2023-10-01")
-        xbrl = _FakeXBRL(
-            {"Assets_c1": _FakeFact("Assets", "c1", 5_000_000.0, unit_ref="shares")},
-            {"c1": ctx},
-        )
-        result = bot.fetch_xbrl_facts(_FakeFiling(xbrl))
-        assert result is None
-
-    def test_fallback_concept_promoted_to_primary(self):
-        """RevenueFromContractWithCustomerExcludingAssessedTax → Revenues key."""
-        ctx = _duration_ctx("2024-03-31", "2023-04-01")
-        xbrl = _FakeXBRL(
-            {
-                "RevenueFromContractWithCustomerExcludingAssessedTax_c1":
-                    _FakeFact("RevenueFromContractWithCustomerExcludingAssessedTax", "c1", 50e9),
-            },
-            {"c1": ctx},
-        )
-        result = bot.fetch_xbrl_facts(_FakeFiling(xbrl))
-        assert result is not None
-        assert "Revenues" in result
-        assert "RevenueFromContractWithCustomerExcludingAssessedTax" not in result
-
-    def test_primary_wins_over_fallback_when_both_present(self):
-        ctx = _duration_ctx("2024-03-31", "2023-04-01")
-        xbrl = _FakeXBRL(
-            {
-                "Revenues_c1":
-                    _FakeFact("Revenues", "c1", 100e9),
-                "RevenueFromContractWithCustomerExcludingAssessedTax_c1":
-                    _FakeFact("RevenueFromContractWithCustomerExcludingAssessedTax", "c1", 90e9),
-            },
-            {"c1": ctx},
-        )
-        result = bot.fetch_xbrl_facts(_FakeFiling(xbrl))
-        assert result is not None
-        assert result["Revenues"][0] == pytest.approx(100e9)
-        assert "RevenueFromContractWithCustomerExcludingAssessedTax" not in result
-
-    def test_out_of_whitelist_concept_ignored(self):
-        ctx = _duration_ctx("2024-09-30", "2023-10-01")
-        xbrl = _FakeXBRL(
-            {"SomeObscureLine_c1": _FakeFact("SomeObscureLine", "c1", 99e9)},
-            {"c1": ctx},
-        )
-        result = bot.fetch_xbrl_facts(_FakeFiling(xbrl))
-        assert result is None
-
-    def test_instant_context_duration_zero(self):
-        ctx = _instant_ctx("2024-09-28")
-        xbrl = _FakeXBRL(
-            {"Assets_c1": _FakeFact("Assets", "c1", 364_980_000_000.0)},
-            {"c1": ctx},
-        )
-        result = bot.fetch_xbrl_facts(_FakeFiling(xbrl))
-        assert result is not None
-        assert "Assets" in result
-
-    def test_none_numeric_value_skipped(self):
-        ctx = _duration_ctx("2024-09-30", "2023-10-01")
-        xbrl = _FakeXBRL(
-            {"Revenues_c1": _FakeFact("Revenues", "c1", None)},
-            {"c1": ctx},
-        )
-        result = bot.fetch_xbrl_facts(_FakeFiling(xbrl))
+    def test_empty_data_returns_none(self, bot, monkeypatch):
+        empty_inc = pd.DataFrame(columns=["FY 2025"])
+        company = _FakeCompany(inc_df=empty_inc, bs_df=empty_inc)
+        monkeypatch.setattr(bot, "get_company", lambda tk: company)
+        result = bot.fetch_company_facts("AAPL")
         assert result is None

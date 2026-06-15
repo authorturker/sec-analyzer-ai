@@ -128,7 +128,7 @@ class TestParseFactsBlock:
         monetary and pct values within 2%.
         """
         facts = {
-            "Revenues":       (391_035_000_000, "USD", "2024-09-28"),
+            "RevenueFromContractWithCustomerExcludingAssessedTax":       (391_035_000_000, "USD", "2024-09-28"),
             "GrossProfit":    (169_148_000_000, "USD", "2024-09-28"),
             "NetIncomeLoss":  (93_736_000_000,  "USD", "2024-09-28"),
         }
@@ -146,7 +146,7 @@ class TestParseFactsBlock:
 
     def test_round_trip_includes_gross_margin_pct(self, bot):
         facts = {
-            "Revenues":    (391_035_000_000, "USD", "2024-09-28"),
+            "RevenueFromContractWithCustomerExcludingAssessedTax":    (391_035_000_000, "USD", "2024-09-28"),
             "GrossProfit": (169_148_000_000, "USD", "2024-09-28"),
         }
         block = bot.format_facts_block(facts)
@@ -186,7 +186,7 @@ class TestSourceNumbers:
 class TestVerifyNumericClaims:
     def _make_facts_block(self, bot):
         facts = {
-            "Revenues":    (391_035_000_000, "USD", "2024-09-28"),
+            "RevenueFromContractWithCustomerExcludingAssessedTax":    (391_035_000_000, "USD", "2024-09-28"),
             "GrossProfit": (169_148_000_000, "USD", "2024-09-28"),
         }
         return bot.format_facts_block(facts)
@@ -231,7 +231,7 @@ class TestVerifyNumericClaims:
 
     def test_pct_within_1_point_supported(self, bot):
         facts = {
-            "Revenues":    (391_035_000_000, "USD", "2024-09-28"),
+            "RevenueFromContractWithCustomerExcludingAssessedTax":    (391_035_000_000, "USD", "2024-09-28"),
             "GrossProfit": (169_148_000_000, "USD", "2024-09-28"),
         }
         facts_block = bot.format_facts_block(facts)
@@ -241,7 +241,7 @@ class TestVerifyNumericClaims:
 
     def test_pct_outside_1_point_flagged(self, bot):
         facts = {
-            "Revenues":    (391_035_000_000, "USD", "2024-09-28"),
+            "RevenueFromContractWithCustomerExcludingAssessedTax":    (391_035_000_000, "USD", "2024-09-28"),
             "GrossProfit": (169_148_000_000, "USD", "2024-09-28"),
         }
         facts_block = bot.format_facts_block(facts)

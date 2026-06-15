@@ -2,8 +2,8 @@
 Tests for K2 — Command Surface: /help completeness + /settings provider visibility.
 
 Coverage:
-- settings output includes active_provider, registered_providers, data_source
-- edge cases: no key, default_provider set but key deleted, fiscalai present
+- settings output includes active_provider, registered_providers
+- edge cases: no key, default_provider set but key deleted
 - help_block contains all dispatcher commands (regression guard)
 - EN/TR parity for new settings_block placeholders
 """
@@ -71,23 +71,6 @@ class TestSettingsProviderVisibility:
         # No key fragments should appear
         assert "sk-or" not in out
         assert "sk-ant" not in out
-
-    def test_data_source_edgar_when_no_fiscalai(self, bot, monkeypatch, tmp_path):
-        """No fiscalai key → data_source shows EDGAR."""
-        self._reset(bot, monkeypatch, tmp_path)
-        bot.mutate_cfg(lambda c: c.update({"api_keys": {}}))
-        out = bot.cmd_settings()
-        assert "EDGAR" in out
-
-    def test_data_source_fiscalai_when_key_present(self, bot, monkeypatch, tmp_path):
-        """fiscalai key registered → data_source shows fiscalai."""
-        self._reset(bot, monkeypatch, tmp_path)
-        bot.mutate_cfg(lambda c: c.update({
-            "api_keys": {bot._FISCAL_AI_PROVIDER: "fai-testkey123"},
-        }))
-        out = bot.cmd_settings()
-        assert "fiscalai" in out
-        assert "EDGAR" in out  # fallback label still present
 
 
 # ─── /help dispatcher coverage (regression guard) ──────────────────────────────
@@ -177,9 +160,8 @@ class TestHelpBlockCoverage:
         assert "/setrawmax" in help_en
 
     def test_settings_block_has_provider_placeholders(self, bot):
-        """settings_block template contains all three new placeholders."""
+        """settings_block template contains provider placeholders."""
         for code in ("en", "tr"):
             tmpl = bot._load_lang(code).get("settings_block", "")
             assert "{active_provider}" in tmpl, f"Missing {{active_provider}} in {code}.json"
             assert "{registered_providers}" in tmpl, f"Missing {{registered_providers}} in {code}.json"
-            assert "{data_source}" in tmpl, f"Missing {{data_source}} in {code}.json"

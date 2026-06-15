@@ -365,3 +365,207 @@ class TestI18nParity:
             keys = self._load(root / lang_file)
             missing = new_keys - keys
             assert not missing, f"{lang_file} missing I1 keys: {sorted(missing)}"
+
+
+# ─── M2: Per-chat data purge on removechat ───────────────────────────────────
+
+class TestPurgeChatData:
+    """_purge_chat_data removes config + weekly log artifacts on deauth."""
+
+    def _setup_chat(self, bot, chat_id, tmp_path, monkeypatch):
+        cfg_path = tmp_path / "bot_config.json"
+        chat_dir = tmp_path / "chats"
+        chat_dir.mkdir(exist_ok=True)
+        monkeypatch.setattr(bot, "CONFIG_FILE", cfg_path)
+        monkeypatch.setattr(bot, "CHAT_DIR", chat_dir)
+        bot._cfg_cache = None
+        # Add chat to authorized list
+        cfg_path.write_text(json.dumps({"chat_ids": ["100", chat_id]}), encoding="utf-8")
+        bot.init_chat_config(chat_id)
+        return cfg_path, chat_dir
+
+    def test_removechat_purges_config_file(self, tmp_path, monkeypatch):
+        """After removechat, chat_<id>.json no longer exists on disk."""
+        import bot
+        cfg_path, chat_dir = self._setup_chat(bot, "200", tmp_path, monkeypatch)
+        bot.cmd_removechat(["/removechat", "200"], "100")
+        assert not bot._chat_cfg_path("200").exists()
+
+    def test_removechat_purges_weekly_log(self, tmp_path, monkeypatch):
+        """After removechat, weekly_log_<id>.json no longer exists on disk."""
+        import bot
+        cfg_path, chat_dir = self._setup_chat(bot, "300", tmp_path, monkeypatch)
+        # Create a weekly log file manually
+        wlog_path = chat_dir / "weekly_log_300.json"
+        wlog_path.write_text(json.dumps([{"ticker": "AAPL"}]), encoding="utf-8")
+        bot.cmd_removechat(["/removechat", "300"], "100")
+        assert not wlog_path.exists()
+
+    def test_purge_idempotent_no_files(self, tmp_path, monkeypatch):
+        """_purge_chat_data on non-existent files → no error."""
+        import bot
+        chat_dir = tmp_path / "chats"
+        chat_dir.mkdir()
+        monkeypatch.setattr(bot, "CHAT_DIR", chat_dir)
+        # Must not raise
+        bot._purge_chat_data("nonexistent")
+
+    def test_purge_idempotent_called_twice(self, tmp_path, monkeypatch):
+        """_purge_chat_data called twice → no error."""
+        import bot
+        cfg_path, chat_dir = self._setup_chat(bot, "400", tmp_path, monkeypatch)
+        bot._purge_chat_data("400")
+        bot._purge_chat_data("400")  # must not raise
+
+    def test_readd_gets_fresh_defaults(self, tmp_path, monkeypatch):
+        """Remove → re-add → config equals _CHAT_DEFAULTS (no stale data)."""
+        import bot
+        cfg_path, chat_dir = self._setup_chat(bot, "500", tmp_path, monkeypatch)
+        # Write some data to the chat config
+        bot._ctx.chat_id = "500"
+        try:
+            bot.mutate_chat_cfg(lambda c: c["tickers"].extend(["AAPL", "MSFT"]))
+            # Verify data was written
+            chat_data = json.loads(bot._chat_cfg_path("500").read_text(encoding="utf-8"))
+            assert "AAPL" in chat_data["tickers"]
+        finally:
+            bot._ctx.chat_id = None
+        # Remove the chat
+        bot.cmd_removechat(["/removechat", "500"], "100")
+        assert not bot._chat_cfg_path("500").exists()
+        # Re-add
+        bot.cmd_addchat(["/addchat", "500"], "100")
+        bot.init_chat_config("500")
+        # Config must be fresh defaults
+        bot._ctx.chat_id = "500"
+        try:
+            cfg = bot.get_chat_cfg()
+            assert cfg["tickers"] == []
+            assert cfg["portfolio"] == []
+            assert cfg["api_keys"] == {}
+        finally:
+            bot._ctx.chat_id = None
+
+    def test_no_api_keys_leak_after_remove(self, tmp_path, monkeypatch):
+        """After removechat, no chat_<id>.json with api_keys on disk."""
+        import bot
+        cfg_path, chat_dir = self._setup_chat(bot, "600", tmp_path, monkeypatch)
+        # Write api_keys to the chat config
+        bot._ctx.chat_id = "600"
+        try:
+            bot.mutate_chat_cfg(lambda c: c.update({"api_keys": {"openai": "sk-secret"}}))
+        finally:
+            bot._ctx.chat_id = None
+        # Remove
+        bot.cmd_removechat(["/removechat", "600"], "100")
+        # Verify no file on disk
+        assert not bot._chat_cfg_path("600").exists()
+        # Also verify no leftover files in chat_dir
+        chat_files = list(chat_dir.glob("chat_600*"))
+        assert chat_files == []
+
+    def test_self_remove_does_not_purge(self, tmp_path, monkeypatch):
+        """Self-remove is blocked, so files must NOT be purged."""
+        import bot
+        cfg_path, chat_dir = self._setup_chat(bot, "700", tmp_path, monkeypatch)
+        bot.cmd_removechat(["/removechat", "700"], "700")
+        # File must still exist
+        assert bot._chat_cfg_path("700").exists()
+        # Admin still in list
+        assert "700" in [str(c) for c in bot.get_cfg()["chat_ids"]]
+
+
+# ─── M3: Per-chat scheduled scan dedup ───────────────────────────────────────
+
+class TestScheduledScanDedup:
+    """_should_run_scheduled_scan is a per-chat gate — two chats with the
+    same schedule both run; same chat within 90s does not re-trigger."""
+
+    def test_two_chats_same_schedule_both_run(self):
+        """Two chats at the same HH:MM → both should_run_scheduled_scan returns True."""
+        import bot
+        from datetime import datetime
+        now = datetime(2026, 6, 15, 9, 0, 0)
+        last = {}
+        assert bot._should_run_scheduled_scan("A", now, last) is True
+        assert bot._should_run_scheduled_scan("B", now, last) is True
+
+    def test_intra_duplicate_within_90s_blocked(self):
+        """Same chat scanned < 90s ago → should not run again."""
+        import bot
+        from datetime import datetime
+        now = datetime(2026, 6, 15, 9, 0, 0)
+        last = {"chat1": now}
+        assert bot._should_run_scheduled_scan("chat1", now, last) is False
+
+    def test_after_90s_allows_rerun(self):
+        """Same chat scanned > 90s ago → should run again."""
+        import bot
+        from datetime import datetime
+        from datetime import timedelta
+        now = datetime(2026, 6, 15, 9, 2, 0)
+        last = {"chat1": datetime(2026, 6, 15, 8, 59, 0)}
+        assert bot._should_run_scheduled_scan("chat1", now, last) is True
+
+    def test_empty_history_allows_run(self):
+        """Chat never scanned before → should run."""
+        import bot
+        from datetime import datetime
+        now = datetime(2026, 6, 15, 9, 0, 0)
+        assert bot._should_run_scheduled_scan("new_chat", now, {}) is True
+
+    def test_exactly_90s_boundary(self):
+        """Exactly 90 seconds → should NOT run (must be strictly greater)."""
+        import bot
+        from datetime import datetime, timedelta
+        now = datetime(2026, 6, 15, 9, 1, 30)
+        last = {"chat1": datetime(2026, 6, 15, 9, 0, 0)}
+        assert bot._should_run_scheduled_scan("chat1", now, last) is False
+
+
+# ─── M4: Single-source version label ─────────────────────────────────────────
+
+class TestVersionSingleSource:
+    """Rendered bot_active / help_block / welcome_bootstrap must show the
+    current __version__ and never contain a literal {version} placeholder."""
+
+    def test_bot_active_renders_version(self):
+        import bot
+        result = bot.t("bot_active", version=bot.__version__)
+        assert f"v{bot.__version__}" in result
+        assert "{version}" not in result
+
+    def test_help_block_renders_version(self):
+        import bot
+        result = bot.t("help_block", forms="10-K", ticker_count=0,
+                       language="en", version=bot.__version__)
+        assert f"v{bot.__version__}" in result
+        assert "{version}" not in result
+
+    def test_welcome_bootstrap_renders_version(self):
+        import bot
+        result = bot.t("welcome_bootstrap", master_chat_id="0",
+                       version=bot.__version__)
+        assert f"v{bot.__version__}" in result
+        assert "{version}" not in result
+
+    def test_version_single_source(self):
+        """Changing __version__ propagates to all rendered strings."""
+        import bot
+        fake_ver = "99.99"
+        for key in ("bot_active", "help_block", "welcome_bootstrap"):
+            result = bot.t(key, version=fake_ver,
+                           master_chat_id="0", forms="10-K",
+                           ticker_count=0, language="en")
+            assert f"v{fake_ver}" in result, f"{key} did not reflect version change"
+
+    def test_no_hardcoded_v4_in_lang_files(self):
+        """Lang files must not contain hardcoded v4.0 (or any v4.x) version."""
+        import json
+        from pathlib import Path
+        lang_dir = Path(__file__).parent.parent / "lang"
+        for lang_file in ("en.json", "tr.json"):
+            data = json.loads((lang_dir / lang_file).read_text(encoding="utf-8"))
+            for key in ("bot_active", "help_block", "welcome_bootstrap"):
+                val = data.get(key, "")
+                assert "v4.0" not in val, f"{lang_file}:{key} still contains v4.0"

@@ -17,6 +17,8 @@ bot_config.json
 # Internal orchestration (not product files)
 FABLE_PLAN.md
 SONNET_REPORT.md
+OPUS_PLAN.md
+MIMO_REPORT.md
 *_Sablonu.md
 EXTERNAL_REVIEW.md
 .claude/

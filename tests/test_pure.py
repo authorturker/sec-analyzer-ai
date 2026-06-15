@@ -365,6 +365,7 @@ class TestFetchNewFilings4Tuple:
         class _FakeFiling:
             filing_date = type("D", (), {"date": lambda self: __import__("datetime").date(2026, 5, 1)})()
             def text(self): return "8-K body text"
+            def markdown(self): return "8-K body text"
             def xbrl(self):
                 xbrl_calls["n"] += 1
                 return None
@@ -386,6 +387,7 @@ class TestFetchNewFilings4Tuple:
         class _FakeFiling:
             filing_date = type("D", (), {"date": lambda self: __import__("datetime").date(2026, 5, 1)})()
             def text(self): return "some body"
+            def markdown(self): return "some body"
 
         class _FakeCompany:
             def get_filings(self, form):

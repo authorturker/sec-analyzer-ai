@@ -1,5 +1,5 @@
 """
-SEC Analyzer Bot v4.0 — Telegram (multi-language)
+SEC Analyzer Bot v4.7 — Telegram (multi-language)
 
 Single-codebase replacement for bot_en.py + bot_tr.py.
 - i18n: lang/en.json (default) + lang/tr.json, switch with /setlang.
@@ -8,7 +8,7 @@ Single-codebase replacement for bot_en.py + bot_tr.py.
 - 8-K EX-99.* exhibit collection, full network I/O hardening, 327 tests.
 """
 
-__version__ = "4.0"
+__version__ = "4.7"
 
 import copy, csv, os, time, json, logging, hashlib, threading, io, uuid
 from datetime import datetime, timedelta
@@ -17,7 +17,7 @@ from pathlib import Path
 import re
 import sys
 import requests
-from edgar import Company, set_identity
+from edgar import Company, set_identity, find
 
 # Flask — for webhook mode (optional)
 try:
@@ -79,8 +79,8 @@ _price_lock  = threading.Lock()     # price_cache.json
 _alarm_lock      = threading.Lock()     # _pending_alarms (interactive alarm)
 _watchword_lock  = threading.Lock()     # watchword_seen.json dedup state (G1)
 _phistory_lock   = threading.Lock()     # portfolio_history.json (J4)
-_fiscal_memo_lock = threading.Lock()    # in-memory Fiscal AI memo cache (J5)
-_twelve_memo_lock = threading.Lock()    # in-memory Twelve Data memo cache (L1)
+_fiscal_memo_lock = threading.Lock()    # no-op — kept for compat (Fiscal AI removed)
+_twelve_memo_lock = threading.Lock()    # no-op — kept for compat (Twelve Data removed)
 _stop_event  = threading.Event()
 _ctx         = threading.local()    # per-thread reactive context (I1): _ctx.chat_id
 
@@ -271,11 +271,7 @@ _CFG_DEFAULTS = {
     "api_keys":               {},   # {provider: key} (J2)
     "default_provider":       "",   # active LLM provider name (J2)
     "no_keys_warned_date":    "",   # YYYY-MM-DD of last NO_KEYS reminder (J3 spam gate)
-    "fiscal_auth_warned_date": "",   # YYYY-MM-DD of last Fiscal AI auth warning (J5)
-    "twelve_auth_warned_date": "",   # YYYY-MM-DD of last Twelve Data auth warning (L1)
     "wizard_step":             "",   # active wizard step: "lang"|"api"|"forms"|"tickers"|"" (K1)
-    "facts_source":            "auto",  # data source preference: "auto"|"fiscalai"|"twelvedata"|"edgar" (L1)
-    "provider_models":         {},   # per-provider model override: {"openrouter": "model-name", ...}
 }
 _cfg_cache: dict | None = None
 
@@ -377,15 +373,27 @@ def get_cfg_value(key: str, default=None):
         return _load_cfg_locked().get(key, default)
 
 # ─── Per-chat config (isolation for /addchat users) ───────
-# Per-chat files store user-specific data: tickers, portfolio, custom_prompts.
-# Global config stores shared state: api_keys, language, model, schedule.
+# Per-chat files store user-specific data: tickers, portfolio, custom_prompts,
+# and per-user preferences (alarm, model, schedule, etc.).
+# Global config stores shared state: language, default provider names.
 
-_CHAT_PER_USER_KEYS = {"tickers", "portfolio", "custom_prompts", "default_forms"}
+_CHAT_PER_USER_KEYS = {"tickers", "portfolio", "custom_prompts", "default_forms",
+                       "alarm_on", "price_action_enabled", "model",
+                       "schedule", "api_keys", "groups", "weekly_digest",
+                       "watchwords"}
 _CHAT_DEFAULTS = {
     "tickers": [],
     "portfolio": [],
     "custom_prompts": {},
     "default_forms": DEFAULT_FORMS,
+    "alarm_on": False,
+    "price_action_enabled": True,
+    "model": "openrouter/auto",
+    "schedule": None,
+    "api_keys": {},
+    "groups": {},
+    "weekly_digest": True,
+    "watchwords": [],
 }
 
 def _chat_cfg_path(chat_id: str) -> Path:
@@ -408,30 +416,70 @@ def _has_chat_cfg(chat_id: str) -> bool:
     return _chat_cfg_path(chat_id).exists()
 
 def get_chat_cfg() -> dict:
-    """Return per-chat config if _ctx.chat_id is set and chat has its own config.
-    Falls back to global config (shared state)."""
-    cid = getattr(_ctx, "chat_id", None)
-    if cid and _has_chat_cfg(cid):
-        with _cfg_lock:
-            return copy.deepcopy(_load_chat_cfg(cid))
-    return get_cfg()
+    """Return per-chat config merged with global config.
+
+    Per-chat settings (tickers, portfolio, model, alarm, etc.) override globals.
+    Global-only settings (wizard_step, first_run, chat_ids, etc.) always come from global.
+    """
+    with _cfg_lock:
+        global_cfg = _load_cfg_locked()
+        cid = getattr(_ctx, "chat_id", None)
+        if cid and _has_chat_cfg(cid):
+            chat_cfg = _load_chat_cfg(cid)
+            merged = copy.deepcopy(global_cfg)
+            for k in _CHAT_PER_USER_KEYS:
+                if k in chat_cfg:
+                    merged[k] = copy.deepcopy(chat_cfg[k])
+            return merged
+        return copy.deepcopy(global_cfg)
 
 def mutate_chat_cfg(fn) -> dict:
-    """Like mutate_cfg but writes to per-chat config when context exists."""
-    cid = getattr(_ctx, "chat_id", None)
-    if cid and _has_chat_cfg(cid):
-        with _cfg_lock:
-            cfg = _load_chat_cfg(cid)
-            fn(cfg)
-            _save_chat_cfg(cid, cfg)
-            return copy.deepcopy(cfg)
-    return mutate_cfg(fn)
+    """Atomic read-modify-write that routes changes correctly.
+
+    Per-chat keys (tickers, model, alarm, etc.) go to the per-chat file.
+    Global keys (wizard_step, chat_ids, etc.) go to the global config.
+    Returns merged config snapshot.
+    """
+    with _cfg_lock:
+        cid = getattr(_ctx, "chat_id", None)
+        if cid and _has_chat_cfg(cid):
+            chat_cfg = _load_chat_cfg(cid)
+            global_cfg = _load_cfg_locked()
+            merged = copy.deepcopy(global_cfg)
+            for k in _CHAT_PER_USER_KEYS:
+                if k in chat_cfg:
+                    merged[k] = copy.deepcopy(chat_cfg[k])
+            fn(merged)
+            for k in _CHAT_PER_USER_KEYS:
+                if merged.get(k) != chat_cfg.get(k):
+                    chat_cfg[k] = copy.deepcopy(merged[k])
+            _save_chat_cfg(cid, chat_cfg)
+            for k, v in merged.items():
+                if k not in _CHAT_PER_USER_KEYS and global_cfg.get(k) != v:
+                    global_cfg[k] = v
+            _save_cfg_locked()
+            return copy.deepcopy(merged)
+        return mutate_cfg(fn)
 
 def init_chat_config(chat_id: str):
     """Create per-chat config for a newly added user (empty defaults)."""
-    path = _chat_cfg_path(chat_id)
-    if not path.exists():
-        _save_chat_cfg(chat_id, copy.deepcopy(_CHAT_DEFAULTS))
+    with _cfg_lock:
+        path = _chat_cfg_path(chat_id)
+        if not path.exists():
+            _save_chat_cfg(chat_id, copy.deepcopy(_CHAT_DEFAULTS))
+
+def _purge_chat_data(chat_id: str) -> None:
+    """Delete all per-chat artifacts for a deauthorized chat. Idempotent."""
+    with _cfg_lock:
+        try:
+            _chat_cfg_path(chat_id).unlink(missing_ok=True)
+        except OSError as e:
+            log.error(f"Failed to delete chat config for {chat_id}: {e}")
+    with _wlog_lock:
+        try:
+            _weekly_log_path(chat_id).unlink(missing_ok=True)
+        except OSError as e:
+            log.error(f"Failed to delete weekly log for {chat_id}: {e}")
 
 # ─── Chat ID authorization helpers (I1) ──────────────────
 
@@ -752,7 +800,7 @@ def compute_price_snippet(ticker: str, filing_date: str) -> str:
     IO: orchestrate cache → fetch → parse → format. Returns "" on disable,
     cache-miss-with-fetch-fail, or unparseable response.
     """
-    cfg = get_cfg()
+    cfg = get_chat_cfg()
     if not cfg.get("price_action_enabled", True):
         return ""
     try:
@@ -984,10 +1032,18 @@ def prune_cache_expired(max_age_days: int | None = None) -> int:
 # ─── Weekly log (for digest / report) ─────────────────────
 _WLOG_CAP = 500   # keep last N entries; independent of raw_max config
 
+def _weekly_log_path(chat_id: str | None = None) -> Path:
+    """Return per-chat weekly log path (or global fallback for background threads)."""
+    if chat_id:
+        return CHAT_DIR / f"weekly_log_{chat_id}.json"
+    return WEEKLY_LOG
+
 def log_weekly(ticker: str, form: str, date_str: str, analysis: str):
     """Append a full analysis to the weekly log. Truncation happens at digest time."""
+    cid = getattr(_ctx, "chat_id", None)
+    path = _weekly_log_path(cid)
     with _wlog_lock:
-        data = _read_json(WEEKLY_LOG, [])
+        data = _read_json(path, [])
         if not isinstance(data, list):
             data = []
         data.append({
@@ -996,16 +1052,20 @@ def log_weekly(ticker: str, form: str, date_str: str, analysis: str):
             "ekleme": datetime.now().isoformat(),
         })
         data = data[-_WLOG_CAP:]
-        _atomic_write_json(WEEKLY_LOG, data)
+        _atomic_write_json(path, data)
 
 def get_weekly_log() -> list:
+    cid = getattr(_ctx, "chat_id", None)
+    path = _weekly_log_path(cid)
     with _wlog_lock:
-        data = _read_json(WEEKLY_LOG, [])
+        data = _read_json(path, [])
         return data if isinstance(data, list) else []
 
 def clear_weekly_log():
+    cid = getattr(_ctx, "chat_id", None)
+    path = _weekly_log_path(cid)
     with _wlog_lock:
-        _atomic_write_json(WEEKLY_LOG, [])
+        _atomic_write_json(path, [])
 
 # ─── Previous filing storage (for risk diff) ──────────────
 def prev_path(ticker: str, form: str) -> Path:
@@ -1161,13 +1221,18 @@ def tg_answer_callback(callback_id: str, text: str = ""):
 
 # ─── Bot command menu (U4) ────────────────────────────────
 _BOT_COMMANDS = [
-    ("check",        "cmd_desc_check"),
+    ("scan",         "cmd_desc_scan"),
+    ("all",          "cmd_desc_all"),
     ("insider",      "cmd_desc_insider"),
     ("scanticker",   "cmd_desc_scanticker"),
     ("compare",      "cmd_desc_compare"),
     ("sentiment",    "cmd_desc_sentiment"),
     ("checkprice",   "cmd_desc_checkprice"),
     ("checknews",    "cmd_desc_checknews"),
+    ("sheet",        "cmd_desc_sheet"),
+    ("fulltext",     "cmd_desc_fulltext"),
+    ("search",       "cmd_desc_search"),
+    ("company",      "cmd_desc_company"),
     ("listtickers",  "cmd_desc_listtickers"),
     ("addticker",    "cmd_desc_addticker"),
     ("removeticker", "cmd_desc_removeticker"),
@@ -1457,12 +1522,19 @@ _PROVIDERS: dict = {
         "model":    "gemini-2.0-flash",
         "type":     "gemini",
     },
+    "deepseek": {
+        "endpoint": "https://api.deepseek.com/chat/completions",
+        "model":    "deepseek-v4-flash",
+        "type":     "openai",
+    },
 }
 
 # Available models per provider (user-selectable via /setapi)
 _PROVIDER_MODELS: dict[str, list[str]] = {
     "openrouter": [
         "openrouter/auto",
+        "openrouter/free",
+        "openrouter/owl-alpha",
         "meta-llama/llama-3.3-70b-instruct:free",
         "google/gemma-3-27b-it:free",
         "deepseek/deepseek-chat-v3-0324:free",
@@ -1479,6 +1551,10 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "gemini": [
         "gemini-2.0-flash",
         "gemini-2.5-flash-preview-04-17",
+    ],
+    "deepseek": [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
     ],
 }
 
@@ -1505,6 +1581,7 @@ _PROVIDER_KEY_PREFIXES: dict[str, str] = {
     "openrouter": "sk-or-v1-",
     "anthropic":  "sk-ant-",
     "groq":       "gsk_",
+    "deepseek":   "ds-",
 }
 
 def _validate_provider_key(provider: str, key: str) -> str | None:
@@ -1524,7 +1601,7 @@ def _get_provider_key(provider: str) -> str:
       2. cfg['openrouter_api_key']  — legacy pre-J2 config (openrouter only)
       3. OPENROUTER_API_KEY env var — very legacy (openrouter only)
     """
-    cfg = get_cfg()
+    cfg = get_chat_cfg()
     key = cfg.get("api_keys", {}).get(provider, "")
     if not key and provider == "openrouter":
         key = cfg.get("openrouter_api_key", "") or OPENROUTER_API_KEY
@@ -1536,7 +1613,7 @@ def _ordered_providers() -> list[str]:
 
     Falls back to _PROVIDERS insertion order for ties.
     """
-    cfg = get_cfg()
+    cfg = get_chat_cfg()
     default = cfg.get("default_provider", "")
     available = []
     for p in _PROVIDERS:
@@ -1574,7 +1651,7 @@ def _parse_gemini_resp(body: dict) -> str:
 
 def _get_provider_model(provider: str) -> str:
     """Return the active model for a provider: config override → _PROVIDERS default."""
-    stored = get_cfg_value("provider_models", {}).get(provider)
+    stored = get_chat_cfg().get("provider_models", {}).get(provider)
     if stored:
         return stored
     return _PROVIDERS.get(provider, {}).get("model", "")
@@ -1624,7 +1701,7 @@ def _llm_one(istem: str, model: str, provider: str):
             "Content-Type":       "application/json",
         }
         payload  = {
-            "model":      prov["model"],
+            "model":      p_model,
             "max_tokens": 1200,
             "system":     system_message(),
             "messages":   [{"role": "user", "content": istem}],
@@ -1639,7 +1716,7 @@ def _llm_one(istem: str, model: str, provider: str):
             "contents": [{"parts": [{"text": istem}]}],
             "generationConfig": {"maxOutputTokens": 1200, "temperature": 0.2},
         }
-        endpoint = prov["endpoint"].format(model=prov["model"]) + f"?key={key}"
+        endpoint = prov["endpoint"].format(model=p_model) + f"?key={key}"
         parser   = _parse_gemini_resp
 
     else:
@@ -1685,34 +1762,30 @@ def _handle_pending_key(chat_id: str, key_text: str, msg: dict):
     """Process an API key message during a pending /addapi flow.
 
     Pops the pending entry, validates key, deletes the key message from
-    Telegram (best-effort), and persists the key to config.
+    Telegram (best-effort), and persists the key to config (per-user).
     """
     with _pending_lock:
         entry = _pending_api_key.pop(chat_id, None)
     if entry is None or time.time() > entry["expires"]:
-        return  # expired between check and pop — ignore
+        return
     provider = entry["provider"]
     if not key_text or len(key_text) < 8:
         tg(t("addapi_invalid_key_short"))
         return
     _tg_delete_msg(chat_id, msg.get("message_id"))
-    def _do(c: dict):
-        c.setdefault("api_keys", {})[provider] = key_text
-        # data providers are never set as default LLM provider (J5 + L1)
-        if not c.get("default_provider") and provider not in _DATA_PROVIDERS:
-            c["default_provider"] = provider
-    mutate_cfg(_do)
-    if provider == _FISCAL_AI_PROVIDER:
-        with _fiscal_memo_lock:
-            _fiscal_memo.clear()
-    elif provider == _TWELVE_DATA_PROVIDER:
-        with _twelve_memo_lock:
-            _twelve_memo.clear()
+    _ctx.chat_id = chat_id
+    try:
+        def _do(c: dict):
+            c.setdefault("api_keys", {})[provider] = key_text
+            if not c.get("default_provider"):
+                c["default_provider"] = provider
+        mutate_chat_cfg(_do)
+    finally:
+        _ctx.chat_id = None
     tg(t("addapi_saved", provider=provider, masked_key=_mask_key(key_text)))
     prefix_warn = _validate_provider_key(provider, key_text)
     if prefix_warn:
         tg(prefix_warn)
-    # If wizard's API step is active, prompt to add more or skip (K1)
     if WIZARD.get("step") == "api":
         tg(t("wizard_api_more"))
 
@@ -1888,28 +1961,21 @@ def llm(istem: str, model: str) -> str | None:
 
 # ─── XBRL facts (F1) ─────────────────────────────────────
 
-# Ordered whitelist: (primary_concept, fallback_or_None)
-_XBRL_WHITELIST: list[tuple[str, str | None]] = [
-    ("Revenues",                                   "RevenueFromContractWithCustomerExcludingAssessedTax"),
-    ("GrossProfit",                                None),
-    ("OperatingIncomeLoss",                        None),
-    ("NetIncomeLoss",                              None),
-    ("EarningsPerShareDiluted",                    None),
-    ("CashAndCashEquivalentsAtCarryingValue",      None),
-    ("Assets",                                     None),
-    ("Liabilities",                                None),
-    ("StockholdersEquity",                         None),
+# Concepts used by format_facts_block for ordered display.
+# Names match what edgartools Company Facts API returns.
+_XBRL_DISPLAY_ORDER: list[str] = [
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "GrossProfit",
+    "OperatingIncomeLoss",
+    "NetIncomeLoss",
+    "EarningsPerShareDiluted",
+    "CashAndCashEquivalentsAtCarryingValue",
+    "Assets",
+    "Liabilities",
+    "StockholdersEquity",
 ]
 
-_XBRL_PRIMARY: frozenset[str] = frozenset(p for p, _ in _XBRL_WHITELIST)
-_XBRL_FALLBACK_TO_PRIMARY: dict[str, str] = {
-    fb: p for p, fb in _XBRL_WHITELIST if fb
-}
-_XBRL_ALL_CONCEPTS: frozenset[str] = _XBRL_PRIMARY | frozenset(_XBRL_FALLBACK_TO_PRIMARY)
-# Ordered list of primary concepts for display
-_XBRL_DISPLAY_ORDER: list[str] = [p for p, _ in _XBRL_WHITELIST]
-
-# Forms that carry XBRL attachments (F2: only these trigger fetch_xbrl_facts).
+# Forms that carry XBRL data (trigger facts fetch).
 _XBRL_FORMS: frozenset[str] = frozenset({"10-K", "10-Q", "20-F"})
 
 # Grounding instruction injected into the prompt when XBRL facts are available.
@@ -1919,28 +1985,6 @@ _GROUNDING_INSTRUCTION = (
     "qualitatively or quote the filing text verbatim — never estimate, extrapolate, or "
     "compute new numbers."
 )
-
-
-def _normalize_xbrl_facts(raw_facts: dict) -> dict:
-    """Pure. {concept: [(value, unit, period_end, period_type, duration_days), ...]}
-    → {concept: (value, unit, period_end)}.
-
-    Per concept: selects the entry with the most-recent period_end; ties broken by
-    shortest duration_days (= current quarter/annual vs. cumulative YTD).
-    """
-    result: dict[str, tuple] = {}
-    for concept, entries in raw_facts.items():
-        if not entries:
-            continue
-        # ISO-format dates compare lexicographically; sort ascending so [-1] = latest.
-        sorted_entries = sorted(entries, key=lambda e: (e[2] or "", e[4]))
-        latest_end = sorted_entries[-1][2]
-        # Among entries sharing the latest period_end, prefer the shortest duration.
-        candidates = [e for e in sorted_entries if e[2] == latest_end]
-        best = min(candidates, key=lambda e: e[4])
-        val, unit, period_end, _ptype, _dur = best
-        result[concept] = (val, unit, period_end)
-    return result
 
 
 def _fmt_xbrl_value(concept: str, value: float, unit: str | None) -> str:
@@ -1975,35 +2019,64 @@ def _fmt_xbrl_value(concept: str, value: float, unit: str | None) -> str:
     return f"{sign}{prefix}{scaled}"
 
 
-def format_facts_block(facts: dict, source: str = "EDGAR XBRL") -> str:
-    """Pure. Normalized {concept: (value, unit, period_end)} → ≤600-char text block.
-    Returns "" when facts is empty.
-    source: label shown in header ("EDGAR XBRL" or "Fiscal AI").
+def format_facts_block(facts: dict) -> str:
+    """Format financial facts for LLM grounding.
+
+    Accepts either:
+      - New format: {"latest": {concept: (val, unit, date)}, "years": {concept: [(fy, val), ...]}}
+      - Legacy format: {concept: (val, unit, date)} — for backward compat
+
+    Returns ≤600-char text block. Empty string when facts is empty.
     """
     if not facts:
         return ""
 
-    # Header date: latest period_end across all facts
-    ends = [v[2] for v in facts.values() if v[2]]
-    header_date = max(ends) if ends else "unknown"
-    if source == "Fiscal AI":
-        header = f"AUDITED FISCAL AI FACTS (period ending {header_date}):"
+    # Unwrap new format
+    if "latest" in facts:
+        latest = facts["latest"]
+        years_data = facts.get("years", {})
     else:
-        header = f"AUDITED XBRL FACTS (period ending {header_date}):"
+        latest = facts
+        years_data = {}
+
+    # Header
+    ends = [v[2] for v in latest.values() if v[2]]
+    header_date = max(ends) if ends else "unknown"
+    header = f"AUDITED XBRL FACTS (period ending {header_date}):"
     lines = [header]
 
-    for concept in _XBRL_DISPLAY_ORDER:
-        if concept not in facts:
-            continue
-        val, unit, _end = facts[concept]
-        if val is None:
-            continue  # zero is valid but None is not
-        lines.append(f"  {concept}: {_fmt_xbrl_value(concept, val, unit)}")
+    SHORT_NAMES = {
+        "RevenueFromContractWithCustomerExcludingAssessedTax": "Revenue",
+    }
 
-    # Derived: gross margin (only if both present and revenue != 0)
-    if "Revenues" in facts and "GrossProfit" in facts:
-        rev = facts["Revenues"][0]
-        gp = facts["GrossProfit"][0]
+    for concept in _XBRL_DISPLAY_ORDER:
+        if concept not in latest:
+            continue
+        val, unit, _end = latest[concept]
+        if val is None:
+            continue
+
+        short = SHORT_NAMES.get(concept, concept)
+
+        # Multi-year line: Revenue: FY2025 $416.2B · FY2024 $391.0B (+6.4%)
+        if concept in years_data and len(years_data[concept]) >= 2:
+            yr_parts = []
+            for fy_label, yr_val in years_data[concept]:
+                yr_parts.append(f"{fy_label} {_fmt_xbrl_value(concept, yr_val, unit)}")
+            # YoY change
+            vals = [v for _, v in years_data[concept]]
+            if len(vals) >= 2 and vals[-2] != 0:
+                yoy = (vals[-1] - vals[-2]) / abs(vals[-2]) * 100
+                yr_parts.append(f"({yoy:+.1f}% YoY)")
+            lines.append(f"  {short}: {' · '.join(yr_parts)}")
+        else:
+            lines.append(f"  {short}: {_fmt_xbrl_value(concept, val, unit)}")
+
+    # Derived: gross margin
+    rev_key = "RevenueFromContractWithCustomerExcludingAssessedTax"
+    if rev_key in latest and "GrossProfit" in latest:
+        rev = latest[rev_key][0]
+        gp = latest["GrossProfit"][0]
         if rev is not None and gp is not None and rev != 0.0:
             margin = gp / rev * 100.0
             lines.append(f"  gross_margin_pct: {margin:.1f}%")
@@ -2014,570 +2087,172 @@ def format_facts_block(facts: dict, source: str = "EDGAR XBRL") -> str:
     return block
 
 
-def fetch_xbrl_facts(filing) -> dict | None:  # type: ignore[type-arg]
-    """Thin IO wrapper. Extracts XBRL whitelist facts from an edgartools Filing.
+def fetch_company_overview(ticker: str) -> str:
+    """Fetch brief company overview via edgartools to_llm_context().
 
-    Returns a normalized facts dict or None on any error/absence.
-    Never raises — any exception is caught and debug-logged so the
-    analysis pipeline continues uninterrupted.
+    Returns a short text block for LLM context, or "" on failure.
     """
     try:
-        # edgartools >=3,<5: filing.xbrl() returns None when no XBRL attached.
-        # v5+: also returns None for XBRLFilingWithNoXbrlData.
-        xbrl = filing.xbrl()
-        if xbrl is None:
-            return None
+        company = get_company(ticker)
+        facts = company.get_facts()
+        ctx = facts.to_llm_context()
+        info = ctx.get("company", {})
+        metrics = ctx.get("key_metrics", {})
+        name = info.get("name", ticker)
+        cik = info.get("cik", "")
+        total_facts = info.get("total_facts", 0)
+        lines = [f"COMPANY OVERVIEW: {name} (CIK: {cik})"]
+        if metrics:
+            for k, v in list(metrics.items())[:5]:
+                lines.append(f"  {k}: {v}")
+        return "\n".join(lines)
+    except Exception as e:
+        log.debug("fetch_company_overview(%s): %s", ticker, e)
+        return ""
 
-        # Raw collection: {concept → [(value, unit, period_end, period_type, dur_days), ...]}
-        raw: dict[str, list[tuple]] = {}
 
-        # Access the internal facts dict; attribute name varies across versions.
-        _facts_iterable: list = []
-        if hasattr(xbrl, "_facts"):
-            _facts_iterable = list(xbrl._facts.items())  # v5 (and likely v4)
-        elif hasattr(xbrl, "facts") and hasattr(xbrl.facts, "get_facts"):
-            # FactsView (edgartools v3): iterate via get_facts()
-            _facts_iterable = [(f.element_id, f) for f in xbrl.facts.get_facts()
-                               if hasattr(f, "element_id")]
-        # If neither worked, _facts_iterable stays empty → returns None gracefully.
+def fetch_facts_context(ticker: str) -> str:
+    """Fetch token-efficient financial context via edgartools to_context().
 
-        for _key, fact in _facts_iterable:
-            # Normalise concept: strip namespace prefix.
-            concept: str = getattr(fact, "element_id", "") or ""
-            if ":" in concept:
-                concept = concept.split(":")[-1]
+    Uses income_statement, balance_sheet, and cashflow_statement with
+    'standard' detail level (~300 tokens each). Returns concatenated
+    context blocks for LLM grounding. Falls back to fetch_company_facts()
+    if to_context() is unavailable.
+    """
+    try:
+        company = get_company(ticker)
+        financials = company.get_financials()
+        if financials is None:
+            return ""
 
-            if concept not in _XBRL_ALL_CONCEPTS:
-                continue
+        parts = []
+        for stmt_name in ["income_statement", "balance_sheet", "cashflow_statement"]:
+            try:
+                stmt = getattr(financials, stmt_name)()
+                if stmt is not None and hasattr(stmt, "to_context"):
+                    ctx = stmt.to_context("standard")
+                    if ctx:
+                        parts.append(ctx)
+            except Exception as e:
+                log.debug("fetch_facts_context %s %s: %s", ticker, stmt_name, e)
 
-            numeric_val: float | None = getattr(fact, "numeric_value", None)
-            if numeric_val is None:
-                continue  # non-numeric fact (text/boolean); zero is kept
+        return "\n\n".join(parts) if parts else ""
 
-            unit: str | None = getattr(fact, "unit_ref", None)
+    except Exception as e:
+        log.debug("fetch_facts_context(%s): %s", ticker, e)
+        return ""
 
-            # Unit filter: keep monetary / EPS units; skip raw share counts.
-            if unit is not None:
-                u_up = unit.upper()
-                if concept == "EarningsPerShareDiluted":
-                    # EPS denominated in USD/shares, pure, or USD — accept all except bare "SHARES"
-                    if u_up == "SHARES":
-                        continue
-                else:
-                    # Monetary: must contain USD or be an ISO4217 currency code.
-                    if "USD" not in u_up and not u_up.startswith("ISO4217:"):
-                        continue
 
-            # Resolve context → period info.
-            ctx_id: str = getattr(fact, "context_ref", "") or ""
-            contexts = getattr(xbrl, "contexts", {}) or {}
-            ctx = contexts.get(ctx_id)
-            if ctx is None:
-                continue
+def fetch_notes_context(ticker: str, focus: str = "") -> str:
+    """Fetch financial notes via edgartools to_context().
 
-            # Skip dimensional (segment) facts — want consolidated totals only.
-            dimensions = getattr(ctx, "dimensions", {}) or {}
-            if dimensions:
-                continue
+    Returns note summaries for LLM context. Use focus='Risk' for 10-K risk factors.
+    """
+    try:
+        company = get_company(ticker)
+        filing = company.get_filings(form="10-K").latest()
+        tenk = filing.obj()
+        notes = tenk.notes
+        if notes is None:
+            return ""
+        if focus:
+            return notes.to_context("minimal")[:800]
+        return notes.to_context("minimal")[:500]
+    except Exception as e:
+        log.debug("fetch_notes_context(%s): %s", ticker, e)
+        return ""
 
-            period: dict = getattr(ctx, "period", {}) or {}
-            period_type: str = period.get("type", "")
 
-            if period_type == "instant":
-                period_end: str = period.get("instant", "") or ""
-                duration_days: int = 0
-            elif period_type == "duration":
-                period_end = period.get("endDate", "") or ""
-                start_str: str = period.get("startDate", "") or ""
-                if period_end and start_str:
+def fetch_company_facts(ticker: str) -> dict | None:
+    """Fetch multi-year financial facts via edgartools Company Facts API.
+
+    Returns a dict with two keys:
+      - "latest": {concept: (value, unit, period_end)} — for verify_numeric_claims
+      - "years": {concept: [(fy_label, value), ...]} — for multi-year display
+
+    Returns None on any error/absence. Never raises.
+    """
+    try:
+        company = get_company(ticker)
+        num_years = 3
+
+        latest: dict[str, tuple] = {}
+        years: dict[str, list] = {}
+
+        def _grab(df, concepts, unit="USD"):
+            fy_cols = [c for c in df.columns if c.startswith("FY")]
+            if not fy_cols:
+                return
+            latest_period = fy_cols[-1]
+            for concept in concepts:
+                if concept not in df.index:
+                    continue
+                # Latest value
+                try:
+                    val = float(df.loc[concept, latest_period])
+                    latest[concept] = (val, unit, latest_period)
+                except (KeyError, ValueError, TypeError):
+                    pass
+                # Multi-year values
+                yr_vals = []
+                for c in fy_cols:
                     try:
-                        dur = datetime.strptime(period_end, "%Y-%m-%d") - \
-                              datetime.strptime(start_str, "%Y-%m-%d")
-                        duration_days = dur.days
-                    except ValueError:
-                        duration_days = 999_999
-                else:
-                    duration_days = 999_999
-            else:
-                continue  # "forever" context — irrelevant
+                        yr_vals.append((c, float(df.loc[concept, c])))
+                    except (KeyError, ValueError, TypeError):
+                        pass
+                if yr_vals:
+                    years[concept] = yr_vals
 
-            if not period_end:
-                continue
-
-            if concept not in raw:
-                raw[concept] = []
-            raw[concept].append((numeric_val, unit, period_end, period_type, duration_days))
-
-        if not raw:
+        # Income statement
+        try:
+            inc = company.income_statement(periods=num_years)
+            inc_df = inc.to_dataframe()
+            # Fallback aliases for revenue concept
+            rev_concepts = [
+                "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "RevenueFromContractWithCustomerIncludingAssessedTax",
+                "Revenues", "SalesRevenueNet",
+            ]
+            rev_key = next((c for c in rev_concepts if c in inc_df.index), None)
+            income_concepts = [rev_key, "GrossProfit", "OperatingIncomeLoss",
+                               "NetIncomeLoss", "EarningsPerShareDiluted"]
+            _grab(inc_df, [c for c in income_concepts if c])
+        except Exception as e:
+            log.debug("fetch_company_facts income_statement: %s", e)
             return None
 
-        normalized = _normalize_xbrl_facts(raw)
+        # Balance sheet
+        try:
+            bs = company.balance_sheet(periods=num_years)
+            _grab(bs.to_dataframe(), [
+                "CashAndCashEquivalentsAtCarryingValue",
+                "Assets", "Liabilities", "StockholdersEquity",
+            ])
+        except Exception as e:
+            log.debug("fetch_company_facts balance_sheet: %s", e)
 
-        # Fallback resolution: if primary absent but fallback present, promote it.
-        for fb_concept, primary_concept in _XBRL_FALLBACK_TO_PRIMARY.items():
-            if primary_concept not in normalized and fb_concept in normalized:
-                normalized[primary_concept] = normalized.pop(fb_concept)
-            elif fb_concept in normalized:
-                del normalized[fb_concept]  # primary already present; drop fallback
+        if not latest:
+            return None
 
-        return normalized if normalized else None
+        return {"latest": latest, "years": years}
 
     except Exception as exc:
-        log.debug("fetch_xbrl_facts: %s", exc)
+        log.debug("fetch_company_facts(%s): %s", ticker, exc)
         return None
 
 
-# ─── Grounding data providers (J5 + L1) ───────────────────
+# ─── EDGAR XBRL grounding (sole data source) ──────────────
+# Fiscal AI and Twelve Data removed — only EDGAR XBRL is used.
+# The _fiscal_memo_lock and _twelve_memo_lock are kept as no-ops
+# for backward compatibility with existing code paths.
 
-_FISCAL_AI_PROVIDER   = "fiscalai"
-_TWELVE_DATA_PROVIDER = "twelvedata"
-# Ordered tuple: auto mode tries providers left-to-right; first with a key wins.
-_DATA_PROVIDERS: tuple[str, ...] = (_FISCAL_AI_PROVIDER, _TWELVE_DATA_PROVIDER)
-
-_FISCAL_AI_BASE       = "https://api.fiscal.ai"
-_TWELVE_DATA_BASE     = "https://api.twelvedata.com"
-_FISCAL_FACTS_MINIMUM = 4       # min concepts for fiscal response to be accepted
-
-# In-memory memo: {(ticker_upper, period_end_YYYY-MM-DD): dict | None}
-_fiscal_memo: dict = {}
-_NEGATIVE_MEMO_TTL = 3600  # seconds — transient API failures expire after 1 hour
-
-
-def _memo_get(memo: dict, key: tuple):
-    """Read from memo cache; return (found: bool, value).
-
-    found=False → cache miss, caller should fetch.
-    found=True, value=None → negative cache hit (within TTL or permanent).
-    found=True, value=dict → successful result (permanent).
-    """
-    if key not in memo:
-        return False, None
-    entry = memo[key]
-    if isinstance(entry, tuple):
-        value, ts = entry
-        if time.time() - ts > _NEGATIVE_MEMO_TTL:
-            memo.pop(key, None)
-            return False, None
-        return True, value
-    return True, entry
-
-
-def _memo_set(memo: dict, key: tuple, value, negative: bool = False):
-    """Write to memo cache. negative=True stores with TTL timestamp."""
-    if negative and value is None:
-        memo[key] = (None, time.time())
-    else:
-        memo[key] = value
-
-# Concept field-name mapping: Fiscal AI key → internal XBRL concept name
-_FISCAL_INCOME_MAP: dict[str, str] = {
-    "revenue":                    "Revenues",
-    "revenues":                   "Revenues",
-    "total_revenue":              "Revenues",
-    "net_revenue":                "Revenues",
-    "gross_profit":               "GrossProfit",
-    "operating_income":           "OperatingIncomeLoss",
-    "operating_income_loss":      "OperatingIncomeLoss",
-    "ebit":                       "OperatingIncomeLoss",
-    "net_income":                 "NetIncomeLoss",
-    "net_income_loss":            "NetIncomeLoss",
-    "diluted_eps":                "EarningsPerShareDiluted",
-    "eps_diluted":                "EarningsPerShareDiluted",
-    "earnings_per_share_diluted": "EarningsPerShareDiluted",
-    "basic_and_diluted_eps":      "EarningsPerShareDiluted",
-}
-_FISCAL_BALANCE_MAP: dict[str, str] = {
-    "cash":                             "CashAndCashEquivalentsAtCarryingValue",
-    "cash_and_equivalents":             "CashAndCashEquivalentsAtCarryingValue",
-    "cash_and_cash_equivalents":        "CashAndCashEquivalentsAtCarryingValue",
-    "cash_equivalents":                 "CashAndCashEquivalentsAtCarryingValue",
-    "total_assets":                     "Assets",
-    "assets":                           "Assets",
-    "total_liabilities":                "Liabilities",
-    "liabilities":                      "Liabilities",
-    "stockholders_equity":              "StockholdersEquity",
-    "shareholders_equity":              "StockholdersEquity",
-    "total_equity":                     "StockholdersEquity",
-    "total_stockholders_equity":        "StockholdersEquity",
-}
-
-
-def _get_fiscal_key() -> str:
-    """Return Fiscal AI API key from config, or '' if not set."""
-    return get_cfg().get("api_keys", {}).get(_FISCAL_AI_PROVIDER, "")
+_fiscal_memo_lock = threading.Lock()  # no-op — kept for compat
+_twelve_memo_lock = threading.Lock()  # no-op — kept for compat
 
 
 def _fiscal_enabled() -> bool:
-    """PURE gate: should Fiscal AI fetch run for this request?
-
-    facts_source == "edgar"             → always False (user forced EDGAR)
-    facts_source == "fiscalai" or "auto" → True iff key present
-    unknown value                       → treat as "auto" (preserves today's
-                                          behaviour) + log warning
-    """
-    src = get_cfg().get("facts_source", "auto")
-    if src == "edgar":
-        return False
-    if src in ("fiscalai", "auto"):
-        return bool(_get_fiscal_key())
-    log.warning(f"_fiscal_enabled: unknown facts_source {src!r}, treating as auto")
-    return bool(_get_fiscal_key())
-
-
-def _parse_fiscal_period(data: list, period_end: str, field_map: dict) -> dict:
-    """PURE: scan data list for an entry with exact period_end match; map fields.
-
-    Returns {internal_concept: float} for matched fields.
-    Returns {} on no match, wrong types, or missing fields.
-    Period date comparison uses only the first 10 chars (YYYY-MM-DD).
-    """
-    if not isinstance(data, list) or not period_end:
-        return {}
-    target = period_end[:10]
-    for record in data:
-        if not isinstance(record, dict):
-            continue
-        rec_end = (record.get("period_end_date") or record.get("date") or
-                   record.get("period_end") or record.get("end_date") or "")
-        if str(rec_end)[:10] != target:
-            continue
-        # Match — extract and convert fields
-        result: dict[str, float] = {}
-        for field, concept in field_map.items():
-            raw = record.get(field)
-            if raw is not None:
-                try:
-                    result[concept] = float(raw)
-                except (TypeError, ValueError):
-                    pass
-        return result
-    return {}
-
-
-def _parse_fiscal_response(income_data, balance_data, period_end: str) -> "dict | None":
-    """PURE: merge income + balance facts for period_end; validate ≥ threshold.
-
-    income_data / balance_data: raw dicts from Fiscal AI (any type safe).
-    Returns normalized {concept: (value, "USD", period_end)} or None.
-    None when < _FISCAL_FACTS_MINIMUM concepts found.
-    """
-    if not period_end:
-        return None
-    inc_list = income_data.get("data") if isinstance(income_data, dict) else None
-    bal_list = balance_data.get("data") if isinstance(balance_data, dict) else None
-    if not isinstance(inc_list, list):
-        inc_list = []
-    if not isinstance(bal_list, list):
-        bal_list = []
-    inc_facts = _parse_fiscal_period(inc_list, period_end, _FISCAL_INCOME_MAP)
-    bal_facts = _parse_fiscal_period(bal_list, period_end, _FISCAL_BALANCE_MAP)
-    merged = {**inc_facts, **bal_facts}
-    if len(merged) < _FISCAL_FACTS_MINIMUM:
-        return None
-    return {concept: (val, "USD", period_end) for concept, val in merged.items()}
-
-
-def _check_fiscal_auth_reminder() -> None:
-    """Send daily warning when Fiscal AI key is rejected (401/403). J5 spam gate."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    if get_cfg().get("fiscal_auth_warned_date", "") == today:
-        return
-    mutate_cfg(lambda c: c.update({"fiscal_auth_warned_date": today}))
-    tg(t("fiscalai_auth_error"))
-
-
-def fetch_fiscal_facts(ticker: str, period_end: str) -> "dict | None":
-    """IO: fetch standardized financials from Fiscal AI for (ticker, period_end).
-
-    Returns normalized facts dict (same 9-concept format as EDGAR XBRL) or None.
-    None on: no key, no period_end, period mismatch, 4xx/5xx, timeout, < 4 concepts.
-    In-memory memo cache: (ticker_upper, period_end) — no persistent file.
-    Max 2 HTTP per unique (ticker, period_end) pair.
-    """
-    if not period_end:
-        return None
-    key = _get_fiscal_key()
-    if not key:
-        return None
-    cache_k = (ticker.upper(), period_end[:10])
-    with _fiscal_memo_lock:
-        found, cached = _memo_get(_fiscal_memo, cache_k)
-        if found:
-            return cached
-
-    headers = {"X-Api-Key": key, "Accept": "application/json"}
-    period_types = "annual,quarterly,semi-annual,ltm,latest"
-    endpoints = [
-        (f"/v1/company/financials/income-statement/standardized"
-         f"?ticker={ticker}&periodType={period_types}", "income"),
-        (f"/v1/company/financials/balance-sheet/standardized"
-         f"?ticker={ticker}&periodType={period_types}", "balance"),
-    ]
-    income_data: "dict | None" = None
-    balance_data: "dict | None" = None
-    for suffix, which in endpoints:
-        url = _FISCAL_AI_BASE + suffix
-        try:
-            r = requests.get(url, headers=headers, timeout=15)
-            if r.status_code in (401, 403):
-                _check_fiscal_auth_reminder()
-                log.debug(f"fetch_fiscal_facts {which}: {r.status_code} — auth fail")
-                with _fiscal_memo_lock:
-                    _memo_set(_fiscal_memo, cache_k, None, negative=True)
-                return None
-            if r.status_code == 404:
-                log.debug(f"fetch_fiscal_facts {which}: 404 {ticker} — not found")
-                with _fiscal_memo_lock:
-                    _memo_set(_fiscal_memo, cache_k, None, negative=True)
-                return None
-            if not r.ok:
-                log.debug(f"fetch_fiscal_facts {which}: {r.status_code} — fallback")
-                with _fiscal_memo_lock:
-                    _memo_set(_fiscal_memo, cache_k, None, negative=True)
-                return None
-            try:
-                body = r.json()
-            except Exception:
-                log.debug(f"fetch_fiscal_facts {which}: JSON parse error")
-                with _fiscal_memo_lock:
-                    _memo_set(_fiscal_memo, cache_k, None, negative=True)
-                return None
-        except Exception as exc:
-            log.debug(f"fetch_fiscal_facts {which}: {exc}")
-            with _fiscal_memo_lock:
-                _memo_set(_fiscal_memo, cache_k, None, negative=True)
-            return None
-        if which == "income":
-            income_data = body
-        else:
-            balance_data = body
-
-    result = _parse_fiscal_response(income_data, balance_data, period_end)
-    with _fiscal_memo_lock:
-        _memo_set(_fiscal_memo, cache_k, result)
-    return result
-
-
-# ─── Twelve Data optional facts source (L1) ────────────────
-
-# In-memory memo: {(ticker_upper, period_end_YYYY-MM-DD): dict | None}
-_twelve_memo: dict = {}
-
-# Concept field-name mapping: Twelve Data key → internal XBRL concept name
-_TWELVE_INCOME_MAP: dict[str, str] = {
-    "revenue":                    "Revenues",
-    "total_revenue":              "Revenues",
-    "net_revenue":                "Revenues",
-    "gross_profit":               "GrossProfit",
-    "operating_income":           "OperatingIncomeLoss",
-    "ebit":                       "OperatingIncomeLoss",
-    "net_income":                 "NetIncomeLoss",
-    "net_income_applicable_to_common_shareholders": "NetIncomeLoss",
-    "diluted_eps":                "EarningsPerShareDiluted",
-    "eps_diluted":                "EarningsPerShareDiluted",
-    "basic_and_diluted_eps":      "EarningsPerShareDiluted",
-}
-_TWELVE_BALANCE_MAP: dict[str, str] = {
-    "cash_and_equivalents":             "CashAndCashEquivalentsAtCarryingValue",
-    "cash_and_cash_equivalents":        "CashAndCashEquivalentsAtCarryingValue",
-    "total_assets":                     "Assets",
-    "total_liabilities":                "Liabilities",
-    "total_equity":                     "StockholdersEquity",
-    "total_stockholders_equity":        "StockholdersEquity",
-    "shareholders_equity":              "StockholdersEquity",
-}
-
-
-def _parse_twelve_response(income_data, balance_data, period_end: str) -> "dict | None":
-    """PURE: merge Twelve Data income + balance for period_end; validate ≥ threshold.
-
-    income_data / balance_data: raw response dicts (any type safe).
-    Twelve Data wraps period lists in {"data": [...]} — each item has "fiscal_date".
-    Returns normalized {concept: (value, "USD", period_end)} or None.
-    None when < _FISCAL_FACTS_MINIMUM concepts found.
-    """
-    if not period_end:
-        return None
-    target = period_end[:10]
-
-    def _extract(raw, field_map: dict) -> dict:
-        if not isinstance(raw, dict):
-            return {}
-        data_list = raw.get("data") if isinstance(raw.get("data"), list) else []
-        for record in data_list:
-            if not isinstance(record, dict):
-                continue
-            fd = str(record.get("fiscal_date") or record.get("date") or "")[:10]
-            if fd != target:
-                continue
-            result: dict[str, float] = {}
-            for field, concept in field_map.items():
-                raw_val = record.get(field)
-                if raw_val is not None:
-                    try:
-                        result[concept] = float(raw_val)
-                    except (TypeError, ValueError):
-                        pass
-            return result
-        return {}
-
-    merged = {**_extract(income_data, _TWELVE_INCOME_MAP),
-              **_extract(balance_data, _TWELVE_BALANCE_MAP)}
-    if len(merged) < _FISCAL_FACTS_MINIMUM:
-        return None
-    return {concept: (val, "USD", period_end) for concept, val in merged.items()}
-
-
-def _check_twelve_auth_reminder() -> None:
-    """Send daily warning when Twelve Data key is rejected (401/403). L1 spam gate."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    if get_cfg().get("twelve_auth_warned_date", "") == today:
-        return
-    mutate_cfg(lambda c: c.update({"twelve_auth_warned_date": today}))
-    tg(t("twelvedata_auth_error"))
-
-
-def fetch_twelvedata_facts(ticker: str, period_end: str,
-                           period_hint: str = "") -> "dict | None":
-    """IO: fetch standardized financials from Twelve Data for (ticker, period_end).
-
-    period_hint: "annual" or "quarterly" — passed as ?period= to halve HTTP calls.
-    Returns normalized facts dict (same 9-concept format as EDGAR XBRL) or None.
-    None on: no key, no period_end, period mismatch, 4xx/5xx, timeout, < 4 concepts.
-    In-memory memo cache: (ticker_upper, period_end) — no persistent file.
-    Max 2 HTTP per unique (ticker, period_end) pair.
-    Auth (401/403): treated as plan-level rejection — daily warning, silent fallback.
-    """
-    if not period_end:
-        return None
-    key = get_cfg().get("api_keys", {}).get(_TWELVE_DATA_PROVIDER, "")
-    if not key:
-        return None
-    cache_k = (ticker.upper(), period_end[:10])
-    with _twelve_memo_lock:
-        found, cached = _memo_get(_twelve_memo, cache_k)
-        if found:
-            return cached
-
-    period_param = period_hint if period_hint in ("annual", "quarterly") else ""
-    endpoints = []
-    for ep in ("income_statement", "balance_sheet"):
-        url = (f"{_TWELVE_DATA_BASE}/{ep}"
-               f"?symbol={ticker}&apikey={key}"
-               + (f"&period={period_param}" if period_param else ""))
-        endpoints.append((url, ep))
-
-    income_data: "dict | None" = None
-    balance_data: "dict | None" = None
-    for url, which in endpoints:
-        try:
-            r = requests.get(url, timeout=15)
-            if r.status_code in (401, 403):
-                _check_twelve_auth_reminder()
-                log.debug(f"fetch_twelvedata_facts {which}: {r.status_code} — auth/plan fail")
-                with _twelve_memo_lock:
-                    _memo_set(_twelve_memo, cache_k, None, negative=True)
-                return None
-            if r.status_code == 404:
-                log.debug(f"fetch_twelvedata_facts {which}: 404 {ticker} — not found")
-                with _twelve_memo_lock:
-                    _memo_set(_twelve_memo, cache_k, None, negative=True)
-                return None
-            if not r.ok:
-                log.debug(f"fetch_twelvedata_facts {which}: {r.status_code} — fallback")
-                with _twelve_memo_lock:
-                    _memo_set(_twelve_memo, cache_k, None, negative=True)
-                return None
-            try:
-                body = r.json()
-            except Exception:
-                log.debug(f"fetch_twelvedata_facts {which}: JSON parse error")
-                with _twelve_memo_lock:
-                    _memo_set(_twelve_memo, cache_k, None, negative=True)
-                return None
-            # Twelve Data returns {"code":4xx,"status":"error"} for plan errors
-            if isinstance(body, dict) and body.get("status") == "error":
-                code = body.get("code", 0)
-                if code in (401, 403, 429) or 400 <= code < 500:
-                    _check_twelve_auth_reminder()
-                    log.debug(f"fetch_twelvedata_facts {which}: API error {code} — auth/plan")
-                    with _twelve_memo_lock:
-                        _memo_set(_twelve_memo, cache_k, None, negative=True)
-                    return None
-                log.debug(f"fetch_twelvedata_facts {which}: API error {code} — fallback")
-                with _twelve_memo_lock:
-                    _memo_set(_twelve_memo, cache_k, None, negative=True)
-                return None
-        except Exception as exc:
-            log.debug(f"fetch_twelvedata_facts {which}: {exc}")
-            with _twelve_memo_lock:
-                _memo_set(_twelve_memo, cache_k, None, negative=True)
-            return None
-        if which == "income_statement":
-            income_data = body
-        else:
-            balance_data = body
-
-    result = _parse_twelve_response(income_data, balance_data, period_end)
-    with _twelve_memo_lock:
-        _memo_set(_twelve_memo, cache_k, result)
-    return result
-
-
-# ─── Data source chain (L1) ────────────────────────────────
-
-def _data_source_chain() -> "list[str]":
-    """PURE: ordered list of data provider names to try for this request.
-
-    "edgar"      → [] (user forced EDGAR; no data-provider HTTP)
-    "fiscalai"   → ["fiscalai"] if key present, else []
-    "twelvedata" → ["twelvedata"] if key present, else []
-    "auto"       → _DATA_PROVIDERS in order, keep only those with keys
-    unknown      → same as "auto" + log.warning
-    """
-    cfg = get_cfg()
-    src = cfg.get("facts_source", "auto")
-    api_keys = cfg.get("api_keys", {})
-
-    if src == "edgar":
-        return []
-    if src in (_FISCAL_AI_PROVIDER, _TWELVE_DATA_PROVIDER):
-        return [src] if api_keys.get(src) else []
-    if src == "auto":
-        return [p for p in _DATA_PROVIDERS if api_keys.get(p)]
-    log.warning(f"_data_source_chain: unknown facts_source {src!r}, treating as auto")
-    return [p for p in _DATA_PROVIDERS if api_keys.get(p)]
-
-
-def _data_source_label() -> str:
-    """PURE: human-readable data source label for /settings.
-
-    Derived from facts_source cfg + which provider keys are present.
-    Examples:
-      edgar                          → "EDGAR"
-      fiscalai  (key)                → "fiscalai ✓ (EDGAR fallback)"
-      fiscalai  (no key)             → "fiscalai (no key → EDGAR)"
-      twelvedata (key)               → "twelvedata ✓ (EDGAR fallback)"
-      twelvedata (no key)            → "twelvedata (no key → EDGAR)"
-      auto (fai key)                 → "auto → fiscalai → EDGAR"
-      auto (td key)                  → "auto → twelvedata → EDGAR"
-      auto (both keys)               → "auto → fiscalai → twelvedata → EDGAR"
-      auto (no keys)                 → "auto → EDGAR"
-    """
-    cfg = get_cfg()
-    src = cfg.get("facts_source", "auto")
-    api_keys = cfg.get("api_keys", {})
-
-    if src == "edgar":
-        return "EDGAR"
-    if src in (_FISCAL_AI_PROVIDER, _TWELVE_DATA_PROVIDER):
-        has_key = bool(api_keys.get(src))
-        return f"{src} ✓ (EDGAR fallback)" if has_key else f"{src} (no key → EDGAR)"
-    # auto or unknown → zincir
-    chain = [p for p in _DATA_PROVIDERS if api_keys.get(p)]
-    if not chain:
-        return "auto → EDGAR"
-    return "auto → " + " → ".join(chain) + " → EDGAR"
+    """Always False — Fiscal AI removed. Kept for call-site compat."""
+    return False
 
 
 # ─── Numeric verification (F3) ────────────────────────────
@@ -2751,6 +2426,21 @@ def verify_numeric_claims(
     return unverified
 
 
+# ─── Markdown cleaning ────────────────────────────────────
+_RE_HTML_TAG = re.compile(r'<[^>]+>')
+_RE_MULTI_BLANK = re.compile(r'\n{3,}')
+
+def _clean_markdown(text: str) -> str:
+    """Strip HTML artifacts from edgartools markdown output.
+
+    Removes <div>, <span>, etc. tags and collapses excessive blank lines.
+    Markdown tables and headers are preserved.
+    """
+    text = _RE_HTML_TAG.sub('', text)
+    text = _RE_MULTI_BLANK.sub('\n\n', text)
+    return text.strip()
+
+
 # ─── Section extraction ───────────────────────────────────
 _SECTION_KEYWORDS = {
     "10-K": ["item 1.", "item 1a.", "item 7.", "item 8."],
@@ -2769,11 +2459,18 @@ _SECTION_KEYWORDS = {
 }
 
 def extract_section(text: str, form: str, max_k: int) -> str:
+    """Extract relevant sections from filing text (plain text or markdown).
+
+    Supports both markdown headers (### Item 1.) and plain text (Item 1.).
+    """
     kw = _SECTION_KEYWORDS.get(form, [])
     if not kw: return text[:max_k]
     lines, active, chars, output = text.split("\n"), False, 0, []
     for line in lines:
-        if any(line.lower().strip().startswith(k) for k in kw): active = True
+        stripped = line.lower().strip()
+        # Match markdown headers (### Item 1.) and plain text (Item 1.)
+        if any(stripped.lstrip("#").strip().startswith(k) for k in kw):
+            active = True
         if active:
             output.append(line); chars += len(line)
             if chars >= max_k: output.append("[text truncated]"); break
@@ -2875,14 +2572,18 @@ PROMPTS["SC 13D"] = PROMPTS["SC 13G"]
 PROMPTS["424B4"]  = PROMPTS["S-1"]
 
 def build_prompt(ticker: str, form: str, date_str: str, body: str,
-                 custom_prompt: str = "", facts_block: str = "") -> str:
+                 custom_prompt: str = "", facts_block: str = "",
+                 company_overview: str = "", notes_context: str = "") -> str:
     header = f"{ticker} — {form} ({date_str})\n\n"
-    # When facts_block is empty the output is byte-identical to the old behaviour.
+    parts = []
+    if company_overview:
+        parts.append(company_overview)
     if facts_block:
-        # FACTS layer comes before body; grounding instruction bridges them.
-        content = facts_block + "\n" + _GROUNDING_INSTRUCTION + "\n\n" + body
-    else:
-        content = body
+        parts.append(facts_block + "\n" + _GROUNDING_INSTRUCTION)
+    if notes_context:
+        parts.append(f"FINANCIAL NOTES:\n{notes_context}")
+    parts.append(body)
+    content = "\n\n".join(parts)
     return header + content + "\n\n" + (custom_prompt or PROMPTS.get(form, _PROMPT_DEFAULT))
 
 # ─── EDGAR Company cache ──────────────────────────────────
@@ -2916,27 +2617,23 @@ def get_company(ticker: str):
 # ═══════════════════════════════════════════════════════════
 
 def _collect_8k_text(filing) -> str:
-    """Collect primary 8-K doc text + EX-99.* attachment bodies.
+    """Collect primary 8-K doc markdown + EX-99.* attachment bodies.
 
-    edgartools API (confirmed from docs):
-      filing.attachments — iterable of attachment objects
-      att.document       — lowercase filename, e.g. "ex-99_1.htm"
-      att.text()         — plain-text content of that attachment
-
+    Uses filing.markdown() for structured tables and headers.
     Falls back to primary-doc-only on AttributeError (old edgartools versions).
     Never raises — caller always gets a string (possibly empty).
     """
     try:
-        primary = filing.text() or ""
+        primary = filing.markdown() or ""
     except Exception as e:
-        log.warning(f"_collect_8k_text: filing.text() failed: {e}")
+        log.warning(f"_collect_8k_text: filing.markdown() failed: {e}")
         return ""
 
     try:
         attachments = filing.attachments
     except AttributeError:
         log.warning("_collect_8k_text: filing.attachments not available — primary doc only")
-        return primary
+        return _clean_markdown(primary)
 
     extra_parts: list = []
     for att in attachments:
@@ -2944,7 +2641,7 @@ def _collect_8k_text(filing) -> str:
             doc_name = att.document or ""
             if not doc_name.lower().startswith("ex-99"):
                 continue
-            att_text = att.text()
+            att_text = att.markdown() or att.text()
             if not att_text:
                 log.warning(f"_collect_8k_text: attachment {doc_name!r} returned empty text — skipping")
                 continue
@@ -2952,7 +2649,7 @@ def _collect_8k_text(filing) -> str:
         except Exception as e:
             log.warning(f"_collect_8k_text: attachment fetch error ({e}) — skipping")
 
-    return primary + "".join(extra_parts)
+    return _clean_markdown(primary + "".join(extra_parts))
 
 
 def fetch_new_filings(ticker: str, forms: list, lookback_days: int,
@@ -2992,9 +2689,9 @@ def fetch_new_filings(ticker: str, forms: list, lookback_days: int,
                     try:
                         result = company.get_filings(form=form).latest(n_latest)
                         if not result: break
-                        items = (list(result) if hasattr(result, "__iter__")
-                                 else [result])
-                        for f in items:
+                        if not isinstance(result, list):
+                            result = [result]
+                        for f in result:
                             d = f.filing_date
                             if hasattr(d, "date"): d = d.date()
                             ds = str(d)
@@ -3005,7 +2702,7 @@ def fetch_new_filings(ticker: str, forms: list, lookback_days: int,
                                 continue
                             if fetch_text:
                                 text = (_collect_8k_text(f) if form == "8-K"
-                                        else f.text())
+                                        else _clean_markdown(f.markdown() or ""))
                                 if not text:
                                     log.warning(f"{ticker} {form} {ds}: text returned empty — skipping filing")
                                     continue
@@ -3013,43 +2710,10 @@ def fetch_new_filings(ticker: str, forms: list, lookback_days: int,
                                     text = text[:max_chars_per]
                             else:
                                 text = None
-                            # F2 + L1: XBRL/data-provider grounding.
-                            # _data_source_chain() returns ordered providers to
-                            # try; first successful facts wins; EDGAR XBRL is
-                            # the unconditional fallback. 8-K/Form 4/etc. skip.
+                            # XBRL grounding via edgartools to_context().
                             facts_block = ""
                             if fetch_text and form in _XBRL_FORMS:
-                                # Derive period_end: prefer period_of_report
-                                _por = getattr(f, "period_of_report", None)
-                                if _por and hasattr(_por, "isoformat"):
-                                    _por = _por.isoformat()
-                                period_end_str = str(_por)[:10] if _por else ds
-                                _period_hint = (
-                                    "annual" if form in ("10-K", "20-F", "11-K")
-                                    else "quarterly"
-                                )
-                                fiscal_facts = None
-                                _facts_source_name = ""
-                                for _dp in _data_source_chain():
-                                    if _dp == _FISCAL_AI_PROVIDER:
-                                        fiscal_facts = fetch_fiscal_facts(
-                                            ticker, period_end_str)
-                                    elif _dp == _TWELVE_DATA_PROVIDER:
-                                        fiscal_facts = fetch_twelvedata_facts(
-                                            ticker, period_end_str, _period_hint)
-                                    if fiscal_facts is not None:
-                                        _facts_source_name = (
-                                            "Fiscal AI" if _dp == _FISCAL_AI_PROVIDER
-                                            else "Twelve Data"
-                                        )
-                                        break
-                                if fiscal_facts is not None:
-                                    facts_block = format_facts_block(
-                                        fiscal_facts, source=_facts_source_name)
-                                else:
-                                    facts_block = format_facts_block(
-                                        fetch_xbrl_facts(f) or {}
-                                    )
+                                facts_block = fetch_facts_context(ticker)
                             found.append((form, ds, text, facts_block))
                             time.sleep(0.5)
                         break
@@ -3083,7 +2747,7 @@ _COMPARE_PER_SIDE_MAX = 14000
 def analyze_filing(ticker: str, form: str, date_str: str, text: str,
                    max_chars: int, model: str,
                    custom_prompts: dict,
-                   facts_block: str = "") -> tuple[str, str]:
+                   facts_block: str = "") -> tuple[str | None, str | None]:
     """
     IO: call the LLM. Pure with respect to caller state.
 
@@ -3096,7 +2760,9 @@ def analyze_filing(ticker: str, form: str, date_str: str, text: str,
     if not ai_enabled():
         # NO_KEYS: signal caller to deliver raw text; diff skipped (J3)
         return None, None
-    analysis = llm(build_prompt(ticker, form, date_str, body, custom, facts_block), model)
+    overview = fetch_company_overview(ticker) if facts_block else ""
+    notes = fetch_notes_context(ticker) if facts_block and form == "10-K" else ""
+    analysis = llm(build_prompt(ticker, form, date_str, body, custom, facts_block, overview, notes), model)
     diff   = diff_analysis(ticker, form, text, model)
     return analysis, diff
 
@@ -3179,9 +2845,22 @@ def scan_ticker(ticker: str, forms: list,
         tg(t("new_filings_found", ticker=ticker, count=len(found)))
 
     for form, date_str, text, facts_block in found:
+        # DEF 14A: send proxy data directly, skip LLM analysis
+        if form == "DEF 14A":
+            proxy_data = analyze_def14a(ticker)
+            if proxy_data:
+                tg(proxy_data)
+                if save_to_cache:
+                    ob = load_cache()
+                    mark_processed(ob, ticker, form, date_str)
+                    save_cache(ob)
+                time.sleep(5)
+                continue
+            # fallback to LLM if proxy extraction failed
+
         analysis, diff = analyze_filing(
             ticker, form, date_str, text,
-            g_cfg["max_chars"], g_cfg["model"], cfg.get("custom_prompts", {}),
+            g_cfg["max_chars"], cfg["model"], cfg.get("custom_prompts", {}),
             facts_block=facts_block,
         )
         if analysis is None:
@@ -3261,7 +2940,7 @@ def cmd_sec(form_override=None, quiet=False):
     return any_found
 
 def cmd_insider(quiet=False):
-    cfg   = get_cfg()
+    cfg   = get_chat_cfg()
     items = cfg["tickers"]
     if not items:
         if not quiet: tg(t("watchlist_empty"))
@@ -3286,7 +2965,7 @@ def cmd_scanticker(parts: list):
             else: tg(t("unknown_form_skipped", form=f))
         if not forms: tg(t("no_valid_forms")); return
     else:
-        forms = get_cfg()["default_forms"]
+        forms = get_chat_cfg()["default_forms"]
     tg(t("on_demand_scan", ticker=ticker, forms="  ".join(forms)))
     scan_ticker(ticker, forms, False, False, False)
     tg(t("on_demand_complete", ticker=ticker))
@@ -3323,7 +3002,7 @@ def cmd_compare(parts: list):
             tg(t("unknown_form_named", form=" ".join(parts[3:])))
             return
 
-    cfg = get_cfg()
+    cfg = get_chat_cfg()
     tg(t("compare_started", a=ticker_a, b=ticker_b, form=form))
 
     def _fetch_one(tk: str) -> tuple[str, str] | None:
@@ -3352,22 +3031,53 @@ def cmd_compare(parts: list):
     date_b, text_b = res_b
     body_a = extract_section(text_a, form, _COMPARE_PER_SIDE_MAX)
     body_b = extract_section(text_b, form, _COMPARE_PER_SIDE_MAX)
+
+    # Financial metrics comparison via Company Facts API
+    metrics_block = ""
+    try:
+        def _get_metrics(tk):
+            c = Company(tk)
+            f = c.get_facts()
+            return {
+                "Revenue": f.get_revenue(),
+                "Net Income": f.get_net_income(),
+                "Total Assets": f.get_total_assets(),
+            }
+        m_a = _get_metrics(ticker_a)
+        m_b = _get_metrics(ticker_b)
+        lines = [f"📊 *Financial Metrics Comparison*",
+                 f"```",
+                 f"{'Metric':<20s} {ticker_a:>14s} {ticker_b:>14s} {'Delta':>10s}"]
+        for key in m_a:
+            va, vb = m_a[key], m_b[key]
+            if va is not None and vb is not None and vb != 0:
+                delta = (va - vb) / abs(vb) * 100
+                lines.append(f"{key:<20s} ${va/1e9:>12.1f}B ${vb/1e9:>12.1f}B {delta:>+9.1f}%")
+            elif va is not None:
+                lines.append(f"{key:<20s} ${va/1e9:>12.1f}B {'n/a':>14s}")
+        lines.append("```")
+        metrics_block = "\n".join(lines)
+    except Exception as e:
+        log.debug("compare metrics: %s", e)
+
     summary = llm(
         build_compare_prompt(ticker_a, ticker_b, form, body_a, body_b),
         cfg["model"],
     )
     if summary is None:
-        # NO_KEYS: deliver raw text for each side (J3)
         tg(t("no_ai_no_keys"))
         _deliver_raw_text(body_a, ticker_a, form, date_a, "no_ai_no_keys")
         _deliver_raw_text(body_b, ticker_b, form, date_b, "no_ai_no_keys")
         return
-    tg(t("compare_header",
-         a=ticker_a, date_a=date_a,
-         b=ticker_b, date_b=date_b,
-         form=form,
-         sep="─" * 28,
-         summary=summary))
+    result = t("compare_header",
+               a=ticker_a, date_a=date_a,
+               b=ticker_b, date_b=date_b,
+               form=form,
+               sep="─" * 28,
+               summary=summary)
+    if metrics_block:
+        result += f"\n\n{metrics_block}"
+    tg(result)
 
 # ─── Weekly digest ────────────────────────────────────────
 # Telegram classic Markdown reserves: \ _ * ` [
@@ -3387,7 +3097,10 @@ def _md_escape(text: str) -> str:
     return text
 
 def _digest_pnl_summary() -> str:
-    """Compact P&L one-liner for the weekly digest. Empty if no portfolio or no yfinance."""
+    """Compact P&L block for the weekly digest. Empty if no portfolio or no yfinance.
+
+    Shows total P&L plus time-interval deltas: 1W, 6M, YTD, 1Y.
+    """
     if not YF_OK:
         return ""
     cfg = get_chat_cfg()
@@ -3408,15 +3121,31 @@ def _digest_pnl_summary() -> str:
     total_cost = sum(r["qty"] * r["avg_cost"] for r in priced)
     t_emoji = "📈" if total_pnl >= 0 else "📉"
     t_pct = _fmt_pct(total_pnl / total_cost * 100.0 if total_cost != 0 else None)
-    return t("digest_pnl_line",
-             emoji=t_emoji, value=f"${total_val:,.0f}",
-             pnl_usd=f"{total_pnl:+,.0f}", pnl_pct=t_pct)
+    lines = [t("digest_pnl_line",
+               emoji=t_emoji, value=f"${total_val:,.0f}",
+               pnl_usd=f"{total_pnl:+,.0f}", pnl_pct=t_pct)]
+    h = load_portfolio_history()
+    from datetime import date as _date
+    today_str = _date.today().isoformat()
+    h_filtered = {k: v for k, v in h.items() if k != today_str}
+    if h_filtered:
+        ytd_days = (_date.today() - _date(_date.today().year, 1, 1)).days
+        intervals = [
+            ("1W", 7),
+            ("6M", 182),
+            ("YTD", ytd_days),
+            ("1Y", 365),
+        ]
+        delta_parts = []
+        for label, days in intervals:
+            d = _compute_delta(h_filtered, total_val, days)
+            delta_parts.append(f"{label}: {_format_delta(d[0] if d else None, d[1] if d else None)}")
+        lines.append("_" + "  ·  ".join(delta_parts) + "_")
+    return "\n".join(lines)
 
 
 def send_weekly_digest():
     data = get_weekly_log()
-    if not data:
-        log.info(t("digest_no_data")); return
 
     week_start = (datetime.now() - timedelta(days=7)).strftime("%d.%m.%Y")
     today_str      = datetime.now().strftime("%d.%m.%Y")
@@ -3425,32 +3154,36 @@ def send_weekly_digest():
                   start=week_start, end=today_str,
                   count=len(data), sep="─" * 28)]
 
-    by_ticker: dict = {}
-    for entry in data:
-        by_ticker.setdefault(entry["ticker"], []).append(entry)
+    if data:
+        by_ticker: dict = {}
+        for entry in data:
+            by_ticker.setdefault(entry["ticker"], []).append(entry)
 
-    for ticker, entries in by_ticker.items():
-        lines.append(f"\n🏢 *{ticker}*")
-        for k in entries:
-            snippet = _md_escape(k["analiz"][:120].replace("\n", " "))
-            lines.append(f"  • {k['form']} ({k['tarih']}): {snippet}...")
+        for ticker, entries in by_ticker.items():
+            lines.append(f"\n🏢 *{ticker}*")
+            for k in entries:
+                snippet = _md_escape(k["analiz"][:120].replace("\n", " "))
+                lines.append(f"  • {k['form']} ({k['tarih']}): {snippet}...")
+    else:
+        lines.append(t("digest_no_filings"))
 
     pnl_line = _digest_pnl_summary()
     if pnl_line:
         lines.append(f"\n{pnl_line}")
 
     tg("\n".join(lines))
-    clear_weekly_log()
-    log.info("Weekly digest sent, log cleared.")
+    if data:
+        clear_weekly_log()
+    log.info("Weekly digest sent%s.", ", log cleared" if data else "")
 
 def cmd_digest(parts: list) -> str:
     if len(parts) >= 2 and parts[1].lower() == "off":
-        update_cfg(weekly_digest=False)
+        mutate_chat_cfg(lambda c: c.update({"weekly_digest": False}))
         return t("digest_disabled")
     if len(parts) >= 2 and parts[1].lower() == "now":
         send_weekly_digest()
         return t("digest_sent")
-    update_cfg(weekly_digest=True)
+    mutate_chat_cfg(lambda c: c.update({"weekly_digest": True}))
     return t("digest_enabled")
 
 # ─── Custom prompts ───────────────────────────────────────
@@ -3522,24 +3255,48 @@ def cmd_listprompts() -> str:
 
 # ─── Portfolio insider sentiment ──────────────────────────
 def cmd_sentiment():
-    cfg   = get_cfg()
+    cfg   = get_chat_cfg()
     items = cfg["tickers"]
     if not items: tg(t("watchlist_empty")); return
 
     tg(t("sentiment_started"))
 
-    # Reuse fetch_new_filings — pulls last 5 Form 4 filings per ticker,
-    # 30-day window, no cache, suppressed user-facing errors.
     ticker_data = []
     for ticker in items:
-        rows = fetch_new_filings(
-            ticker, ["4"], lookback_days=30,
-            quiet=True,
-            n_latest=5, max_chars_per=3000,
-        )
-        if rows:
-            texts = [text for _, _, text, _ in rows]
-            ticker_data.append((ticker, "\n---\n".join(texts)))
+        try:
+            company = Company(ticker)
+            filings = company.get_filings(form="4").head(5)
+            summaries = []
+            for f in filings:
+                try:
+                    obj = f.obj()
+                    if hasattr(obj, 'get_ownership_summary'):
+                        s = obj.get_ownership_summary()
+                        # Header: name, position, activity, net change
+                        activity = getattr(s, 'primary_activity', '')
+                        net_chg = getattr(s, 'net_change', 0)
+                        net_val = getattr(s, 'net_value', 0)
+                        header = f"{s.insider_name} ({s.position}) — {activity}"
+                        if net_chg:
+                            sign = "+" if net_chg > 0 else ""
+                            header += f" — {sign}{net_chg:,} shares (${net_val:,.0f})"
+                        # Transaction details
+                        txns = []
+                        for tx in (s.transactions or []):
+                            code = getattr(tx, 'code', '?')
+                            shares = getattr(tx, 'shares', 0)
+                            price = getattr(tx, 'price_per_share', 0)
+                            ttype = getattr(tx, 'transaction_type', '?')
+                            txns.append(
+                                f"  {code} — {shares:,} shares @ ${price:.2f} ({ttype})"
+                            )
+                        summaries.append(header + "\n" + "\n".join(txns) if txns else header)
+                except Exception as e:
+                    log.debug(f"sentiment {ticker} filing: {e}")
+            if summaries:
+                ticker_data.append((ticker, "\n---\n".join(summaries)))
+        except Exception as e:
+            log.debug(f"sentiment {ticker}: {e}")
 
     if not ticker_data:
         tg(t("sentiment_no_transactions")); return
@@ -3692,10 +3449,83 @@ def cmd_addticker(parts: list) -> str:
             else: c["tickers"].append(ticker); added.append(ticker)
     mutate_chat_cfg(_add)
     lines = []
-    if added:      lines.append(t("ticker_added",   tickers="  ".join(f"`{x}`" for x in added)))
+    if added:
+        # Validate against EDGAR and show company names
+        validated = []
+        for tk in added:
+            ok, name = validate_ticker_edgar(tk)
+            if ok:
+                validated.append(f"`{tk}` ({name})")
+            else:
+                validated.append(f"`{tk}` ⚠️")
+                invalid.append(tk)
+        # Remove invalid from config
+        if invalid:
+            mutate_chat_cfg(lambda c: [c["tickers"].remove(t) for t in invalid if t in c["tickers"]])
+            added = [t for t in added if t not in invalid]
+        if validated:
+            lines.append(t("ticker_added", tickers="  ".join(validated)))
     if already_in: lines.append(t("ticker_already", tickers="  ".join(f"`{x}`" for x in already_in)))
     if invalid:    lines.append(t("ticker_invalid",  tickers="  ".join(f"`{x}`" for x in invalid)))
     return "\n".join(lines)
+
+
+def cmd_search(parts: list) -> str:
+    """Usage: /search <company name> — search SEC database by company name."""
+    if len(parts) < 2:
+        return t("search_usage")
+    query = " ".join(parts[1:])
+    try:
+        results = find(query)
+        if not results:
+            return t("search_no_results", query=query)
+        lines = [t("search_results", query=query, count=len(results))]
+        count = 0
+        for company in results:
+            if count >= 10:
+                break
+            if company is None:
+                continue
+            tickers = getattr(company, "tickers", [])
+            ticker = tickers[0] if tickers else "?"
+            name = getattr(company, "name", "?")
+            cik = getattr(company, "cik", "?")
+            lines.append(f"  `{ticker}` — {name} (CIK: {cik})")
+            count += 1
+        if len(results) > 10:
+            lines.append(t("search_more", count=len(results) - 10))
+        return "\n".join(lines)
+    except Exception as e:
+        log.debug("search(%s): %s", query, e)
+        return t("search_error", query=query)
+
+
+def cmd_company(parts: list) -> str:
+    """Usage: /company <TICKER> — show company info from EDGAR."""
+    if len(parts) < 2:
+        return t("company_usage")
+    ticker = parts[1].upper().strip()
+    try:
+        company = Company(ticker)
+        tickers = getattr(company, "tickers", [ticker])
+        info = [
+            f"🏢 *{getattr(company, 'name', ticker)}*",
+            f"CIK: `{getattr(company, 'cik', 'N/A')}`",
+            f"Ticker: `{', '.join(tickers) if tickers else 'N/A'}`",
+            f"Industry: {getattr(company, 'industry', 'N/A')}",
+            f"SIC: {getattr(company, 'sic', 'N/A')}",
+        ]
+        shares = getattr(company, "shares_outstanding", None)
+        pfloat = getattr(company, "public_float", None)
+        if shares:
+            info.append(f"Shares Outstanding: {shares:,.0f}")
+        if pfloat:
+            info.append(f"Public Float: ${pfloat:,.0f}")
+        return "\n".join(info)
+    except Exception as e:
+        log.debug("company(%s): %s", ticker, e)
+        return t("company_not_found", ticker=ticker)
+
 
 def cmd_removeticker(parts: list) -> str:
     if len(parts) < 2: return t("removeticker_usage")
@@ -3722,8 +3552,22 @@ def cmd_listtickers() -> str:
 _TICKER_RE = re.compile(r"^[A-Z]{1,6}(?:[.\-][A-Z0-9]{1,3})?$")
 
 def valid_ticker(symbol: str) -> bool:
-    """PURE: True iff symbol looks like a valid US equity ticker."""
+    """PURE: True iff symbol looks like a valid US equity ticker format."""
     return bool(_TICKER_RE.match(symbol))
+
+def validate_ticker_edgar(ticker: str) -> tuple[bool, str]:
+    """Validate ticker against EDGAR database. Returns (ok, company_name).
+
+    Uses edgartools' bundled ticker data (offline) as first check.
+    Falls back to Company() construction (network) for edge cases.
+    """
+    if not valid_ticker(ticker):
+        return False, ""
+    try:
+        company = Company(ticker)
+        return True, getattr(company, "name", ticker)
+    except Exception:
+        return False, ""
 
 # ─── Watchlist groups (E2) ────────────────────────────────
 # Groups are named subsets of tickers, persisted in cfg["groups"].
@@ -3748,7 +3592,7 @@ def cmd_addgroup(parts: list) -> str:
         return t("group_no_valid_tickers", name=name)
     def _add(c):
         c["groups"][name] = sorted(set(valid))
-    mutate_cfg(_add)
+    mutate_chat_cfg(_add)
     lines = [t("group_added", name=name,
                tickers="  ".join(f"`{x}`" for x in sorted(set(valid))))]
     if invalid:
@@ -3766,14 +3610,14 @@ def cmd_removegroup(parts: list) -> str:
             missing["flag"] = True
         else:
             c["groups"].pop(name, None)
-    mutate_cfg(_rm)
+    mutate_chat_cfg(_rm)
     if missing["flag"]:
         return t("group_not_found", name=name)
     return t("group_removed", name=name)
 
 def cmd_listgroups() -> str:
     """Show all defined groups."""
-    groups = get_cfg().get("groups", {})
+    groups = get_chat_cfg().get("groups", {})
     if not groups:
         return t("listgroups_empty")
     lines = [t("listgroups_title", count=len(groups))]
@@ -3788,7 +3632,7 @@ def cmd_scangroup(parts: list):
     if len(parts) < 2:
         tg(t("scangroup_usage")); return
     name = parts[1].strip()
-    cfg = get_cfg()
+    cfg = get_chat_cfg()
     group = cfg.get("groups", {}).get(name)
     if group is None:
         tg(t("group_not_found", name=name)); return
@@ -3818,7 +3662,7 @@ def cmd_scangroup(parts: list):
 
 # ─── Form management ──────────────────────────────────────
 def cmd_listforms() -> str:
-    cfg   = get_cfg(); active = cfg["default_forms"]
+    cfg   = get_chat_cfg(); active = cfg["default_forms"]
     categories = [
         (t("listforms_cat_periodic"),  ["10-K","10-Q","8-K"]),
         (t("listforms_cat_insider"),   ["4","144","SC 13G","SC 13D"]),
@@ -3867,7 +3711,7 @@ def cmd_removeform(parts: list) -> str:
 
 # ─── Settings, status, language ───────────────────────────
 def cmd_settings() -> str:
-    cfg = get_cfg()
+    cfg = get_chat_cfg()
     ticker_list = ""
     if cfg["tickers"]:
         ticker_list = " — `" + "  ".join(cfg["tickers"]) + "`"
@@ -3883,8 +3727,6 @@ def cmd_settings() -> str:
     # Registered LLM provider names (names only, no keys/masks)
     llm_registered = [p for p in _PROVIDERS if api_keys.get(p)]
     registered_providers = ", ".join(llm_registered) if llm_registered else t("label_off")
-    # Data source label via pure helper (L1 — combinatoric states)
-    data_source = _data_source_label()
     return t("settings_block",
              model=cfg['model'],
              lookback=cfg['days_lookback'],
@@ -3898,8 +3740,7 @@ def cmd_settings() -> str:
              digest=t("label_on") if cfg.get('weekly_digest') else t("label_off"),
              prompt_count=len(cfg.get('custom_prompts', {})),
              active_provider=active_provider,
-             registered_providers=registered_providers,
-             data_source=data_source)
+             registered_providers=registered_providers)
 
 def cmd_status() -> str:
     snap = status_snapshot()
@@ -3913,7 +3754,7 @@ def cmd_status() -> str:
         if not iso: return t("label_dash")
         return datetime.fromisoformat(iso).strftime("%d.%m.%Y %H:%M")
 
-    cfg = get_cfg()
+    cfg = get_chat_cfg()
     tg_hata = snap["tg_errors"]
     or_hata = snap["or_errors"]
     return t("status_block",
@@ -3944,7 +3785,7 @@ def cmd_setlang(parts: list) -> str:
 def cmd_setmodel(parts: list) -> str:
     if len(parts) < 2:
         return t("setmodel_usage")
-    update_cfg(model=" ".join(parts[1:]))
+    mutate_chat_cfg(lambda c: c.update({"model": " ".join(parts[1:])}))
     return t("model_set", model=" ".join(parts[1:]))
 
 def cmd_setlookback(parts: list) -> str:
@@ -3979,37 +3820,20 @@ def cmd_setrawmax(parts: list) -> str:
     except ValueError:
         return t("rawmax_invalid")
 
-def cmd_setsource(parts: list) -> str:
-    """Set preferred data source for grounding facts: auto | fiscalai | twelvedata | edgar."""
-    _VALID = ("auto",) + _DATA_PROVIDERS + ("edgar",)
-    cfg = get_cfg()
-    if len(parts) < 2:
-        return t("setsource_current",
-                 source=cfg.get("facts_source", "auto"),
-                 valid=" | ".join(_VALID))
-    val = parts[1].lower()
-    if val not in _VALID:
-        return t("setsource_invalid", valid=" | ".join(_VALID))
-    mutate_cfg(lambda c: c.update({"facts_source": val}))
-    # Warn when a data provider is selected but the key is not present
-    if val in _DATA_PROVIDERS and not cfg.get("api_keys", {}).get(val):
-        return t("setsource_no_key", provider=val)
-    return t("setsource_ok", source=val)
-
 
 def cmd_priceaction(parts: list) -> str:
     """Toggle the E1 price action snippet under each filing analysis."""
     if len(parts) < 2:
-        cur = "on" if get_cfg().get("price_action_enabled", True) else "off"
+        cur = "on" if get_chat_cfg().get("price_action_enabled", True) else "off"
         return t("priceaction_usage", current=cur)
     val = parts[1].lower()
     if val == "off":
-        update_cfg(price_action_enabled=False)
+        mutate_chat_cfg(lambda c: c.update({"price_action_enabled": False}))
         return t("priceaction_disabled")
     if val == "on":
-        update_cfg(price_action_enabled=True)
+        mutate_chat_cfg(lambda c: c.update({"price_action_enabled": True}))
         return t("priceaction_enabled")
-    return t("priceaction_usage", current="on" if get_cfg().get("price_action_enabled", True) else "off")
+    return t("priceaction_usage", current="on" if get_chat_cfg().get("price_action_enabled", True) else "off")
 
 def cmd_setlookforward(parts: list) -> str:
     """Days after filing for price change measurement (1-90)."""
@@ -4034,19 +3858,19 @@ def cmd_setschedule(parts: list) -> str:
         return t("setschedule_usage")
     value = parts[1].lower()
     if value == "off":
-        update_cfg(schedule=None)
+        mutate_chat_cfg(lambda c: c.update({"schedule": None}))
         return t("schedule_disabled")
     sh, sd = _parse_hhmm(value)
     if sh < 0 or not (0 <= sh <= 23 and 0 <= sd <= 59):
         return t("schedule_invalid")
-    update_cfg(schedule=value)
+    mutate_chat_cfg(lambda c: c.update({"schedule": value}))
     return t("schedule_set", time=value)
 
 def cmd_alarm(parts: list) -> str:
     if len(parts) >= 2 and parts[1].lower() == "off":
-        update_cfg(alarm_on=False)
+        mutate_chat_cfg(lambda c: c.update({"alarm_on": False}))
         return t("alarm_disabled")
-    update_cfg(alarm_on=True)
+    mutate_chat_cfg(lambda c: c.update({"alarm_on": True}))
     return t("alarm_enabled")
 
 # ─── Watchwords / EDGAR full-text search (G1) ────────────
@@ -4178,7 +4002,7 @@ def cmd_addword(parts: list) -> str:
             words.append(phrase)
             outcome.append("ok")
 
-    mutate_cfg(_add)
+    mutate_chat_cfg(_add)
     status = outcome[0] if outcome else "ok"
     if status == "dup":
         return t("addword_duplicate", word=_md_escape(phrase))
@@ -4201,7 +4025,7 @@ def cmd_removeword(parts: list) -> str:
         else:
             outcome.append("not_found")
 
-    mutate_cfg(_remove)
+    mutate_chat_cfg(_remove)
     status = outcome[0] if outcome else "not_found"
     if status == "not_found":
         return t("removeword_not_found", word=_md_escape(phrase))
@@ -4209,7 +4033,7 @@ def cmd_removeword(parts: list) -> str:
 
 
 def cmd_listwords() -> str:
-    words = get_cfg().get("watchwords", [])
+    words = get_chat_cfg().get("watchwords", [])
     if not words:
         return t("listwords_empty")
     return t(
@@ -4255,6 +4079,7 @@ def cmd_removechat(parts: list, caller_id: str) -> str:
     def _remove(c: dict):
         c["chat_ids"] = [x for x in c.get("chat_ids", []) if str(x) != rem_id]
     mutate_cfg(_remove)
+    _purge_chat_data(rem_id)
     return t("removechat_confirm", id=rem_id)
 
 
@@ -4683,103 +4508,445 @@ def cmd_pnl() -> str:
     return f"{base}\n{delta_line}"
 
 
+# ─── /sheet — financial statements from EDGAR (Company Facts API) ──
+
+def _sheet_format_val(v: "float | None", abbreviate: bool = True) -> str:
+    """PURE: format a financial value. None → n/a. Large values abbreviated."""
+    if v is None:
+        return "n/a"
+    if abbreviate and abs(v) >= 1_000_000_000:
+        return f"{v / 1_000_000_000:+.2f}B"
+    if abbreviate and abs(v) >= 1_000_000:
+        return f"{v / 1_000_000:+.1f}M"
+    if abbreviate and abs(v) >= 10_000:
+        return f"{v / 1_000:+.1f}K"
+    return f"{v:+,.0f}"
+
+
+def cmd_sheet(parts: list) -> str:
+    """Usage: /sheet TICKER [year_from-year_to] [quarterly|yearly]
+
+    Fetches multi-year financial statements via Company Facts API.
+    Default: last 5 years, yearly.
+    """
+    if len(parts) < 2:
+        return t("sheet_usage")
+    ticker = parts[1].upper().strip()
+
+    now = datetime.now()
+    year_from = now.year - 4
+    year_to = now.year
+    num_years = 5
+
+    for arg in parts[2:]:
+        low = arg.lower().strip()
+        if low in ("quarterly", "q", "çeyreklik", "çeyrek"):
+            num_years = 12  # quarterly: ~3 years
+        elif low in ("yearly", "y", "yıllık", "yıl"):
+            num_years = 5
+        elif "-" in low:
+            try:
+                a, b = low.split("-", 1)
+                year_from = int(a)
+                year_to = int(b)
+                num_years = year_to - year_from + 1
+            except (ValueError, TypeError):
+                pass
+
+    tg(t("sheet_fetching", ticker=ticker))
+
+    try:
+        company = Company(ticker)
+    except Exception as e:
+        log.error(f"sheet {ticker}: Company init failed: {e}")
+        return t("sheet_fetch_failed", ticker=ticker)
+
+    lines = [t("sheet_header", ticker=ticker,
+               period=t("sheet_period_quarterly") if num_years > 5 else t("sheet_period_yearly"))]
+    found_any = False
+    table_lines: list = []
+
+    def _fmt(v):
+        return _sheet_format_val(v) if v is not None else "n/a"
+
+    def _col_filter(df, year_from, year_to):
+        fy_cols = [c for c in df.columns if c.startswith("FY")]
+        filtered = []
+        for c in fy_cols:
+            try:
+                yr = int(c.split()[1])
+                if year_from <= yr <= year_to:
+                    filtered.append(c)
+            except (IndexError, ValueError):
+                pass
+        return filtered
+
+    def _short_hdr(col: str) -> str:
+        parts = col.split()
+        if len(parts) == 3:
+            q = parts[2]
+            yr = parts[1][2:]
+            return f"{q}'{yr}"
+        if len(parts) == 2:
+            return parts[1]
+        return col
+
+    def _section_block(title: str, fy_cols: list, rows: list):
+        """Build a section inside the single code block with aligned columns."""
+        if not fy_cols or not rows:
+            return []
+        short = [_short_hdr(c) for c in fy_cols]
+        W_LBL = max(len(r[0]) for r in rows)
+        W_LBL = max(W_LBL, 7)
+        W_VAL = max(len(r[1].split("  ")[i])
+                    for r in rows for i in range(len(fy_cols)))
+        W_VAL = max(W_VAL, 3)
+        W_HDR = max(len(h) for h in short)
+        col_w = max(W_VAL, W_HDR) + 1
+        header = "Concept".ljust(W_LBL) + "".join(f" {h:>{col_w}s}" for h in short)
+        out = [f"  {title}", header, "-" * len(header)]
+        for label, vals_str in rows:
+            parts = vals_str.split("  ")
+            vals_aligned = "".join(f" {v:>{col_w}s}" for v in parts)
+            out.append(f"{label:<{W_LBL}s}{vals_aligned}")
+        out.append("")
+        return out
+
+    # Income Statement
+    try:
+        inc = company.income_statement(periods=num_years)
+        inc_df = inc.to_dataframe()
+        fy_cols = _col_filter(inc_df, year_from, year_to)
+        if fy_cols:
+            found_any = True
+            is_rows = []
+            for concept in ["RevenueFromContractWithCustomerExcludingAssessedTax",
+                            "GrossProfit", "OperatingIncomeLoss",
+                            "NetIncomeLoss", "EarningsPerShareDiluted"]:
+                if concept in inc_df.index:
+                    vals = "  ".join(_fmt(inc_df.loc[concept, c]) for c in fy_cols)
+                    short = concept.replace("RevenueFromContractWithCustomerExcludingAssessedTax", "Revenue")
+                    is_rows.append((short, vals))
+            table_lines.extend(_section_block("INCOME STATEMENT", fy_cols, is_rows))
+    except Exception as e:
+        log.debug(f"sheet {ticker}: income_statement failed: {e}")
+
+    # Balance Sheet
+    try:
+        bs = company.balance_sheet(periods=num_years)
+        bs_df = bs.to_dataframe()
+        fy_cols = _col_filter(bs_df, year_from, year_to)
+        if fy_cols:
+            found_any = True
+            bs_rows = []
+            for concept in ["CashAndCashEquivalentsAtCarryingValue",
+                            "Assets", "Liabilities", "StockholdersEquity"]:
+                if concept in bs_df.index:
+                    vals = "  ".join(_fmt(bs_df.loc[concept, c]) for c in fy_cols)
+                    bs_rows.append((concept, vals))
+            table_lines.extend(_section_block("BALANCE SHEET", fy_cols, bs_rows))
+    except Exception as e:
+        log.debug(f"sheet {ticker}: balance_sheet failed: {e}")
+
+    # Cash Flow
+    try:
+        cf = company.cashflow_statement(periods=num_years)
+        cf_df = cf.to_dataframe()
+        fy_cols = _col_filter(cf_df, year_from, year_to)
+        if fy_cols:
+            found_any = True
+            cf_rows = []
+            for concept in ["NetCashProvidedByUsedInOperatingActivities",
+                            "NetCashProvidedByUsedInInvestingActivities",
+                            "NetCashProvidedByUsedInFinancingActivities"]:
+                if concept in cf_df.index:
+                    vals = "  ".join(_fmt(cf_df.loc[concept, c]) for c in fy_cols)
+                    short = concept.replace("NetCashProvidedByUsedIn", "Cash:")
+                    cf_rows.append((short, vals))
+            table_lines.extend(_section_block("CASH FLOW", fy_cols, cf_rows))
+    except Exception as e:
+        log.debug(f"sheet {ticker}: cashflow_statement failed: {e}")
+
+    if not found_any:
+        return t("sheet_no_data", ticker=ticker)
+
+    if table_lines:
+        lines.append("```\n" + "\n".join(table_lines) + "```")
+
+    return "\n".join(lines).rstrip()
+
+
+# ─── DEF 14A proxy analysis (edgartools) ───────────────────
+
+def analyze_def14a(ticker: str) -> str | None:
+    """Extract proxy statement data using edgartools. Returns formatted string or None."""
+    try:
+        company = Company(ticker)
+        filings = company.get_filings(form="DEF 14A")
+        if filings is None or len(filings) == 0:
+            return None
+        latest = filings.latest()
+        if latest is None:
+            return None
+        proxy = latest.obj()
+    except Exception as e:
+        log.debug(f"analyze_def14a {ticker}: {e}")
+        return None
+
+    lines = [f"🗳️ *{ticker} — Proxy Statement (DEF 14A)*\n"]
+
+    # CEO / PEO info
+    try:
+        peo_name = getattr(proxy, "peo_name", None)
+        peo_total = getattr(proxy, "peo_total_comp", None)
+        peo_paid = getattr(proxy, "peo_actually_paid_comp", None)
+        if peo_name:
+            lines.append(f"*Principal Executive Officer:* {peo_name}")
+        if peo_total is not None:
+            lines.append(f"*CEO Total Compensation (SCT):* ${peo_total:,.0f}")
+        if peo_paid is not None:
+            lines.append(f"*CEO Compensation Actually Paid:* ${peo_paid:,.0f}")
+        lines.append("")
+    except Exception as e:
+        log.debug(f"analyze_def14a peo: {e}")
+
+    # Executive compensation
+    try:
+        exec_comp = proxy.executive_compensation
+        if exec_comp is not None and hasattr(exec_comp, "to_dataframe"):
+            df = exec_comp.to_dataframe()
+            if df is not None and not df.empty:
+                lines.append("*Executive Compensation:*")
+                for _, row in df.head(10).iterrows():
+                    name = row.get("Name", row.get("name", ""))
+                    comp = row.get("Total", row.get("total", row.get("Total Compensation", None)))
+                    if name:
+                        comp_str = f"${comp:,.0f}" if comp and comp != 0 else "n/a"
+                        lines.append(f"  • {name}: {comp_str}")
+                lines.append("")
+    except Exception as e:
+        log.debug(f"analyze_def14a exec_comp: {e}")
+
+    # Pay vs Performance
+    try:
+        pvp = proxy.pay_vs_performance
+        if pvp is not None and hasattr(pvp, "to_dataframe"):
+            df = pvp.to_dataframe()
+            if df is not None and not df.empty:
+                lines.append("*Pay vs Performance:*")
+                for _, row in df.head(5).iterrows():
+                    year = row.get("Year", row.get("year", ""))
+                    comp = row.get("SummaryCompensationTotal", row.get("compensation", ""))
+                    perf = row.get("NetIncome", row.get("net_income", ""))
+                    if year:
+                        comp_str = f"${comp:,.0f}" if comp else "n/a"
+                        perf_str = f"${perf:,.0f}" if perf else "n/a"
+                        lines.append(f"  {year}: Comp {comp_str} · Net Income {perf_str}")
+                lines.append("")
+    except Exception as e:
+        log.debug(f"analyze_def14a pay_vs_perf: {e}")
+
+    # Company-selected performance measures
+    try:
+        measures = getattr(proxy, "performance_measures", None)
+        selected = getattr(proxy, "company_selected_measure", None)
+        selected_val = getattr(proxy, "company_selected_measure_value", None)
+        if measures:
+            lines.append("*Performance Measures:*")
+            if isinstance(measures, list):
+                for m in measures[:5]:
+                    lines.append(f"  • {m}")
+            else:
+                lines.append(f"  {measures}")
+            if selected:
+                val_str = f" = {selected_val:,.0f}" if selected_val else ""
+                lines.append(f"  *Company Selected:* {selected}{val_str}")
+            lines.append("")
+    except Exception as e:
+        log.debug(f"analyze_def14a perf_measures: {e}")
+
+    # Shareholder returns
+    try:
+        tsr = getattr(proxy, "total_shareholder_return", None)
+        peer_tsr = getattr(proxy, "peer_group_tsr", None)
+        if tsr is not None or peer_tsr is not None:
+            lines.append("*Shareholder Returns:*")
+            if tsr is not None:
+                lines.append(f"  Company TSR: {tsr:.1%}" if isinstance(tsr, float) else f"  Company TSR: {tsr}")
+            if peer_tsr is not None:
+                lines.append(f"  Peer Group TSR: {peer_tsr:.1%}" if isinstance(peer_tsr, float) else f"  Peer Group TSR: {peer_tsr}")
+            lines.append("")
+    except Exception as e:
+        log.debug(f"analyze_def14a tsr: {e}")
+
+    if len(lines) <= 2:
+        return None
+
+    return "\n".join(lines).rstrip()
+
+
+# ─── Filing markdown (full text as .md) ───────────────────
+
+def fetch_filing_markdown(ticker: str, form: str) -> tuple[str, str] | None:
+    """Fetch the latest filing's markdown content via edgartools.
+
+    Returns (filename, markdown_content) or None.
+    """
+    try:
+        company = Company(ticker)
+        filings = company.get_filings(form=form)
+        if filings is None or len(filings) == 0:
+            return None
+        latest = filings.latest()
+        md = latest.markdown()
+        if not md:
+            return None
+        safe_form = form.replace(" ", "_")
+        filename = f"{ticker}_{safe_form}_{latest.date.strftime('%Y-%m-%d')}.md"
+        return filename, md
+    except Exception as e:
+        log.debug(f"fetch_filing_markdown {ticker} {form}: {e}")
+        return None
+
+
+def cmd_fulltext(parts: list) -> str:
+    """Usage: /fulltext TICKER [FORM] — send the latest filing as a .md file."""
+    if len(parts) < 2:
+        return t("fulltext_usage")
+    ticker = parts[1].upper().strip()
+    form = parts[2].upper().strip() if len(parts) >= 3 else "10-K"
+    form = _match_form(form) or form
+
+    result = fetch_filing_markdown(ticker, form)
+    if result is None:
+        return t("fulltext_failed", ticker=ticker, form=form)
+    filename, content = result
+    tg_send_document(filename, content, caption=f"📄 {ticker} {form}")
+    return ""
+
+
+def _should_run_scheduled_scan(cid: str, now: datetime, last_sched_scan: dict) -> bool:
+    """PURE: per-chat gate for scheduled scan. Returns True if the scan should run."""
+    last = last_sched_scan.get(cid, datetime.min)
+    return (now - last).total_seconds() > 90
+
+
 # ─── Background thread ────────────────────────────────────
 def background_thread():
     log.info("Background thread started.")
-    last_alarm_check = datetime.now()
-    # (ISO year, ISO week) of the last digest sent. Using the ISO week — not
-    # the calendar day-of-month — avoids the bug where two consecutive Sundays
-    # land on the same day number (e.g. a non-leap February) and the second
-    # week's digest gets silently skipped.
-    last_digest_yw: tuple = (-1, -1)
-    bg_errors = 0   # consecutive failed iterations
+    last_alarm_check: dict[str, datetime] = {}   # chat_id → last alarm check time
+    last_digest_yw: dict[str, tuple] = {}        # chat_id → (ISO year, ISO week)
+    last_sched_scan: dict[str, datetime] = {}    # chat_id → last scheduled scan time
+    bg_errors = 0
 
     while not _stop_event.is_set():
-        # [H7] Crash guard. An unhandled exception here used to kill the
-        # whole background thread silently: scheduled scans, the hourly
-        # alarm and the weekly digest would stop forever while the bot
-        # still looked alive (polling kept running). Now a failure is
-        # logged with a traceback, the user is told once, and the
-        # scheduler keeps ticking.
         try:
             now = datetime.now()
-            cfg = get_cfg()
+            chat_ids = get_cfg_value("chat_ids", [])
 
-            # Auto schedule
-            schedule_str = cfg.get("schedule")
-            if schedule_str:
-                sh, sd = _parse_hhmm(schedule_str)
-                if sh >= 0 and now.hour == sh and now.minute == sd:
-                    last = last_scan_dt()
-                    if last is None or (now - last).total_seconds() > 90:
-                        log.info(f"Scheduled scan: {schedule_str}")
-                        tg(t("scheduled_scan_starting", time=schedule_str))
-                        cmd_sec(quiet=False)
-                        # J4: opportunistic portfolio snapshot after scheduled scan
-                        if YF_OK:
-                            _bg_cfg = get_cfg()
-                            _bg_lots = _bg_cfg.get("portfolio", [])
-                            if _bg_lots:
-                                _bg_agg = aggregate_positions(_bg_lots)
-                                _bg_prices: dict[str, "float | None"] = {}
-                                for _bg_tk in _bg_agg:
-                                    _bg_prices[_bg_tk] = fetch_last_close(_bg_tk)
-                                    time.sleep(0.5)
-                                maybe_snapshot_portfolio_value(_bg_agg, _bg_prices)
+            for cid in chat_ids:
+                cid = str(cid)
+                try:
+                    # Set reactive context so per-chat config works
+                    _ctx.chat_id = cid
+                    cfg = get_chat_cfg()
 
-            # Hourly alarm — PROBE ONLY. Existence check that does not touch
-            # the cache, the LLM, or weekly_log. The user runs /check manually
-            # after seeing the alert. Prevents the old bug where the alarm
-            # silently processed filings and the subsequent /check returned
-            # "no new filings".
-            if cfg.get("alarm_on"):
-                if (now - last_alarm_check).total_seconds() >= 3600:
-                    log.info("Alarm: hourly probe")
-                    hits = probe_new_filings_for_watchlist()
-                    if hits:
-                        send_alarm_alert(hits)
+                    # Auto schedule — per-user
+                    schedule_str = cfg.get("schedule")
+                    if schedule_str:
+                        sh, sd = _parse_hhmm(schedule_str)
+                        if sh >= 0 and now.hour == sh and now.minute == sd:
+                            if _should_run_scheduled_scan(cid, now, last_sched_scan):
+                                log.info(f"Scheduled scan ({cid}): {schedule_str}")
+                                _tg_to(cid, t("scheduled_scan_starting", time=schedule_str))
+                                # Run scan with this user's tickers/forms
+                                items = cfg.get("tickers", [])
+                                forms = cfg.get("default_forms", DEFAULT_FORMS)
+                                if items:
+                                    for ticker in items:
+                                        scan_ticker(ticker, forms, True, True, quiet=True)
+                                        time.sleep(2)
+                                # Portfolio snapshot
+                                if YF_OK:
+                                    _bg_lots = cfg.get("portfolio", [])
+                                    if _bg_lots:
+                                        _bg_agg = aggregate_positions(_bg_lots)
+                                        _bg_prices: dict[str, "float | None"] = {}
+                                        for _bg_tk in _bg_agg:
+                                            _bg_prices[_bg_tk] = fetch_last_close(_bg_tk)
+                                            time.sleep(0.5)
+                                        maybe_snapshot_portfolio_value(_bg_agg, _bg_prices)
+                                last_sched_scan[cid] = now
 
-                    # Watchword scan — probe-only; no LLM, no cache writes (G1)
-                    words = cfg.get("watchwords", [])
-                    if words:
-                        from_date = (now - timedelta(hours=24)).strftime("%Y-%m-%d")
-                        with _watchword_lock:
-                            ww_state = _read_json(WATCHWORD_SEEN, {})
-                        for phrase in words:
-                            ww_hits = fetch_fts_hits(phrase, from_date)
-                            if ww_hits is None:
-                                time.sleep(1)
-                                continue
-                            new_acc = [h["accession"] for h in ww_hits]
-                            with _watchword_lock:
-                                fresh_acc = _update_watchword_seen(
-                                    ww_state, phrase, new_acc
-                                )
-                                _atomic_write_json(WATCHWORD_SEEN, ww_state)
-                            if fresh_acc:
-                                fresh_set  = set(fresh_acc)
-                                fresh_hits = [h for h in ww_hits
-                                              if h["accession"] in fresh_set]
-                                tg(format_watchword_alert(phrase, fresh_hits))
-                            time.sleep(1)
+                    # Hourly alarm — per-user (probe only)
+                    if cfg.get("alarm_on"):
+                        last_ac = last_alarm_check.get(cid, datetime.min)
+                        if (now - last_ac).total_seconds() >= 3600:
+                            log.info(f"Alarm probe ({cid})")
+                            # Use this user's tickers for probe
+                            user_tickers = cfg.get("tickers", [])
+                            if user_tickers:
+                                hits = []
+                                for tk in user_tickers:
+                                    for form in cfg.get("default_forms", DEFAULT_FORMS):
+                                        rows = fetch_new_filings(
+                                            tk, [form],
+                                            cfg.get("days_lookback", 35),
+                                            load_cache(), True, True,
+                                            n_latest=1, max_chars_per=100,
+                                        )
+                                        if rows:
+                                            hits.append((tk, form, rows[0][1]))
+                                        time.sleep(0.5)
+                                if hits:
+                                    send_alarm_alert(hits)
 
-                    last_alarm_check = now
-                    status_set(last_alarm=now.isoformat())
+                            # Watchword scan — per-user
+                            words = cfg.get("watchwords", [])
+                            if words:
+                                from_date = (now - timedelta(hours=24)).strftime("%Y-%m-%d")
+                                with _watchword_lock:
+                                    ww_state = _read_json(WATCHWORD_SEEN, {})
+                                for phrase in words:
+                                    ww_hits = fetch_fts_hits(phrase, from_date)
+                                    if ww_hits is None:
+                                        time.sleep(1)
+                                        continue
+                                    new_acc = [h["accession"] for h in ww_hits]
+                                    with _watchword_lock:
+                                        fresh_acc = _update_watchword_seen(
+                                            ww_state, phrase, new_acc
+                                        )
+                                        _atomic_write_json(WATCHWORD_SEEN, ww_state)
+                                    if fresh_acc:
+                                        fresh_set  = set(fresh_acc)
+                                        fresh_hits = [h for h in ww_hits
+                                                      if h["accession"] in fresh_set]
+                                        _tg_to(cid, format_watchword_alert(phrase, fresh_hits))
+                                    time.sleep(1)
 
-            # Weekly digest (Sunday 09:00)
-            if cfg.get("weekly_digest"):
-                cur_yw = tuple(now.isocalendar()[:2])   # (ISO year, ISO week)
-                if (now.weekday() == 6 and now.hour == 9
-                        and now.minute == 0 and last_digest_yw != cur_yw):
-                    log.info("Sending weekly digest.")
-                    send_weekly_digest()
-                    last_digest_yw = cur_yw
+                            last_alarm_check[cid] = now
+
+                    # Weekly digest (Sunday 09:00) — per-user
+                    if cfg.get("weekly_digest"):
+                        cur_yw = tuple(now.isocalendar()[:2])
+                        user_last = last_digest_yw.get(cid, (-1, -1))
+                        if (now.weekday() == 6 and now.hour == 9
+                                and now.minute == 0 and user_last != cur_yw):
+                            log.info(f"Sending weekly digest ({cid}).")
+                            send_weekly_digest()
+                            last_digest_yw[cid] = cur_yw
+
+                except Exception as e:
+                    log.error(f"Background error for chat {cid}: {e}")
+                finally:
+                    _ctx.chat_id = None
 
             bg_errors = 0
         except Exception as e:
             bg_errors += 1
             log.exception(f"Background iteration failed ({bg_errors}): {e}")
-            if bg_errors == 1:   # notify once, on the first failure only
+            if bg_errors == 1:
                 try:
                     tg(t("background_error"))
                 except Exception:
@@ -4792,11 +4959,16 @@ def background_thread():
 # ─── First-run wizard ─────────────────────────────────────
 WIZARD: dict = {}
 
+def _tg_to_master(text: str):
+    """Send a message to the master chat only (for startup wizard)."""
+    if _is_valid_chat_id(MASTER_CHAT_ID):
+        _tg_to(str(MASTER_CHAT_ID), text)
+
 def start_wizard():
     """Step 1: language picker. Bilingual until the user picks. Persists wizard_step."""
     WIZARD["step"] = "lang"
     mutate_cfg(lambda c: c.update({"wizard_step": "lang"}))
-    tg(t("wizard_lang_menu"))
+    _tg_to_master(t("wizard_lang_menu"))
 
 def _advance_to_api_step():
     """After language chosen: welcome (in selected lang) + API key menu. Persists step."""
@@ -4806,26 +4978,26 @@ def _advance_to_api_step():
     llm_keys = {p: k for p, k in api_keys.items() if p in _PROVIDERS and k}
     if llm_keys:
         masked = ", ".join(f"`{p}` ({_mask_key(k)})" for p, k in llm_keys.items())
-        tg(t("welcome_bootstrap", master_chat_id=MASTER_CHAT_ID)
+        _tg_to_master(t("welcome_bootstrap", master_chat_id=MASTER_CHAT_ID, version=__version__)
            + "\n\n" + t("wizard_api_existing", masked_providers=masked))
     else:
-        tg(t("welcome_bootstrap", master_chat_id=MASTER_CHAT_ID)
+        _tg_to_master(t("welcome_bootstrap", master_chat_id=MASTER_CHAT_ID, version=__version__)
            + "\n\n" + t("wizard_api_menu"))
 
 def _advance_to_forms_step():
     """Move to forms step. Persists wizard_step."""
     WIZARD["step"] = "forms"
     mutate_cfg(lambda c: c.update({"wizard_step": "forms"}))
-    tg(t("wizard_form_menu"))
+    _tg_to_master(t("wizard_form_menu"))
 
 def _show_wizard_step_menu(step: str):
     """On restart: re-display the menu for the current wizard step."""
     if step == "api":
         _advance_to_api_step()
     elif step == "forms":
-        tg(t("wizard_form_menu"))
+        _tg_to_master(t("wizard_form_menu"))
     elif step == "tickers":
-        tg(t("wizard_ticker_menu"))
+        _tg_to_master(t("wizard_ticker_menu"))
     else:
         start_wizard()
 
@@ -4971,11 +5143,12 @@ def cmd_export():
     tg_send_document(filename, content, t("export_caption", count=len(data)))
 
 def help_msg() -> str:
-    cfg = get_cfg()
+    cfg = get_chat_cfg()
     return t("help_block",
              forms="  ".join(cfg['default_forms']),
              ticker_count=len(cfg['tickers']),
-             language=get_lang())
+             language=get_lang(),
+             version=__version__)
 
 # ─── Update handler (polling and webhook) ─────────────────
 def handle_analyze_callback(cq: dict, token: str, idx: int):
@@ -5019,14 +5192,13 @@ def handle_analyzeall_callback(cq: dict, token: str):
 # ─── Multi-LLM API management commands (J2) ──────────────
 
 def cmd_addapi(parts: list, chat_id: str, msg: dict) -> str:
-    """Admin-only: /addapi <provider> [key] — add or update an API key.
+    """Add or update an API key — saves per-user if chat has its own config.
 
     Two-message form: /addapi openrouter  → prompts for key in next message.
     One-message form: /addapi openrouter sk-or-v1-xxx  → saves immediately.
     Rejected in group chats (members can see message before deletion).
-    fiscalai is a data provider (not LLM) — accepted here but not in /setapi.
     """
-    valid = list(_PROVIDERS.keys()) + list(_DATA_PROVIDERS)
+    valid = list(_PROVIDERS.keys())
     if msg.get("chat", {}).get("type", "private") != "private":
         return t("addapi_group_rejected")
     if len(parts) < 2:
@@ -5040,18 +5212,16 @@ def cmd_addapi(parts: list, chat_id: str, msg: dict) -> str:
         if len(key) < 8:
             return t("addapi_invalid_key_short")
         _tg_delete_msg(chat_id, msg.get("message_id"))
-        def _do(c: dict):
-            c.setdefault("api_keys", {})[provider] = key
-            # data providers are never set as default LLM provider (J5 + L1)
-            if not c.get("default_provider") and provider not in _DATA_PROVIDERS:
-                c["default_provider"] = provider
-        mutate_cfg(_do)
-        if provider == _FISCAL_AI_PROVIDER:
-            with _fiscal_memo_lock:
-                _fiscal_memo.clear()
-        elif provider == _TWELVE_DATA_PROVIDER:
-            with _twelve_memo_lock:
-                _twelve_memo.clear()
+        # Set context so mutate_chat_cfg routes to per-chat config
+        _ctx.chat_id = chat_id
+        try:
+            def _do(c: dict):
+                c.setdefault("api_keys", {})[provider] = key
+                if not c.get("default_provider"):
+                    c["default_provider"] = provider
+            mutate_chat_cfg(_do)
+        finally:
+            _ctx.chat_id = None
         prefix_warn = _validate_provider_key(provider, key)
         saved_msg = t("addapi_saved", provider=provider, masked_key=_mask_key(key))
         return f"{saved_msg}\n{prefix_warn}" if prefix_warn else saved_msg
@@ -5062,8 +5232,8 @@ def cmd_addapi(parts: list, chat_id: str, msg: dict) -> str:
 
 
 def cmd_apis() -> str:
-    """Admin: /apis — list configured LLM providers + data providers (J5)."""
-    cfg = get_cfg()
+    """Admin: /apis — list configured LLM providers."""
+    cfg = get_chat_cfg()
     api_keys = cfg.get("api_keys", {})
     default = cfg.get("default_provider", "")
     rows = []
@@ -5072,13 +5242,6 @@ def cmd_apis() -> str:
         if key:
             star = " ⭐" if prov == default else ""
             rows.append(t("apis_row", provider=prov, masked_key=_mask_key(key), star=star))
-    # Data providers section (J5 + L1)
-    for _dp in _DATA_PROVIDERS:
-        _dp_key = api_keys.get(_dp, "")
-        if _dp_key:
-            rows.append(t("apis_data_row",
-                          provider=_dp,
-                          masked_key=_mask_key(_dp_key)))
     if not rows:
         return t("apis_empty")
     return t("apis_header") + "\n" + "\n".join(rows)
@@ -5089,26 +5252,23 @@ def cmd_setapi(parts: list) -> str:
 
     /setapi openrouter                     → set provider, show model menu
     /setapi openrouter meta-llama/...      → set provider + model inline
-    Data providers (fiscalai, twelvedata) cannot be set as default LLM (L1).
     """
     valid = list(_PROVIDERS.keys())
     if len(parts) < 2:
         return t("setapi_usage", providers=", ".join(valid))
     provider = parts[1].lower()
-    if provider in _DATA_PROVIDERS:
-        return t("setapi_data_provider_rejected", provider=provider)
     if provider not in _PROVIDERS or not _get_provider_key(provider):
         return t("setapi_unknown", provider=provider)
     # If model specified inline, set both provider and model
     if len(parts) >= 3:
         model = " ".join(parts[2:])
-        mutate_cfg(lambda c: c.update({
+        mutate_chat_cfg(lambda c: c.update({
             "default_provider": provider,
             "provider_models": {**c.get("provider_models", {}), provider: model},
         }))
         return t("setapi_done_model", provider=provider, model=model)
     # No model specified — set provider, show model menu
-    mutate_cfg(lambda c: c.update({"default_provider": provider}))
+    mutate_chat_cfg(lambda c: c.update({"default_provider": provider}))
     models = _PROVIDER_MODELS.get(provider, [])
     if not models:
         return t("setapi_done", provider=provider)
@@ -5123,14 +5283,12 @@ def cmd_setapi(parts: list) -> str:
 
 
 def cmd_delapi(parts: list) -> str:
-    """Admin: /delapi <provider> — delete an API key.
-    Accepts data providers (fiscalai, twelvedata) in addition to LLM providers (L1).
-    """
-    all_valid = list(_PROVIDERS.keys()) + list(_DATA_PROVIDERS)
+    """Admin: /delapi <provider> — delete an API key."""
+    all_valid = list(_PROVIDERS.keys())
     if len(parts) < 2:
         return t("delapi_usage", providers=", ".join(all_valid))
     provider = parts[1].lower()
-    cfg = get_cfg()
+    cfg = get_chat_cfg()
     if not cfg.get("api_keys", {}).get(provider):
         return t("delapi_unknown", provider=provider)
     def _do(c: dict):
@@ -5139,13 +5297,7 @@ def cmd_delapi(parts: list) -> str:
         if c.get("default_provider") == provider:
             remaining = [p for p in _PROVIDERS if c.get("api_keys", {}).get(p)]
             c["default_provider"] = remaining[0] if remaining else ""
-    mutate_cfg(_do)
-    if provider == _FISCAL_AI_PROVIDER:
-        with _fiscal_memo_lock:
-            _fiscal_memo.clear()
-    elif provider == _TWELVE_DATA_PROVIDER:
-        with _twelve_memo_lock:
-            _twelve_memo.clear()
+    mutate_chat_cfg(_do)
     return t("delapi_done", provider=provider)
 
 
@@ -5259,18 +5411,21 @@ def _process_update(upd: dict):
             "/setlookback":  (cmd_setlookback,  True,  False),
             "/setchars":     (cmd_setchars,     True,  False),
             "/setrawmax":    (cmd_setrawmax,    True,  False),
-            "/setsource":    (cmd_setsource,    True,  False),
             "/priceaction":  (cmd_priceaction,  True,  False),
             "/setlookforward":(cmd_setlookforward,True, False),
             "/scanticker":   (cmd_scanticker,   True,  False),
             "/compare":      (cmd_compare,      True,  False),
             "/checkprice":   (cmd_checkprice,   True,  False),
             "/checknews":    (cmd_checknews,    True,  False),
+            "/sheet":        (cmd_sheet,        True,  False),
+            "/fulltext":     (cmd_fulltext,     True,  False),
+            "/search":       (cmd_search,       True,  False),
+            "/company":      (cmd_company,      True,  False),
             # Admin-only commands
-            "/addapi":       (cmd_addapi,       True,  True),
-            "/apis":         (cmd_apis,         False, True),
-            "/setapi":       (cmd_setapi,       True,  True),
-            "/delapi":       (cmd_delapi,       True,  True),
+            "/addapi":       (cmd_addapi,       True,  False),
+            "/apis":         (cmd_apis,         False, False),
+            "/setapi":       (cmd_setapi,       True,  False),
+            "/delapi":       (cmd_delapi,       True,  False),
             "/addchat":      (cmd_addchat,      True,  True),
             "/removechat":   (cmd_removechat,   True,  True),
             "/listchats":    (cmd_listchats,    False, True),
@@ -5308,17 +5463,16 @@ def _process_update(upd: dict):
         # Natural-language and keyword triggers (not dict-dispatchable)
         elif text in ["/start", "/help"]:
             tg(help_msg())
-        elif any(s in text for s in ["/sentiment", "sentiment", "sentiment score"]):
+        elif text.startswith("/sentiment"):
             if len(parts) >= 2 and parts[1].lower() == "trend":
                 cmd_sentiment_trend(parts)
             else:
                 cmd_sentiment()
-        elif any(s in text for s in ["check all","scan all","everything","/all"]):
+        elif text == "/all":
             cmd_sec(); cmd_insider()
-        elif any(s in text for s in ["insider","form4","/insider","/form4"]):
+        elif text == "/insider":
             cmd_insider()
-        elif any(s in text for s in ["any news","check","scan","sec",
-                                       "filings","/sec","/check","/scan"]):
+        elif text == "/scan":
             cmd_sec()
     finally:
         _ctx.chat_id = None
@@ -5411,7 +5565,7 @@ def main():
         else:
             start_wizard()
     else:
-        tg(t("bot_active"))
+        tg(t("bot_active", version=__version__))
 
     # Webhook or polling mode
     webhook_url = cfg.get("webhook_url")
