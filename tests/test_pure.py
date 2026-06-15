@@ -628,3 +628,71 @@ class TestSplitMessage:
         # A blank text after stripping → no chunks.
         result = bot._split_message("   \n  \n  ", limit=4000)
         assert result == []
+
+
+# ─── _digest_top_movers ───────────────────────────────────
+class TestDigestTopMovers:
+    def _row(self, ticker, pnl_pct):
+        return {"ticker": ticker, "pnl_pct": pnl_pct, "qty": 10,
+                "avg_cost": 50, "last": 55, "value": 550, "pnl_usd": 50}
+
+    def test_positive_and_negative_mix(self, bot):
+        priced = [
+            self._row("AAPL", 15.0),
+            self._row("MSFT", -8.0),
+            self._row("GOOG", 5.0),
+        ]
+        result = bot._digest_top_movers(priced)
+        assert result is not None
+        best, worst = result
+        assert best["ticker"] == "AAPL"
+        assert worst["ticker"] == "MSFT"
+
+    def test_single_eligible_returns_none(self, bot):
+        priced = [
+            self._row("AAPL", 10.0),
+            {"ticker": "MSFT", "pnl_pct": None, "qty": 5,
+             "avg_cost": 0, "last": 100, "value": 500, "pnl_usd": 500},
+        ]
+        assert bot._digest_top_movers(priced) is None
+
+    def test_all_none_pct_returns_none(self, bot):
+        priced = [
+            {"ticker": "A", "pnl_pct": None, "qty": 1, "avg_cost": 0,
+             "last": 10, "value": 10, "pnl_usd": 10},
+            {"ticker": "B", "pnl_pct": None, "qty": 1, "avg_cost": 0,
+             "last": 20, "value": 20, "pnl_usd": 20},
+        ]
+        assert bot._digest_top_movers(priced) is None
+
+    def test_tie_stable_first_seen(self, bot):
+        priced = [
+            self._row("A", 10.0),
+            self._row("B", 10.0),
+            self._row("C", -5.0),
+        ]
+        result = bot._digest_top_movers(priced)
+        assert result is not None
+        best, worst = result
+        assert best["ticker"] == "A"
+        assert worst["ticker"] == "C"
+
+    def test_all_positive(self, bot):
+        priced = [
+            self._row("A", 5.0),
+            self._row("B", 20.0),
+            self._row("C", 12.0),
+        ]
+        result = bot._digest_top_movers(priced)
+        assert result is not None
+        best, worst = result
+        assert best["ticker"] == "B"
+        assert worst["ticker"] == "A"
+
+    def test_empty_priced_returns_none(self, bot):
+        assert bot._digest_top_movers([]) is None
+
+    def test_same_ticker_best_worst_returns_none(self, bot):
+        """When best and worst are the same ticker (edge), return None."""
+        priced = [self._row("ONLY", 10.0)]
+        assert bot._digest_top_movers(priced) is None

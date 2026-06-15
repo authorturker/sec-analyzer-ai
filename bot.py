@@ -1,5 +1,5 @@
 """
-SEC Analyzer Bot v4.7 — Telegram (multi-language)
+SEC Analyzer Bot v4.8 — Telegram (multi-language)
 
 Single-codebase replacement for bot_en.py + bot_tr.py.
 - i18n: lang/en.json (default) + lang/tr.json, switch with /setlang.
@@ -8,10 +8,10 @@ Single-codebase replacement for bot_en.py + bot_tr.py.
 - 8-K EX-99.* exhibit collection, full network I/O hardening, 327 tests.
 """
 
-__version__ = "4.7"
+__version__ = "4.8"
 
 import copy, csv, os, time, json, logging, hashlib, threading, io, uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from pathlib import Path
 
 import re
@@ -380,7 +380,7 @@ def get_cfg_value(key: str, default=None):
 _CHAT_PER_USER_KEYS = {"tickers", "portfolio", "custom_prompts", "default_forms",
                        "alarm_on", "price_action_enabled", "model",
                        "schedule", "api_keys", "groups", "weekly_digest",
-                       "watchwords"}
+                       "daily_news", "watchwords"}
 _CHAT_DEFAULTS = {
     "tickers": [],
     "portfolio": [],
@@ -393,6 +393,7 @@ _CHAT_DEFAULTS = {
     "api_keys": {},
     "groups": {},
     "weekly_digest": True,
+    "daily_news": False,
     "watchwords": [],
 }
 
@@ -954,6 +955,68 @@ def cmd_checknews(parts: list):
         tg(t("checknews_fetch_error", ticker=ticker)); return
     tg(_format_news_list(ticker, items, count))
 
+# ─── Daily news digest (N2) ─────────────────────────────
+
+def _daily_news_fresh(items: list, today_iso: str, count: int) -> list:
+    """PURE: filter raw yfinance news to today's date, normalized, max count."""
+    result = []
+    for raw in items:
+        n = _news_extract(raw)
+        if n["date"] == today_iso:
+            result.append(n)
+        if len(result) >= count:
+            break
+    return result
+
+def _format_daily_news(news_by_ticker: dict, today_iso: str, per_ticker: int = 3) -> str:
+    """PURE: build daily news digest body from {ticker: raw_items} map.
+
+    Returns '' if no ticker has fresh news today.
+    """
+    sections = []
+    for ticker, raw_items in news_by_ticker.items():
+        fresh = _daily_news_fresh(raw_items or [], today_iso, per_ticker)
+        if fresh:
+            sections.append(t("dailynews_ticker", ticker=ticker))
+            for n in fresh:
+                sections.append(t("dailynews_item",
+                                  title=n["title"], url=n["url"],
+                                  provider=n["provider"], date=n["date"]))
+    if not sections:
+        return ""
+    header = t("dailynews_header", date=today_iso)
+    return header + "\n" + "\n".join(sections)
+
+def send_daily_news() -> bool:
+    """IO: send daily news digest for current chat. Returns True if sent."""
+    if not YF_OK:
+        return False
+    cfg = get_chat_cfg()
+    tickers = cfg.get("tickers", [])
+    if not tickers:
+        return False
+    today_iso = date.today().isoformat()
+    news_by_ticker: dict = {}
+    for tk in tickers:
+        news_by_ticker[tk] = fetch_yfinance_news(tk) or []
+        time.sleep(0.5)
+    body = _format_daily_news(news_by_ticker, today_iso)
+    if body:
+        tg(body)
+        return True
+    return False
+
+def cmd_dailynews(parts: list) -> str:
+    """Usage: /dailynews [on|off|now]"""
+    if len(parts) >= 2 and parts[1].lower() == "off":
+        mutate_chat_cfg(lambda c: c.update({"daily_news": False}))
+        return t("dailynews_disabled")
+    if len(parts) >= 2 and parts[1].lower() == "now":
+        sent = send_daily_news()
+        return t("dailynews_sent") if sent else t("dailynews_none")
+    mutate_chat_cfg(lambda c: c.update({"daily_news": True}))
+    return t("dailynews_enabled")
+
 # ─── Sentiment history (E3) ───────────────────────────────
 # Layout: {"AAPL": [{"date": "YYYY-MM-DD", "label": "bullish|bearish|neutral|unknown",
 #                    "emoji": "📈", "raw": "<full signal line>"}], ...}
@@ -1229,6 +1292,7 @@ _BOT_COMMANDS = [
     ("sentiment",    "cmd_desc_sentiment"),
     ("checkprice",   "cmd_desc_checkprice"),
     ("checknews",    "cmd_desc_checknews"),
+    ("dailynews",    "cmd_desc_dailynews"),
     ("sheet",        "cmd_desc_sheet"),
     ("fulltext",     "cmd_desc_fulltext"),
     ("search",       "cmd_desc_search"),
@@ -3124,6 +3188,12 @@ def _digest_pnl_summary() -> str:
     lines = [t("digest_pnl_line",
                emoji=t_emoji, value=f"${total_val:,.0f}",
                pnl_usd=f"{total_pnl:+,.0f}", pnl_pct=t_pct)]
+    mv = _digest_top_movers(priced)
+    if mv:
+        best, worst = mv
+        lines.append(t("digest_movers_line",
+            up=best["ticker"], up_pct=_fmt_pct(best["pnl_pct"]),
+            down=worst["ticker"], down_pct=_fmt_pct(worst["pnl_pct"])))
     h = load_portfolio_history()
     from datetime import date as _date
     today_str = _date.today().isoformat()
@@ -3934,6 +4004,16 @@ def _parse_fts_hits(payload: dict) -> list[dict]:
     return hits
 
 
+def _watchword_analyzable_hits(hits: list) -> list:
+    """PURE: map watchword hits to alarm-compatible (ticker, form, date) tuples.
+
+    Only includes hits where ticker_or_cik passes valid_ticker().
+    Capped at 5 to match the display cap in format_watchword_alert.
+    """
+    return [(h["ticker_or_cik"], h["form"], h["date"])
+            for h in hits if valid_ticker(h["ticker_or_cik"])][:5]
+
+
 def format_watchword_alert(word: str, hits: list) -> str:
     """PURE: Markdown alert for watchword matches (max 5 hits + overflow line)."""
     cap     = 5
@@ -4201,6 +4281,22 @@ def _fmt_value(v: "float | None") -> str:
     if v is None:
         return "n/a"
     return f"${int(round(v)):,}"
+
+
+def _digest_top_movers(priced: list) -> "tuple | None":
+    """PURE: return (best_row, worst_row) by pnl_pct, or None.
+
+    Best = highest pnl_pct, worst = lowest. Requires ≥2 eligible rows
+    (pnl_pct is not None) with distinct tickers.
+    """
+    eligible = [r for r in priced if r["pnl_pct"] is not None]
+    if len(eligible) < 2:
+        return None
+    best = max(eligible, key=lambda r: r["pnl_pct"])
+    worst = min(eligible, key=lambda r: r["pnl_pct"])
+    if best["ticker"] == worst["ticker"]:
+        return None
+    return best, worst
 
 
 def _fmt_pct(pct: "float | None") -> str:
@@ -4837,6 +4933,7 @@ def background_thread():
     last_alarm_check: dict[str, datetime] = {}   # chat_id → last alarm check time
     last_digest_yw: dict[str, tuple] = {}        # chat_id → (ISO year, ISO week)
     last_sched_scan: dict[str, datetime] = {}    # chat_id → last scheduled scan time
+    last_dailynews: dict[str, str] = {}          # chat_id → last daily news date (ISO)
     bg_errors = 0
 
     while not _stop_event.is_set():
@@ -4922,7 +5019,14 @@ def background_thread():
                                         fresh_set  = set(fresh_acc)
                                         fresh_hits = [h for h in ww_hits
                                                       if h["accession"] in fresh_set]
-                                        _tg_to(cid, format_watchword_alert(phrase, fresh_hits))
+                                        text = format_watchword_alert(phrase, fresh_hits)
+                                        analyzable = _watchword_analyzable_hits(fresh_hits)
+                                        if analyzable:
+                                            token = register_alarm_hits(analyzable)
+                                            _tg_with_keyboard_to(cid, text,
+                                                build_alarm_keyboard(token, analyzable, set()))
+                                        else:
+                                            _tg_to(cid, text)
                                     time.sleep(1)
 
                             last_alarm_check[cid] = now
@@ -4936,6 +5040,14 @@ def background_thread():
                             log.info(f"Sending weekly digest ({cid}).")
                             send_weekly_digest()
                             last_digest_yw[cid] = cur_yw
+
+                    # Daily news (N2) — per-user, 08:00
+                    if cfg.get("daily_news"):
+                        today_iso = now.date().isoformat()
+                        if now.hour == 8 and now.minute == 0 and last_dailynews.get(cid) != today_iso:
+                            log.info(f"Sending daily news ({cid}).")
+                            send_daily_news()
+                            last_dailynews[cid] = today_iso
 
                 except Exception as e:
                     log.error(f"Background error for chat {cid}: {e}")
@@ -5455,6 +5567,9 @@ def _process_update(upd: dict):
             cmd_scangroup(parts)
         elif komut == "/digest":
             r = cmd_digest(parts)
+            if r: tg(r)
+        elif komut == "/dailynews":
+            r = cmd_dailynews(parts)
             if r: tg(r)
         elif komut == "/report":
             cmd_report()

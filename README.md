@@ -450,10 +450,10 @@ python -m pytest tests/ -q
 ```
 
 ```
-749 passed, 6 skipped in <3s
+783 passed, 6 skipped in <3s
 ```
 
-The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, `_portfolio_history_delta`, `_pnl_table`, `_fmt_qty_col`, `_should_run_scheduled_scan`), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the per-chat config lock-discipline (TOCTOU flip, single-acquire proof), the chat-data purge (`_purge_chat_data` idempotency, re-add freshness), the per-chat scheduled-scan dedup (multi-chat gate, 90s boundary), the version label single-source (render correctness, placeholder leak), the multi-LLM provider abstraction (provider chain, key masking, retry logic), the No-AI mode (raw text delivery, short-circuit, daily reminder gate), the portfolio-history delta helpers, the command surface inventory (dispatcher↔help parity), and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline. The 6 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
+The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, `_portfolio_history_delta`, `_pnl_table`, `_fmt_qty_col`, `_should_run_scheduled_scan`, `_digest_top_movers`, `_daily_news_fresh`, `_format_daily_news`, `_watchword_analyzable_hits`), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the per-chat config lock-discipline (TOCTOU flip, single-acquire proof), the chat-data purge (`_purge_chat_data` idempotency, re-add freshness), the per-chat scheduled-scan dedup (multi-chat gate, 90s boundary), the version label single-source (render correctness, placeholder leak), the multi-LLM provider abstraction (provider chain, key masking, retry logic), the No-AI mode (raw text delivery, short-circuit, daily reminder gate), the portfolio-history delta helpers, the command surface inventory (dispatcher↔help parity), and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline. The 6 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
 
 ---
 
@@ -486,6 +486,13 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 ---
 
 ## 📝 Release Notes
+
+### v4.8
+
+- **Digest top-movers line** — weekly digest P&L now includes best/worst performing position (% basis) derived from existing `priced` data; no extra IO.
+- **`/dailynews on/off`** — daily (08:00) news feed for watchlist tickers; independent per-chat toggle; reuses existing yfinance news layer.
+- **Watchword analyze button** — EFTS watchword alerts now include inline "analyze" buttons for valid-ticker hits; reuses existing alarm button infrastructure; CIK/adsh-only hits shown as text without buttons.
+- **Test count:** 783 passing, 6 skipped (789 collected).
 
 ### v4.7
 
