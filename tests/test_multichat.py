@@ -158,7 +158,7 @@ class TestBroadcastIsolation:
         bot._cfg_cache = None
 
         received = []
-        monkeypatch.setattr(bot, "_tg_to", lambda cid, text: received.append(cid))
+        monkeypatch.setattr(bot, "_tg_to", lambda cid, text, **kw: received.append(cid))
         bot.broadcast("hello")
 
         assert received == ["111", "222", "333"]
@@ -174,7 +174,7 @@ class TestBroadcastIsolation:
         bot._cfg_cache = None
 
         received = []
-        def _mock_tg_to(cid, text):
+        def _mock_tg_to(cid, text, **kw):
             if cid == "222":
                 raise RuntimeError("bot blocked")
             received.append(cid)
@@ -192,7 +192,7 @@ class TestBroadcastIsolation:
         bot._cfg_cache = None
 
         calls = []
-        monkeypatch.setattr(bot, "_tg_to", lambda cid, text: calls.append(cid))
+        monkeypatch.setattr(bot, "_tg_to", lambda cid, text, **kw: calls.append(cid))
         bot.broadcast("hello")
         assert calls == []
 
@@ -209,7 +209,7 @@ class TestTgContextRouting:
         bot._cfg_cache = None
 
         sent = []
-        monkeypatch.setattr(bot, "_tg_to", lambda cid, text: sent.append(cid))
+        monkeypatch.setattr(bot, "_tg_to", lambda cid, text, **kw: sent.append(cid))
 
         bot._ctx.chat_id = "111"
         try:
@@ -228,7 +228,7 @@ class TestTgContextRouting:
         bot._cfg_cache = None
 
         sent = []
-        monkeypatch.setattr(bot, "_tg_to", lambda cid, text: sent.append(cid))
+        monkeypatch.setattr(bot, "_tg_to", lambda cid, text, **kw: sent.append(cid))
         bot._ctx.chat_id = None
         bot.tg("hello")
 

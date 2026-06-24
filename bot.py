@@ -1,5 +1,5 @@
 """
-SEC Analyzer Bot v4.8 — Telegram (multi-language)
+SEC Analyzer Bot v4.9 — Telegram (multi-language)
 
 Single-codebase replacement for bot_en.py + bot_tr.py.
 - i18n: lang/en.json (default) + lang/tr.json, switch with /setlang.
@@ -8,7 +8,7 @@ Single-codebase replacement for bot_en.py + bot_tr.py.
 - 8-K EX-99.* exhibit collection, full network I/O hardening, 327 tests.
 """
 
-__version__ = "4.8"
+__version__ = "4.9"
 
 import copy, csv, os, time, json, logging, hashlib, threading, io, uuid
 from datetime import datetime, timedelta, date
@@ -272,6 +272,7 @@ _CFG_DEFAULTS = {
     "default_provider":       "",   # active LLM provider name (J2)
     "no_keys_warned_date":    "",   # YYYY-MM-DD of last NO_KEYS reminder (J3 spam gate)
     "wizard_step":             "",   # active wizard step: "lang"|"api"|"forms"|"tickers"|"" (K1)
+    "rich_format":            True,   # Bot API 10.1 rich messages (O1); per-chat opt-out via /setrich off
 }
 _cfg_cache: dict | None = None
 
@@ -380,7 +381,7 @@ def get_cfg_value(key: str, default=None):
 _CHAT_PER_USER_KEYS = {"tickers", "portfolio", "custom_prompts", "default_forms",
                        "alarm_on", "price_action_enabled", "model",
                        "schedule", "api_keys", "groups", "weekly_digest",
-                       "daily_news", "watchwords"}
+                       "daily_news", "watchwords", "rich_format"}
 _CHAT_DEFAULTS = {
     "tickers": [],
     "portfolio": [],
@@ -395,6 +396,7 @@ _CHAT_DEFAULTS = {
     "weekly_digest": True,
     "daily_news": False,
     "watchwords": [],
+    "rich_format": True,
 }
 
 def _chat_cfg_path(chat_id: str) -> Path:
@@ -888,6 +890,20 @@ def _format_news_list(ticker: str, items: list, count: int) -> str:
                        provider=n["provider"], date=n["date"]))
     return "\n".join(lines)
 
+def _format_news_list_rich(ticker: str, items: list, count: int) -> str:
+    """PURE: GFM-rich counterpart to _format_news_list for sendRichMessage."""
+    if not items:
+        return ""
+    items = items[:count]
+    lines = [t("checknews_rich_header", ticker=ticker, count=len(items))]
+    for raw in items:
+        n = _news_extract(raw)
+        lines.append(t("checknews_rich_item",
+                       title=n["title"], url=n["url"],
+                       provider=n["provider"], date=n["date"]))
+    return "\n".join(lines)
+
+
 def fetch_yfinance_history(ticker: str, days: int) -> list | None:
     """IO: returns rows sorted ascending or None on failure."""
     if not YF_OK:
@@ -953,7 +969,9 @@ def cmd_checknews(parts: list):
     items = fetch_yfinance_news(ticker)
     if items is None:
         tg(t("checknews_fetch_error", ticker=ticker)); return
-    tg(_format_news_list(ticker, items, count))
+    body = _format_news_list(ticker, items, count)
+    rich = _format_news_list_rich(ticker, items, count)
+    tg(body, rich_md=rich or None)
 
 # ─── Daily news digest (N2) ─────────────────────────────
 
@@ -987,6 +1005,23 @@ def _format_daily_news(news_by_ticker: dict, today_iso: str, per_ticker: int = 3
     header = t("dailynews_header", date=today_iso)
     return header + "\n" + "\n".join(sections)
 
+def _format_daily_news_rich(news_by_ticker: dict, today_iso: str, per_ticker: int = 3) -> str:
+    """PURE: GFM-rich counterpart to _format_daily_news for sendRichMessage."""
+    sections = []
+    for ticker, raw_items in news_by_ticker.items():
+        fresh = _daily_news_fresh(raw_items or [], today_iso, per_ticker)
+        if fresh:
+            sections.append(t("dailynews_rich_ticker", ticker=ticker))
+            for n in fresh:
+                sections.append(t("dailynews_rich_item",
+                                  title=n["title"], url=n["url"],
+                                  provider=n["provider"], date=n["date"]))
+    if not sections:
+        return ""
+    header = t("dailynews_rich_header", date=today_iso)
+    return header + "\n" + "\n".join(sections)
+
+
 def send_daily_news() -> bool:
     """IO: send daily news digest for current chat. Returns True if sent."""
     if not YF_OK:
@@ -1002,7 +1037,8 @@ def send_daily_news() -> bool:
         time.sleep(0.5)
     body = _format_daily_news(news_by_ticker, today_iso)
     if body:
-        tg(body)
+        rich_body = _format_daily_news_rich(news_by_ticker, today_iso)
+        tg(body, rich_md=rich_body or None)
         return True
     return False
 
@@ -1016,6 +1052,25 @@ def cmd_dailynews(parts: list) -> str:
         return t("dailynews_sent") if sent else t("dailynews_none")
     mutate_chat_cfg(lambda c: c.update({"daily_news": True}))
     return t("dailynews_enabled")
+
+def cmd_setrich(parts: list) -> str:
+    """Usage: /setrich [on|off] — toggle rich-message formatting for this chat."""
+    if len(parts) >= 2 and parts[1].lower() == "off":
+        mutate_chat_cfg(lambda c: c.update({"rich_format": False}))
+        return t("rich_disabled")
+    mutate_chat_cfg(lambda c: c.update({"rich_format": True}))
+    return t("rich_enabled")
+
+def cmd_richtest():
+    """Admin/master-gated: send a canonical rich-markdown sample end-to-end so
+    the user can visually confirm rich rendering in their real client. If the
+    rich transport reports failure, reply that rich is unsupported."""
+    cid = getattr(_ctx, "chat_id", None)
+    if not cid or not _is_admin(cid):
+        tg(t("unauthorized_admin"))
+        return
+    if not _tg_send_rich_to(cid, t("rich_test_sample")):
+        tg(t("rich_unsupported"))
 
 # ─── Sentiment history (E3) ───────────────────────────────
 # Layout: {"AAPL": [{"date": "YYYY-MM-DD", "label": "bullish|bearish|neutral|unknown",
@@ -1151,6 +1206,180 @@ def load_prev(ticker: str, form: str) -> str | None:
 _TG = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 _TG_LIMIT = 4000
 
+# ─── Rich message transport (Bot API 10.1 — Wave O / O1) ──
+# Lazy, cached, startup-spam-free capability flag for `sendRichMessage`:
+#   None  = unknown (never attempted yet) — first attempt decides
+#   True  = this process has confirmed rich support
+#   False = this process learned rich is unsupported — never re-attempt
+# Only callers passing an explicit `rich_md` ever exercise the rich path; ALL
+# production callers in O1 pass rich_md=None, so the legacy path is byte-identical.
+_RICH_CAP: bool | None = None
+
+def _classify_rich_error(status: int, body: str) -> str:
+    """PURE: classify a failed sendRichMessage response into a fallback action.
+
+    Returns one of:
+      "unsupported" — the API/method does not exist (404, "method not found",
+                      "unknown method") → cap goes permanently False.
+      "content"     — 400 markdown/parse/content error for THIS message →
+                      fall back for this message only; cap unchanged.
+      "transient"   — 429 / 5xx / network / empty body → retry with backoff.
+    Deterministic; offline-testable with synthetic (status, body).
+    """
+    low = (body or "").lower()
+    if status == 404 or "method not found" in low or "unknown method" in low:
+        return "unsupported"
+    if status == 429 or 500 <= status <= 599:
+        return "transient"
+    if status == 400:
+        return "content"
+    if status == 0 or status is None:
+        return "transient"
+    # Any other 4xx with a content-ish body is treated as a content error;
+    # anything else (unexpected) is transient so we retry rather than give up.
+    return "content" if 400 <= status < 500 else "transient"
+
+def _rich_enabled(chat_id: str) -> bool:
+    """Per-chat gate: that chat's rich_format pref (default True) AND the
+    process-level cap is not known-False (None/unknown still allowed to try)."""
+    if _RICH_CAP is False:
+        return False
+    return bool(get_chat_cfg().get("rich_format", True))
+
+def _tg_send_rich_to(chat_id: str, markdown: str, keyboard: dict | None = None) -> bool:
+    """Transport primitive: POST `markdown` to sendRichMessage. Returns True on
+    success, False on any failure. NEVER raises — the caller decides on fallback.
+
+    Honors the lazy capability flag, classifies failures, retries transient
+    errors with the same 4-attempt/429 logic as _tg_to.
+    """
+    global _RICH_CAP
+    if _RICH_CAP is False:
+        return False
+    payload: dict = {
+        "chat_id": chat_id,
+        "rich_message": {"markdown": markdown},
+        "disable_notification": False,
+    }
+    if keyboard is not None:
+        payload["reply_markup"] = keyboard
+    for attempt in range(4):
+        try:
+            r = requests.post(f"{_TG}/sendRichMessage", json=payload, timeout=15)
+            if 200 <= r.status_code < 300:
+                _RICH_CAP = True
+                status_reset_zero("tg_errors")
+                return True
+            body = ""
+            try:
+                body = r.text or ""
+            except Exception:
+                body = ""
+            kind = _classify_rich_error(r.status_code, body)
+            if kind == "unsupported":
+                _RICH_CAP = False
+                return False
+            if kind == "content":
+                return False
+            # transient — backoff and retry
+            if r.status_code == 429:
+                wait_sec = int(r.headers.get("Retry-After", 5 * (attempt + 1)))
+            else:
+                wait_sec = _backoff(attempt, 3, 60)
+            log.warning(f"sendRichMessage transient ({r.status_code}) — waiting {wait_sec}s")
+            time.sleep(wait_sec)
+        except Exception as e:
+            status_inc("tg_errors")
+            wait_sec = _backoff(attempt, 3, 60)
+            log.error(f"sendRichMessage (attempt {attempt+1}): {e} — waiting {wait_sec}s")
+            time.sleep(wait_sec)
+    return False
+
+_RICH_DRAFT_CAP: bool | None = None
+
+
+def _is_private_chat(chat_id: str) -> bool:
+    """PURE: True if chat_id looks like a private (positive) Telegram chat."""
+    try:
+        return int(chat_id) > 0
+    except (ValueError, TypeError):
+        return False
+
+
+def _thinking_draft_md(ticker: str, form: str) -> str:
+    """PURE: GFM rich-markdown with <tg-thinking> block for sendRichMessageDraft."""
+    return t("filing_thinking_draft", ticker=ticker, form=form)
+
+
+def _tg_send_rich_draft_to(chat_id: str, markdown: str, draft_id: int) -> bool:
+    """Transport primitive: POST to sendRichMessageDraft. Returns True on
+    success, False on failure. NEVER raises — caller decides on fallback.
+
+    Uses _classify_rich_error (shared with _tg_send_rich_to) but writes
+    ONLY to _RICH_DRAFT_CAP — _RICH_CAP is never touched (isolation).
+    """
+    global _RICH_DRAFT_CAP
+    if _RICH_DRAFT_CAP is False:
+        return False
+    payload: dict = {
+        "chat_id": int(chat_id),
+        "draft_id": draft_id,
+        "rich_message": {"markdown": markdown},
+    }
+    for attempt in range(4):
+        try:
+            r = requests.post(f"{_TG}/sendRichMessageDraft", json=payload, timeout=15)
+            if 200 <= r.status_code < 300:
+                _RICH_DRAFT_CAP = True
+                status_reset_zero("tg_errors")
+                return True
+            body = ""
+            try:
+                body = r.text or ""
+            except Exception:
+                body = ""
+            kind = _classify_rich_error(r.status_code, body)
+            if kind == "unsupported":
+                _RICH_DRAFT_CAP = False
+                return False
+            if kind == "content":
+                return False
+            if r.status_code == 429:
+                wait_sec = int(r.headers.get("Retry-After", 5 * (attempt + 1)))
+            else:
+                wait_sec = _backoff(attempt, 3, 60)
+            log.warning(f"sendRichMessageDraft transient ({r.status_code}) — waiting {wait_sec}s")
+            time.sleep(wait_sec)
+        except Exception as e:
+            status_inc("tg_errors")
+            wait_sec = _backoff(attempt, 3, 60)
+            log.error(f"sendRichMessageDraft (attempt {attempt+1}): {e} — waiting {wait_sec}s")
+            time.sleep(wait_sec)
+    return False
+
+
+def _maybe_post_thinking_draft(ticker: str, form: str, quiet: bool) -> bool:
+    """Best-effort: show a <tg-thinking> draft before LLM analysis.
+
+    Returns True if a draft was posted (best-effort; never raises).
+    Gate: quiet=False, _ctx.chat_id set, private-only, _RICH_DRAFT_CAP not False,
+    _rich_enabled.
+    """
+    if quiet:
+        return False
+    cid = getattr(_ctx, "chat_id", None)
+    if not cid:
+        return False
+    if not _is_private_chat(cid):
+        return False
+    if _RICH_DRAFT_CAP is False:
+        return False
+    if not _rich_enabled(cid):
+        return False
+    draft_id = (abs(hash((ticker, form))) % 2_000_000_000) + 1
+    return _tg_send_rich_draft_to(cid, _thinking_draft_md(ticker, form), draft_id)
+
+
 def _split_message(text: str, limit: int = _TG_LIMIT) -> list:
     """PURE: split text into Telegram-safe chunks (≤ limit chars).
 
@@ -1177,8 +1406,16 @@ def _split_message(text: str, limit: int = _TG_LIMIT) -> list:
         parts.append(current)
     return parts
 
-def _tg_to(chat_id: str, text: str):
-    """Primitive: send `text` to one specific Telegram chat (chunked, backoff, Markdown fallback)."""
+def _tg_to(chat_id: str, text: str, rich_md: str | None = None):
+    """Primitive: send `text` to one specific Telegram chat (chunked, backoff, Markdown fallback).
+
+    When `rich_md` is provided AND the chat has rich enabled AND the rich
+    transport succeeds, the message is delivered via sendRichMessage and we
+    return early. When `rich_md is None` (every production caller in O1) the
+    rich path is NOT attempted at all and the legacy path below runs unchanged.
+    """
+    if rich_md is not None and _rich_enabled(chat_id) and _tg_send_rich_to(chat_id, rich_md):
+        return                       # rich delivered → done
     for part in _split_message(text):
         sent = False
         for attempt in range(4):
@@ -1225,16 +1462,16 @@ def _tg_to(chat_id: str, text: str):
                              "message lost. Check network / bot token.\n")
         time.sleep(0.3)
 
-def broadcast(text: str):
+def broadcast(text: str, rich_md: str | None = None):
     """Send `text` to ALL authorized chat_ids (proactive/background messages).
     Each chat's failure is isolated — one blocked bot does not stop the rest."""
     for cid in get_cfg_value("chat_ids", []):
         try:
-            _tg_to(str(cid), text)
+            _tg_to(str(cid), text, rich_md=rich_md)
         except Exception as e:
             log.debug(f"broadcast to {cid}: {e}")
 
-def tg(text: str):
+def tg(text: str, rich_md: str | None = None):
     """Send a Telegram message.
 
     Reactive context (inside handle_update): sends only to the requesting chat.
@@ -1242,9 +1479,9 @@ def tg(text: str):
     """
     cid = getattr(_ctx, "chat_id", None)
     if cid:
-        _tg_to(cid, text)
+        _tg_to(cid, text, rich_md=rich_md)
     else:
-        broadcast(text)
+        broadcast(text, rich_md=rich_md)
 
 def _tg_send_document_to(chat_id: str, filename: str, content: str, caption: str = ""):
     """Primitive: send a document to one specific chat."""
@@ -1293,6 +1530,7 @@ _BOT_COMMANDS = [
     ("checkprice",   "cmd_desc_checkprice"),
     ("checknews",    "cmd_desc_checknews"),
     ("dailynews",    "cmd_desc_dailynews"),
+    ("setrich",      "cmd_desc_setrich"),
     ("sheet",        "cmd_desc_sheet"),
     ("fulltext",     "cmd_desc_fulltext"),
     ("search",       "cmd_desc_search"),
@@ -1335,8 +1573,16 @@ def build_inline_button(raw_key: str) -> dict:
         ]]
     }
 
-def _tg_with_keyboard_to(chat_id: str, text: str, keyboard: dict | None):
-    """Primitive: send a (chunked) message with keyboard to one specific chat."""
+def _tg_with_keyboard_to(chat_id: str, text: str, keyboard: dict | None, rich_md: str | None = None):
+    """Primitive: send a (chunked) message with keyboard to one specific chat.
+
+    When `rich_md` is provided AND the chat has rich enabled AND the rich
+    transport succeeds (keyboard threaded through), we return early. When
+    `rich_md is None` (every production caller in O1) the rich path is NOT
+    attempted and the legacy keyboard path below runs unchanged.
+    """
+    if rich_md is not None and _rich_enabled(chat_id) and _tg_send_rich_to(chat_id, rich_md, keyboard):
+        return                       # rich delivered → done
     parts, current = [], ""
     for line in text.split("\n"):
         if len(current) + len(line) + 1 > 4000:
@@ -1366,19 +1612,19 @@ def _tg_with_keyboard_to(chat_id: str, text: str, keyboard: dict | None):
               on_error=lambda e, a: status_inc("tg_errors"))
         time.sleep(0.3)
 
-def tg_with_keyboard(text: str, keyboard: dict | None):
+def tg_with_keyboard(text: str, keyboard: dict | None, rich_md: str | None = None):
     """Send message+keyboard to the reactive context chat, or broadcast if no context."""
     cid = getattr(_ctx, "chat_id", None)
     chats = [cid] if cid else [str(c) for c in get_cfg_value("chat_ids", [])]
     for chat in chats:
         try:
-            _tg_with_keyboard_to(str(chat), text, keyboard)
+            _tg_with_keyboard_to(str(chat), text, keyboard, rich_md=rich_md)
         except Exception as e:
             log.debug(f"tg_with_keyboard to {chat}: {e}")
 
-def tg_with_button(text: str, raw_key: str):
+def tg_with_button(text: str, raw_key: str, rich_md: str | None = None):
     """Send an analysis message with its inline buttons (view raw + .md)."""
-    tg_with_keyboard(text, build_inline_button(raw_key))
+    tg_with_keyboard(text, build_inline_button(raw_key), rich_md=rich_md)
 
 def tg_edit_markup(chat_id, message_id, keyboard: dict | None):
     """editMessageReplyMarkup — replace, or (keyboard=None) remove, a message's
@@ -2831,6 +3077,41 @@ def analyze_filing(ticker: str, form: str, date_str: str, text: str,
     return analysis, diff
 
 
+def _filing_rich_md(ticker: str, form: str, date_str: str,
+                    analysis: str, diff: str,
+                    price_snippet: str = "",
+                    unverified: list | None = None) -> str:
+    """PURE: GFM-rich counterpart to render_filing_message for sendRichMessage.
+
+    Uses ### header (GFM) instead of *bold* (legacy). Risk-factor diff is
+    wrapped in <details> for collapsibility. Returns '' when content exceeds
+    32768 chars (caller falls back to legacy chunking).
+    """
+    parts = [t("filing_rich_header", ticker=ticker, form=form, date=date_str)]
+    parts.append("")
+    parts.append(analysis)
+    if diff:
+        parts.append("")
+        parts.append(t("filing_rich_risk_header"))
+        parts.append("")
+        summary = t("filing_rich_risk_summary")
+        parts.append(f"<details>\n<summary>{summary}</summary>\n")
+        parts.append(diff)
+        parts.append("\n\n</details>")
+    if unverified:
+        parts.append("")
+        parts.append(t("unverified_figures", items=", ".join(unverified)))
+    if price_snippet:
+        parts.append("")
+        parts.append(price_snippet)
+    parts.append("")
+    parts.append("---")
+    result = "\n".join(parts)
+    if len(result) > 32768:
+        return ""
+    return result
+
+
 def render_filing_message(ticker: str, form: str, date_str: str,
                           analysis: str, diff: str,
                           price_snippet: str = "",
@@ -2874,7 +3155,10 @@ def send_filing_result(ticker: str, form: str, date_str: str, text: str,
         message = render_filing_message(ticker, form, date_str,
                                         analysis, diff, price_snippet,
                                         unverified=unverified)
-        tg_with_button(message, raw_key)
+        rich_full = _filing_rich_md(ticker, form, date_str,
+                                    analysis, diff, price_snippet,
+                                    unverified=unverified)
+        tg_with_button(message, raw_key, rich_md=rich_full or None)
 
     log_weekly(ticker, form, date_str, analysis)
 
@@ -2922,6 +3206,7 @@ def scan_ticker(ticker: str, forms: list,
                 continue
             # fallback to LLM if proxy extraction failed
 
+        _maybe_post_thinking_draft(ticker, form, quiet)
         analysis, diff = analyze_filing(
             ticker, form, date_str, text,
             g_cfg["max_chars"], cfg["model"], cfg.get("custom_prompts", {}),
@@ -3049,6 +3334,80 @@ def build_compare_prompt(ticker_a: str, ticker_b: str, form: str,
         "4. 🎯 Relative attractiveness for an investor"
     )
 
+def _compare_metrics_data(ticker_a: str, ticker_b: str) -> "dict | None":
+    """IO: fetch Company Facts metrics for two tickers. Returns dict or None.
+
+    Returns: {a: str, b: str, rows: [(key, va, vb)]} or None on failure.
+    """
+    try:
+        def _get_metrics(tk):
+            c = Company(tk)
+            f = c.get_facts()
+            return {
+                "Revenue": f.get_revenue(),
+                "Net Income": f.get_net_income(),
+                "Total Assets": f.get_total_assets(),
+            }
+        m_a = _get_metrics(ticker_a)
+        m_b = _get_metrics(ticker_b)
+        rows = []
+        for key in m_a:
+            rows.append((key, m_a[key], m_b[key]))
+        return {"a": ticker_a, "b": ticker_b, "rows": rows}
+    except Exception as e:
+        log.debug("compare metrics: %s", e)
+        return None
+
+
+def _compare_metrics_legacy(d: "dict | None") -> str:
+    """PURE: legacy ASCII-fence metrics block. Byte-identical to old inline code."""
+    if not d:
+        return ""
+    lines = [f"📊 *Financial Metrics Comparison*",
+             f"```",
+             f"{'Metric':<20s} {d['a']:>14s} {d['b']:>14s} {'Delta':>10s}"]
+    for key, va, vb in d["rows"]:
+        if va is not None and vb is not None and vb != 0:
+            delta = (va - vb) / abs(vb) * 100
+            lines.append(f"{key:<20s} ${va/1e9:>12.1f}B ${vb/1e9:>12.1f}B {delta:>+9.1f}%")
+        elif va is not None:
+            lines.append(f"{key:<20s} ${va/1e9:>12.1f}B {'n/a':>14s}")
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def _compare_metrics_rich(d: "dict | None") -> str:
+    """PURE: GFM-native metrics table for sendRichMessage."""
+    if not d:
+        return ""
+    lines = [t("compare_rich_metrics_header", a=d["a"], b=d["b"])]
+    lines.append(f"| Metric | {d['a']} | {d['b']} | Delta |")
+    lines.append("|:--|--:|--:|--:|")
+    for key, va, vb in d["rows"]:
+        if va is not None and vb is not None and vb != 0:
+            delta = (va - vb) / abs(vb) * 100
+            lines.append(f"| {key} | ${va/1e9:.1f}B | ${vb/1e9:.1f}B | {delta:+.1f}% |")
+        elif va is not None:
+            lines.append(f"| {key} | ${va/1e9:.1f}B | n/a | n/a |")
+    return "\n".join(lines)
+
+
+def _compare_rich_md(ticker_a: str, date_a: str, ticker_b: str, date_b: str,
+                     form: str, summary: str, metrics_rich: str = "") -> str:
+    """PURE: GFM-rich counterpart to cmd_compare output."""
+    parts = [t("compare_rich_header",
+               a=ticker_a, date_a=date_a, b=ticker_b, date_b=date_b, form=form)]
+    parts.append("")
+    parts.append(summary)
+    if metrics_rich:
+        parts.append("")
+        parts.append(metrics_rich)
+    result = "\n".join(parts)
+    if len(result) > 32768:
+        return ""
+    return result
+
+
 def cmd_compare(parts: list):
     """Usage: /compare TICKER_A TICKER_B [FORM]   — FORM defaults to 10-K."""
     if len(parts) < 3:
@@ -3096,33 +3455,8 @@ def cmd_compare(parts: list):
     body_a = extract_section(text_a, form, _COMPARE_PER_SIDE_MAX)
     body_b = extract_section(text_b, form, _COMPARE_PER_SIDE_MAX)
 
-    # Financial metrics comparison via Company Facts API
-    metrics_block = ""
-    try:
-        def _get_metrics(tk):
-            c = Company(tk)
-            f = c.get_facts()
-            return {
-                "Revenue": f.get_revenue(),
-                "Net Income": f.get_net_income(),
-                "Total Assets": f.get_total_assets(),
-            }
-        m_a = _get_metrics(ticker_a)
-        m_b = _get_metrics(ticker_b)
-        lines = [f"📊 *Financial Metrics Comparison*",
-                 f"```",
-                 f"{'Metric':<20s} {ticker_a:>14s} {ticker_b:>14s} {'Delta':>10s}"]
-        for key in m_a:
-            va, vb = m_a[key], m_b[key]
-            if va is not None and vb is not None and vb != 0:
-                delta = (va - vb) / abs(vb) * 100
-                lines.append(f"{key:<20s} ${va/1e9:>12.1f}B ${vb/1e9:>12.1f}B {delta:>+9.1f}%")
-            elif va is not None:
-                lines.append(f"{key:<20s} ${va/1e9:>12.1f}B {'n/a':>14s}")
-        lines.append("```")
-        metrics_block = "\n".join(lines)
-    except Exception as e:
-        log.debug("compare metrics: %s", e)
+    d = _compare_metrics_data(ticker_a, ticker_b)
+    metrics_block = _compare_metrics_legacy(d)
 
     summary = llm(
         build_compare_prompt(ticker_a, ticker_b, form, body_a, body_b),
@@ -3141,7 +3475,9 @@ def cmd_compare(parts: list):
                summary=summary)
     if metrics_block:
         result += f"\n\n{metrics_block}"
-    tg(result)
+    rich = _compare_rich_md(ticker_a, date_a, ticker_b, date_b, form, summary,
+                            metrics_rich=_compare_metrics_rich(d))
+    tg(result, rich_md=rich or None)
 
 # ─── Weekly digest ────────────────────────────────────────
 # Telegram classic Markdown reserves: \ _ * ` [
@@ -3160,17 +3496,18 @@ def _md_escape(text: str) -> str:
         text = text.replace(ch, "\\" + ch)
     return text
 
-def _digest_pnl_summary() -> str:
-    """Compact P&L block for the weekly digest. Empty if no portfolio or no yfinance.
+def _digest_pnl_data() -> "dict | None":
+    """IO: fetch portfolio data for digest P&L. Returns dict or None if unavailable.
 
-    Shows total P&L plus time-interval deltas: 1W, 6M, YTD, 1Y.
+    Returns: {total_val, total_pnl, total_cost, t_emoji, t_pct,
+              movers: (best, worst)|None, delta_parts: list[str]}
     """
     if not YF_OK:
-        return ""
+        return None
     cfg = get_chat_cfg()
     lots = cfg.get("portfolio", [])
     if not lots:
-        return ""
+        return None
     agg = aggregate_positions(lots)
     prices: dict[str, "float | None"] = {}
     for ticker in agg:
@@ -3179,38 +3516,89 @@ def _digest_pnl_summary() -> str:
     rows = compute_pnl_rows(agg, prices)
     priced = [r for r in rows if r["last"] is not None]
     if not priced:
-        return ""
+        return None
     total_val = sum(r["value"] for r in priced)
     total_pnl = sum(r["pnl_usd"] for r in priced)
     total_cost = sum(r["qty"] * r["avg_cost"] for r in priced)
     t_emoji = "📈" if total_pnl >= 0 else "📉"
     t_pct = _fmt_pct(total_pnl / total_cost * 100.0 if total_cost != 0 else None)
-    lines = [t("digest_pnl_line",
-               emoji=t_emoji, value=f"${total_val:,.0f}",
-               pnl_usd=f"{total_pnl:+,.0f}", pnl_pct=t_pct)]
     mv = _digest_top_movers(priced)
-    if mv:
-        best, worst = mv
-        lines.append(t("digest_movers_line",
-            up=best["ticker"], up_pct=_fmt_pct(best["pnl_pct"]),
-            down=worst["ticker"], down_pct=_fmt_pct(worst["pnl_pct"])))
     h = load_portfolio_history()
     from datetime import date as _date
     today_str = _date.today().isoformat()
     h_filtered = {k: v for k, v in h.items() if k != today_str}
+    delta_parts = []
     if h_filtered:
         ytd_days = (_date.today() - _date(_date.today().year, 1, 1)).days
-        intervals = [
-            ("1W", 7),
-            ("6M", 182),
-            ("YTD", ytd_days),
-            ("1Y", 365),
-        ]
-        delta_parts = []
+        intervals = [("1W", 7), ("6M", 182), ("YTD", ytd_days), ("1Y", 365)]
         for label, days in intervals:
             d = _compute_delta(h_filtered, total_val, days)
             delta_parts.append(f"{label}: {_format_delta(d[0] if d else None, d[1] if d else None)}")
-        lines.append("_" + "  ·  ".join(delta_parts) + "_")
+    return {
+        "total_val": total_val, "total_pnl": total_pnl,
+        "total_cost": total_cost, "t_emoji": t_emoji, "t_pct": t_pct,
+        "movers": mv, "delta_parts": delta_parts,
+    }
+
+
+def _digest_pnl_fmt_legacy(d: dict) -> str:
+    """PURE: legacy-format P&L block from _digest_pnl_data dict."""
+    lines = [t("digest_pnl_line",
+               emoji=d["t_emoji"], value=f"${d['total_val']:,.0f}",
+               pnl_usd=f"{d['total_pnl']:+,.0f}", pnl_pct=d["t_pct"])]
+    if d["movers"]:
+        best, worst = d["movers"]
+        lines.append(t("digest_movers_line",
+            up=best["ticker"], up_pct=_fmt_pct(best["pnl_pct"]),
+            down=worst["ticker"], down_pct=_fmt_pct(worst["pnl_pct"])))
+    if d["delta_parts"]:
+        lines.append("_" + "  ·  ".join(d["delta_parts"]) + "_")
+    return "\n".join(lines)
+
+
+def _digest_pnl_rich(d: dict) -> str:
+    """PURE: GFM-rich P&L block from _digest_pnl_data dict."""
+    lines = [t("digest_rich_pnl_line",
+               emoji=d["t_emoji"], value=f"${d['total_val']:,.0f}",
+               pnl_usd=f"{d['total_pnl']:+,.0f}", pnl_pct=d["t_pct"])]
+    if d["movers"]:
+        best, worst = d["movers"]
+        lines.append(t("digest_rich_movers_line",
+            up=best["ticker"], up_pct=_fmt_pct(best["pnl_pct"]),
+            down=worst["ticker"], down_pct=_fmt_pct(worst["pnl_pct"])))
+    if d["delta_parts"]:
+        lines.append("*" + "  ·  ".join(d["delta_parts"]) + "*")
+    return "\n".join(lines)
+
+
+def _digest_pnl_summary() -> str:
+    """Compact P&L block for the weekly digest. Empty if no portfolio or no yfinance."""
+    d = _digest_pnl_data()
+    if not d:
+        return ""
+    return _digest_pnl_fmt_legacy(d)
+
+
+def _digest_rich_md(data: list, week_start: str, today_str: str,
+                    pnl_rich: str = "") -> str:
+    """PURE: GFM-rich counterpart to send_weekly_digest body."""
+    lines = [t("digest_rich_title", start=week_start, end=today_str,
+               count=len(data))]
+    if data:
+        by_ticker: dict = {}
+        for entry in data:
+            by_ticker.setdefault(entry["ticker"], []).append(entry)
+        for ticker, entries in by_ticker.items():
+            lines.append(t("digest_rich_ticker", ticker=ticker))
+            for k in entries:
+                snippet = _md_escape(k["analiz"][:120].replace("\n", " "))
+                lines.append(t("digest_rich_item",
+                               form=k["form"], tarih=k["tarih"], snippet=snippet))
+    else:
+        lines.append(t("digest_no_filings"))
+    if pnl_rich:
+        lines.append("")
+        lines.append(pnl_rich)
     return "\n".join(lines)
 
 
@@ -3237,11 +3625,14 @@ def send_weekly_digest():
     else:
         lines.append(t("digest_no_filings"))
 
-    pnl_line = _digest_pnl_summary()
-    if pnl_line:
-        lines.append(f"\n{pnl_line}")
+    d = _digest_pnl_data()
+    pnl_legacy = _digest_pnl_fmt_legacy(d) if d else ""
+    if pnl_legacy:
+        lines.append(f"\n{pnl_legacy}")
 
-    tg("\n".join(lines))
+    rich = _digest_rich_md(data, week_start, today_str,
+                           pnl_rich=_digest_pnl_rich(d) if d else "")
+    tg("\n".join(lines), rich_md=rich or None)
     if data:
         clear_weekly_log()
     log.info("Weekly digest sent%s.", ", log cleared" if data else "")
@@ -3797,7 +4188,7 @@ def cmd_settings() -> str:
     # Registered LLM provider names (names only, no keys/masks)
     llm_registered = [p for p in _PROVIDERS if api_keys.get(p)]
     registered_providers = ", ".join(llm_registered) if llm_registered else t("label_off")
-    return t("settings_block",
+    block = t("settings_block",
              model=cfg['model'],
              lookback=cfg['days_lookback'],
              max_chars=cfg['max_chars'],
@@ -3811,14 +4202,18 @@ def cmd_settings() -> str:
              prompt_count=len(cfg.get('custom_prompts', {})),
              active_provider=active_provider,
              registered_providers=registered_providers)
+    rich_line = t("rich_settings_line",
+                  rich=t("label_on") if cfg.get('rich_format', True) else t("label_off"))
+    return block + "\n" + rich_line
 
-def cmd_status() -> str:
+def _status_data() -> dict:
+    """IO: build status dict from snapshot + config. Single-read, no formatting."""
     snap = status_snapshot()
-    now    = datetime.now()
+    now = datetime.now()
     baslangi = datetime.fromisoformat(snap["started"])
-    sure     = now - baslangi
-    saat     = int(sure.total_seconds() // 3600)
-    dakika   = int((sure.total_seconds() % 3600) // 60)
+    sure = now - baslangi
+    saat = int(sure.total_seconds() // 3600)
+    dakika = int((sure.total_seconds() % 3600) // 60)
 
     def time_format(iso: str | None) -> str:
         if not iso: return t("label_dash")
@@ -3827,19 +4222,37 @@ def cmd_status() -> str:
     cfg = get_chat_cfg()
     tg_hata = snap["tg_errors"]
     or_hata = snap["or_errors"]
-    return t("status_block",
-             uptime=t("uptime_format", hours=saat, minutes=dakika),
-             last_update=time_format(snap["last_update"]),
-             last_scan=time_format(snap["last_scan"]),
-             last_alarm=time_format(snap["last_alarm"]),
-             total_analyzed=snap["total_analyzed"],
-             tg_errors=("✅ 0" if tg_hata == 0 else f"⚠️ {tg_hata}"),
-             or_errors=("✅ 0" if or_hata == 0 else f"⚠️ {or_hata}"),
-             language=get_lang(),
-             schedule=cfg.get('schedule') or t("label_off"),
-             alarm=t("label_on") if cfg.get('alarm_on') else t("label_off"),
-             digest=t("label_on") if cfg.get('weekly_digest') else t("label_off"),
-             ticker_count=len(cfg['tickers']))
+    return {
+        "uptime": t("uptime_format", hours=saat, minutes=dakika),
+        "last_update": time_format(snap["last_update"]),
+        "last_scan": time_format(snap["last_scan"]),
+        "last_alarm": time_format(snap["last_alarm"]),
+        "total_analyzed": snap["total_analyzed"],
+        "tg_errors": "✅ 0" if tg_hata == 0 else f"⚠️ {tg_hata}",
+        "or_errors": "✅ 0" if or_hata == 0 else f"⚠️ {or_hata}",
+        "language": get_lang(),
+        "schedule": cfg.get("schedule") or t("label_off"),
+        "alarm": t("label_on") if cfg.get("alarm_on") else t("label_off"),
+        "digest": t("label_on") if cfg.get("weekly_digest") else t("label_off"),
+        "ticker_count": len(cfg["tickers"]),
+    }
+
+
+def _status_legacy(d: dict) -> str:
+    """PURE: legacy status block. Byte-identical to old cmd_status output."""
+    return t("status_block", **d)
+
+
+def _status_rich(d: dict) -> str:
+    """PURE: GFM-native status panel table for sendRichMessage."""
+    return t("status_rich", **d)
+
+
+def cmd_status() -> None:
+    d = _status_data()
+    body = _status_legacy(d)
+    rich = _status_rich(d)
+    tg(body, rich_md=rich or None)
 
 def cmd_setlang(parts: list) -> str:
     if len(parts) < 2:
@@ -4030,6 +4443,31 @@ def format_watchword_alert(word: str, hits: list) -> str:
         ))
     if extra:
         lines.append(t("watchword_alert_more", n=extra))
+    return "\n".join(lines)
+
+
+def format_watchword_alert_rich(word: str, hits: list) -> str:
+    """PURE: GFM-rich counterpart to format_watchword_alert for sendRichMessage.
+
+    Uses ### header (GFM) instead of *bold* (legacy). No _md_escape — raw
+    values are GFM-safe (word in backtick, ticker/form are controlled tokens).
+    """
+    if not hits:
+        return ""
+    cap = 5
+    shown = hits[:cap]
+    extra = len(hits) - cap if len(hits) > cap else 0
+    lines = [t("watchword_alert_rich_header", word=word, count=len(hits))]
+    for h in shown:
+        lines.append(t(
+            "watchword_alert_rich_hit",
+            ticker=h["ticker_or_cik"],
+            form=h["form"],
+            date=h["date"],
+            url=h["url"],
+        ))
+    if extra:
+        lines.append(t("watchword_alert_rich_more", n=extra))
     return "\n".join(lines)
 
 
@@ -4422,6 +4860,57 @@ def _fmt_qty(qty: float) -> str:
     return str(int(qty)) if qty == int(qty) else f"{qty:g}"
 
 
+def _pnl_rich_md(rows: list) -> str:
+    """PURE: build GFM-rich P&L table for sendRichMessage.
+
+    Returns '' when rows is empty (caller falls back to legacy pnl_empty).
+    Uses **bold** (GFM) instead of *bold* (legacy). No fixed-width columns
+    — raw _fmt_qty is shown, so K3/QTY-overflow bug-class is eliminated.
+    """
+    if not rows:
+        return ""
+
+    na_count = 0
+    total_val = 0.0
+    total_pnl = 0.0
+    total_cost = 0.0
+    for r in rows:
+        if r["last"] is None:
+            na_count += 1
+        else:
+            total_val += r["value"]
+            total_pnl += r["pnl_usd"]
+            total_cost += r["qty"] * r["avg_cost"]
+
+    priced = len(rows) - na_count
+    lines = [t("pnl_rich_header")]
+
+    lines.append("| Ticker | Qty | Last | Value | P&L% |")
+    lines.append("| --- | ---: | ---: | ---: | ---: |")
+    for r in rows:
+        tk = r["ticker"]
+        qty = _fmt_qty(r["qty"])
+        if r["last"] is None:
+            lines.append(f"| {tk} | {qty} | n/a | n/a | n/a |")
+        else:
+            last = f"${r['last']:.2f}"
+            val = _fmt_value(r["value"])
+            pct = _fmt_pct(r["pnl_pct"])
+            lines.append(f"| {tk} | {qty} | {last} | {val} | {pct} |")
+
+    if priced > 0:
+        t_emoji = "📈" if total_pnl >= 0 else "📉"
+        t_pct = _fmt_pct(total_pnl / total_cost * 100.0 if total_cost != 0 else None)
+        lines.append(t("pnl_rich_total",
+                       emoji=t_emoji,
+                       value=f"${int(round(total_val)):,}",
+                       pnl_usd=f"{total_pnl:+,.0f}",
+                       pnl_pct=t_pct))
+    if na_count:
+        lines.append(t("pnl_na_note", count=na_count))
+    return "\n".join(lines)
+
+
 def fetch_last_close(ticker: str) -> "float | None":
     """THIN IO: yfinance last 5 trading days → most recent close. Any exception → None."""
     if not YF_OK:
@@ -4567,13 +5056,15 @@ def _format_delta(abs_d: "float | None", pct_d: "float | None") -> str:
     return f"{emoji} {sign}${abs_d:,.2f} ({sign}{pct_d:.2f}%)"
 
 
-def cmd_pnl() -> str:
+def cmd_pnl() -> None:
     if not YF_OK:
-        return t("yfinance_missing", cmd="/pnl")
+        tg(t("yfinance_missing", cmd="/pnl"))
+        return
     cfg  = get_chat_cfg()
     lots = cfg.get("portfolio", [])
     if not lots:
-        return t("pnl_empty")
+        tg(t("pnl_empty"))
+        return
     agg    = aggregate_positions(lots)
     prices: dict[str, "float | None"] = {}
     for ticker in agg:
@@ -4585,23 +5076,28 @@ def cmd_pnl() -> str:
     base = format_pnl(rows)
     # J4: append delta line if snapshot data available
     priced_rows = [r for r in rows if r["last"] is not None]
-    if not priced_rows or len(priced_rows) != len(rows):
-        return base   # partial prices → no delta line
-    today_val = sum(r["value"] for r in priced_rows)
-    h = load_portfolio_history()
-    # Remove today's just-written entry for delta calc (can't diff against itself)
-    from datetime import timezone
-    today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    h_without_today = {k: v for k, v in h.items() if k != today_key}
-    d1  = _compute_delta(h_without_today, today_val, 1)
-    d7  = _compute_delta(h_without_today, today_val, 7)
-    d30 = _compute_delta(h_without_today, today_val, 30)
-    col1  = _format_delta(d1[0]  if d1  else None, d1[1]  if d1  else None)
-    col7  = _format_delta(d7[0]  if d7  else None, d7[1]  if d7  else None)
-    col30 = _format_delta(d30[0] if d30 else None, d30[1] if d30 else None)
-    delta_line = t("pnl_delta_line",
-                   d1=col1, d7=col7, d30=col30)
-    return f"{base}\n{delta_line}"
+    delta_line = ""
+    if priced_rows and len(priced_rows) == len(rows):
+        today_val = sum(r["value"] for r in priced_rows)
+        h = load_portfolio_history()
+        from datetime import timezone
+        today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        h_without_today = {k: v for k, v in h.items() if k != today_key}
+        d1  = _compute_delta(h_without_today, today_val, 1)
+        d7  = _compute_delta(h_without_today, today_val, 7)
+        d30 = _compute_delta(h_without_today, today_val, 30)
+        col1  = _format_delta(d1[0]  if d1  else None, d1[1]  if d1  else None)
+        col7  = _format_delta(d7[0]  if d7  else None, d7[1]  if d7  else None)
+        col30 = _format_delta(d30[0] if d30 else None, d30[1] if d30 else None)
+        delta_line = t("pnl_delta_line", d1=col1, d7=col7, d30=col30)
+    # Rich path: GFM table (K3/QTY-overflow eliminated)
+    rich_body = _pnl_rich_md(rows)
+    legacy_full = base + ("\n" + delta_line if delta_line else "")
+    if rich_body:
+        rich_full = rich_body + ("\n" + delta_line if delta_line else "")
+        tg(legacy_full, rich_md=rich_full)
+    else:
+        tg(legacy_full)
 
 
 # ─── /sheet — financial statements from EDGAR (Company Facts API) ──
@@ -4617,6 +5113,31 @@ def _sheet_format_val(v: "float | None", abbreviate: bool = True) -> str:
     if abbreviate and abs(v) >= 10_000:
         return f"{v / 1_000:+.1f}K"
     return f"{v:+,.0f}"
+
+
+def _sheet_rich_md(ticker: str, period: str, sections: list) -> str:
+    """PURE: GFM-rich counterpart to cmd_sheet's ASCII code block.
+
+    sections: [(title, short_cols, rows), ...] where rows = [(label, vals_str), ...]
+    Returns '' when sections is empty or content exceeds 32768 chars.
+    """
+    if not sections:
+        return ""
+    lines = [t("sheet_rich_header", ticker=ticker, period=period)]
+    for title, short_cols, rows in sections:
+        lines.append("")
+        lines.append(t("sheet_rich_section", title=title))
+        header = "| Concept | " + " | ".join(short_cols) + " |"
+        sep = "|:--|" + "--:|" * len(short_cols)
+        lines.append(header)
+        lines.append(sep)
+        for label, vals_str in rows:
+            cells = vals_str.split("  ")
+            lines.append("| " + label + " | " + " | ".join(cells) + " |")
+    body = "\n".join(lines)
+    if len(body) > 32768:
+        return ""
+    return body
 
 
 def cmd_sheet(parts: list) -> str:
@@ -4657,10 +5178,11 @@ def cmd_sheet(parts: list) -> str:
         log.error(f"sheet {ticker}: Company init failed: {e}")
         return t("sheet_fetch_failed", ticker=ticker)
 
-    lines = [t("sheet_header", ticker=ticker,
-               period=t("sheet_period_quarterly") if num_years > 5 else t("sheet_period_yearly"))]
+    period = t("sheet_period_quarterly") if num_years > 5 else t("sheet_period_yearly")
+    lines = [t("sheet_header", ticker=ticker, period=period)]
     found_any = False
     table_lines: list = []
+    rich_sections: list = []
 
     def _fmt(v):
         return _sheet_format_val(v) if v is not None else "n/a"
@@ -4724,6 +5246,7 @@ def cmd_sheet(parts: list) -> str:
                     short = concept.replace("RevenueFromContractWithCustomerExcludingAssessedTax", "Revenue")
                     is_rows.append((short, vals))
             table_lines.extend(_section_block("INCOME STATEMENT", fy_cols, is_rows))
+            rich_sections.append(("INCOME STATEMENT", [_short_hdr(c) for c in fy_cols], is_rows))
     except Exception as e:
         log.debug(f"sheet {ticker}: income_statement failed: {e}")
 
@@ -4741,6 +5264,7 @@ def cmd_sheet(parts: list) -> str:
                     vals = "  ".join(_fmt(bs_df.loc[concept, c]) for c in fy_cols)
                     bs_rows.append((concept, vals))
             table_lines.extend(_section_block("BALANCE SHEET", fy_cols, bs_rows))
+            rich_sections.append(("BALANCE SHEET", [_short_hdr(c) for c in fy_cols], bs_rows))
     except Exception as e:
         log.debug(f"sheet {ticker}: balance_sheet failed: {e}")
 
@@ -4760,6 +5284,7 @@ def cmd_sheet(parts: list) -> str:
                     short = concept.replace("NetCashProvidedByUsedIn", "Cash:")
                     cf_rows.append((short, vals))
             table_lines.extend(_section_block("CASH FLOW", fy_cols, cf_rows))
+            rich_sections.append(("CASH FLOW", [_short_hdr(c) for c in fy_cols], cf_rows))
     except Exception as e:
         log.debug(f"sheet {ticker}: cashflow_statement failed: {e}")
 
@@ -4769,7 +5294,10 @@ def cmd_sheet(parts: list) -> str:
     if table_lines:
         lines.append("```\n" + "\n".join(table_lines) + "```")
 
-    return "\n".join(lines).rstrip()
+    legacy_body = "\n".join(lines).rstrip()
+    rich = _sheet_rich_md(ticker, period, rich_sections)
+    tg(legacy_body, rich_md=rich or None)
+    return None
 
 
 # ─── DEF 14A proxy analysis (edgartools) ───────────────────
@@ -5020,13 +5548,15 @@ def background_thread():
                                         fresh_hits = [h for h in ww_hits
                                                       if h["accession"] in fresh_set]
                                         text = format_watchword_alert(phrase, fresh_hits)
+                                        rich = format_watchword_alert_rich(phrase, fresh_hits)
                                         analyzable = _watchword_analyzable_hits(fresh_hits)
                                         if analyzable:
                                             token = register_alarm_hits(analyzable)
                                             _tg_with_keyboard_to(cid, text,
-                                                build_alarm_keyboard(token, analyzable, set()))
+                                                build_alarm_keyboard(token, analyzable, set()),
+                                                rich_md=rich or None)
                                         else:
-                                            _tg_to(cid, text)
+                                            _tg_to(cid, text, rich_md=rich or None)
                                     time.sleep(1)
 
                             last_alarm_check[cid] = now
@@ -5571,6 +6101,11 @@ def _process_update(upd: dict):
         elif komut == "/dailynews":
             r = cmd_dailynews(parts)
             if r: tg(r)
+        elif komut == "/setrich":
+            r = cmd_setrich(parts)
+            if r: tg(r)
+        elif komut == "/richtest":
+            cmd_richtest()
         elif komut == "/report":
             cmd_report()
         elif komut == "/export":

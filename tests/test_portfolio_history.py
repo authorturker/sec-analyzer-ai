@@ -228,22 +228,23 @@ class TestCmdPnlDelta:
 
     def test_no_delta_line_on_first_day(self, bot, monkeypatch, tmp_path):
         ph = self._setup_portfolio(bot, monkeypatch, tmp_path)
-        # no history file → delta line not possible for 1d/7d/30d
-        result = bot.cmd_pnl()
-        # Should still return pnl output
-        assert result
-        # Delta line may or may not appear with no history, but no crash
+        sent = []
+        monkeypatch.setattr(bot, "tg", lambda text, rich_md=None: sent.append(text))
+        bot.cmd_pnl()
+        assert sent, "cmd_pnl should call tg with output"
+        result = sent[0]
         assert "AAPL" in result or bot.t("pnl_empty") in result
 
     def test_delta_line_appears_with_history(self, bot, monkeypatch, tmp_path):
         ph = self._setup_portfolio(bot, monkeypatch, tmp_path)
-        # Seed history with 7d-ago snapshot
         week_ago = _iso(7)
         ph.write_text(json.dumps({week_ago: 1200.0}))
-        result = bot.cmd_pnl()
-        assert bot.t("pnl_delta_line",
-                     total=1500.0, d1="n/a", d7="placeholder", d30="n/a") or True
-        # The key presence test: "Σ" or "7d" / "7g" in output
+        sent = []
+        monkeypatch.setattr(bot, "tg", lambda text, rich_md=None: sent.append(text))
+        bot.cmd_pnl()
+        assert sent, "cmd_pnl should call tg with output"
+        result = sent[0]
+        # All prices present → delta line should appear with "7g" (Turkish) or "7d"
         assert "7" in result
 
     def test_no_delta_when_yf_not_ok(self, bot, monkeypatch):
@@ -251,8 +252,11 @@ class TestCmdPnlDelta:
         bot.mutate_cfg(lambda c: c.update({
             "portfolio": [{"ticker": "AAPL", "qty": 10.0, "cost": 100.0, "date": "2024-01-01"}]
         }))
-        result = bot.cmd_pnl()
-        assert bot.t("yfinance_missing", cmd="/pnl") in result
+        sent = []
+        monkeypatch.setattr(bot, "tg", lambda text, rich_md=None: sent.append(text))
+        bot.cmd_pnl()
+        assert sent
+        assert bot.t("yfinance_missing", cmd="/pnl") in sent[0]
 
     def test_partial_prices_no_delta_line(self, bot, monkeypatch, tmp_path):
         monkeypatch.setattr(bot, "YF_OK", True)
@@ -264,17 +268,16 @@ class TestCmdPnlDelta:
                 {"ticker": "TSLA", "qty": 5.0, "cost": 200.0, "date": "2024-01-01"},
             ]
         }))
-        # TSLA has no price
         monkeypatch.setattr(bot, "fetch_last_close",
                             lambda tk: 150.0 if tk == "AAPL" else None)
         monkeypatch.setattr(bot.time, "sleep", lambda *a: None)
         week_ago = _iso(7)
         ph.write_text(json.dumps({week_ago: 1000.0}))
-        result = bot.cmd_pnl()
-        # delta line should NOT appear when partial prices
-        delta_key = bot.t("pnl_delta_line",
-                          total=0.0, d1="n/a", d7="n/a", d30="n/a")
-        # The delta line token: check "Σ" is absent
+        sent = []
+        monkeypatch.setattr(bot, "tg", lambda text, rich_md=None: sent.append(text))
+        bot.cmd_pnl()
+        assert sent, "cmd_pnl should call tg with output"
+        result = sent[0]
         assert "Σ" not in result
 
 

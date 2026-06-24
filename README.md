@@ -10,7 +10,7 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 [![OpenRouter](https://img.shields.io/badge/LLM-OpenRouter%20Free-6c47ff)](https://openrouter.ai)
 [![Telegram](https://img.shields.io/badge/Interface-Telegram-2CA5E0?logo=telegram&logoColor=white)](https://telegram.org)
 [![CI](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-874%20passing-success)](#-tests)
+[![Tests](https://img.shields.io/badge/tests-882%20passing-success)](#-tests)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 </div>
@@ -450,10 +450,10 @@ python -m pytest tests/ -q
 ```
 
 ```
-783 passed, 6 skipped in <3s
+882 passed, 6 skipped in <3s
 ```
 
-The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, `_portfolio_history_delta`, `_pnl_table`, `_fmt_qty_col`, `_should_run_scheduled_scan`, `_digest_top_movers`, `_daily_news_fresh`, `_format_daily_news`, `_watchword_analyzable_hits`), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the per-chat config lock-discipline (TOCTOU flip, single-acquire proof), the chat-data purge (`_purge_chat_data` idempotency, re-add freshness), the per-chat scheduled-scan dedup (multi-chat gate, 90s boundary), the version label single-source (render correctness, placeholder leak), the multi-LLM provider abstraction (provider chain, key masking, retry logic), the No-AI mode (raw text delivery, short-circuit, daily reminder gate), the portfolio-history delta helpers, the command surface inventory (dispatcher↔help parity), and the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes). Network IO is not exercised — tests run offline. The 6 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
+The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, `_portfolio_history_delta`, `_pnl_table`, `_fmt_qty_col`, `_should_run_scheduled_scan`, `_digest_top_movers`, `_daily_news_fresh`, `_format_daily_news`, `_watchword_analyzable_hits`, `_classify_rich_error`, `_rich_enabled`, `_sheet_rich_md`, `_pnl_rich_md`, `_filing_rich_md`, `_compare_metrics_data`, `_compare_metrics_legacy`, `_compare_metrics_rich`, `_compare_rich_md`, `_status_data`, `_status_legacy`, `_status_rich`, `_digest_pnl_data`, `_digest_pnl_fmt_legacy`, `_digest_pnl_rich`, `_digest_rich_md`, `_format_daily_news_rich`, `_format_news_list_rich`, `format_watchword_alert_rich`, `_is_private_chat`, `_thinking_draft_md`), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the per-chat config lock-discipline (TOCTOU flip, single-acquire proof), the chat-data purge (`_purge_chat_data` idempotency, re-add freshness), the per-chat scheduled-scan dedup (multi-chat gate, 90s boundary), the version label single-source (render correctness, placeholder leak), the multi-LLM provider abstraction (provider chain, key masking, retry logic), the No-AI mode (raw text delivery, short-circuit, daily reminder gate), the portfolio-history delta helpers, the command surface inventory (dispatcher↔help parity), the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes), and the rich message transport (capability detection, fallback chain, dual-render callsites, byte-identical legacy path). Network IO is not exercised — tests run offline. The 6 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
 
 ---
 
@@ -486,6 +486,21 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 ---
 
 ## 📝 Release Notes
+
+### v4.9
+
+- **Rich Messages (Telegram Bot API 10.1):** all major output surfaces now support Telegram's native rich markdown — headers, GFM tables, `<details>` collapsible blocks, and inline links. Legacy markdown fallback preserved for all messages.
+- **`/sheet` rich tables:** income statement, balance sheet, and cash flow displayed as native GFM tables with right-aligned numeric columns; legacy ASCII code block retained as fallback.
+- **`/compare` rich table:** side-by-side financial metrics rendered as a native GFM table with delta column.
+- **`/status` rich panel:** bot status shown as a native GFM table.
+- **P&L rich table:** portfolio profit/loss displayed as a native GFM table (eliminates monospace column-clamp bug class K3).
+- **Filing analysis rich:** analysis results include GFM headers and `<details>` collapsible diff blocks.
+- **Digest + daily news rich:** weekly digest and daily news headlines rendered with GFM headers and list formatting.
+- **Watchword alerts rich:** EFTS watchword alerts rendered as GFM lists with clickable filing links.
+- **Checknews rich:** `/checknews` headlines rendered as GFM lists with links.
+- **Thinking draft:** `sendRichMessageDraft` placeholder shown before LLM analysis starts (private chats only, ephemeral 30s).
+- **`/setrich on/off`:** toggle rich formatting per-chat (enabled by default).
+- **Test count:** 882 passing, 6 skipped (888 collected).
 
 ### v4.8
 

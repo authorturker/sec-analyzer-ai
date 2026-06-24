@@ -94,6 +94,7 @@ class TestHelpBlockCoverage:
         "/skip",        # wizard step command
         "/usedefaults", # wizard step command
         "/webhook",     # substring appearing in config URLs, not a command
+        "/richtest",    # hidden admin-only rich-transport verification (O1)
     }
 
     def _dispatcher_commands(self, bot) -> set:

@@ -95,7 +95,7 @@ class TestLlmNoKeys:
 class TestDeliverRawText:
     def _tg_calls(self, bot, monkeypatch):
         sent = []
-        monkeypatch.setattr(bot, "_tg_to", lambda cid, text: sent.append(text))
+        monkeypatch.setattr(bot, "_tg_to", lambda cid, text, **kw: sent.append(text))
         return sent
 
     def test_empty_body_sends_only_warning(self, bot, monkeypatch):
@@ -154,7 +154,7 @@ class TestDeliverRawText:
 
     def test_document_failure_fallback_inline(self, bot, monkeypatch):
         sent = []
-        monkeypatch.setattr(bot, "_tg_to", lambda cid, text: sent.append(text))
+        monkeypatch.setattr(bot, "_tg_to", lambda cid, text, **kw: sent.append(text))
         monkeypatch.setattr(bot.requests, "post",
                             lambda *a, **k: (_ for _ in ()).throw(ConnectionError("fail")))
         body = "q" * (bot._RAW_TEXT_INLINE_LIMIT + 1)
@@ -174,7 +174,7 @@ class TestNoKeysReminder:
     def test_sends_on_first_call(self, bot, monkeypatch):
         bot.mutate_cfg(lambda c: c.update({"no_keys_warned_date": ""}))
         sent = []
-        monkeypatch.setattr(bot, "_tg_to", lambda cid, text: sent.append(text))
+        monkeypatch.setattr(bot, "_tg_to", lambda cid, text, **kw: sent.append(text))
         bot._check_no_keys_reminder()
         assert sent, "Reminder must be sent when date is blank"
         assert bot.t("no_ai_reminder") in sent[0]
@@ -184,14 +184,14 @@ class TestNoKeysReminder:
         today = datetime.now().strftime("%Y-%m-%d")
         bot.mutate_cfg(lambda c: c.update({"no_keys_warned_date": today}))
         sent = []
-        monkeypatch.setattr(bot, "_tg_to", lambda cid, text: sent.append(text))
+        monkeypatch.setattr(bot, "_tg_to", lambda cid, text, **kw: sent.append(text))
         bot._check_no_keys_reminder()
         assert sent == [], "No reminder when already sent today"
 
     def test_resends_next_day(self, bot, monkeypatch):
         bot.mutate_cfg(lambda c: c.update({"no_keys_warned_date": "2000-01-01"}))
         sent = []
-        monkeypatch.setattr(bot, "_tg_to", lambda cid, text: sent.append(text))
+        monkeypatch.setattr(bot, "_tg_to", lambda cid, text, **kw: sent.append(text))
         bot._check_no_keys_reminder()
         assert sent, "Reminder must resend after date differs"
 
@@ -266,7 +266,7 @@ class TestSentimentNoAi:
     def test_no_ai_signal_placeholder_used(self, bot, monkeypatch):
         _clear_keys(bot, monkeypatch)
         sent = []
-        monkeypatch.setattr(bot, "_tg_to", lambda cid, text: sent.append(text))
+        monkeypatch.setattr(bot, "_tg_to", lambda cid, text, **kw: sent.append(text))
         monkeypatch.setattr(bot.time, "sleep", lambda *a: None)
 
         # Mock Company and Form 4 filings with get_ownership_summary
