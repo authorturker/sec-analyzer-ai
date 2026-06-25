@@ -948,3 +948,341 @@ class TestSheetRichMd:
         sections = [("BIG", ["FY2024"], huge_rows)]
         out = bot._sheet_rich_md("X", "Yearly", sections)
         assert out == ""
+
+
+# ═══════════════════════════════════════════════════════════
+# O11 — /help rich (komut rehberi GFM panel, çift-render)
+# ═══════════════════════════════════════════════════════════
+
+import re
+
+
+class TestO11HelpRich:
+    KW = dict(forms="8-K  10-K", ticker_count=3, language="tr", version="4.9")
+
+    def test_no_single_star_outside_backticks_tr(self, bot):
+        r = bot.t("help_block_rich", **self.KW)
+        no_backtick = re.sub(r"`[^`]+`", "", r)
+        single_stars = len(re.findall(r"(?<!\*)\*(?!\*)", no_backtick))
+        assert single_stars == 0, f"Found {single_stars} single-* outside backticks"
+
+    def test_no_single_star_outside_backticks_en(self, bot):
+        kw = dict(self.KW, language="en")
+        r = bot.t("help_block_rich", **kw)
+        no_backtick = re.sub(r"`[^`]+`", "", r)
+        single_stars = len(re.findall(r"(?<!\*)\*(?!\*)", no_backtick))
+        assert single_stars == 0, f"Found {single_stars} single-* outside backticks"
+
+    def test_starts_with_h3_has_bold_has_backticks(self, bot):
+        for lang in ("tr", "en"):
+            kw = dict(self.KW, language=lang)
+            r = bot.t("help_block_rich", **kw)
+            assert r.startswith("### "), f"{lang}: missing ### heading"
+            assert "**" in r, f"{lang}: no **bold**"
+            assert "`" in r, f"{lang}: no backtick"
+
+    def test_placeholders_filled(self, bot):
+        r = bot.t("help_block_rich", **self.KW)
+        assert "4.9" in r
+        assert "{version}" not in r
+        assert "{forms}" not in r
+        assert "{ticker_count}" not in r
+        assert "{language}" not in r
+
+    def test_legacy_byte_identical(self, bot):
+        legacy = bot.t("help_block", **self.KW)
+        rich = bot.t("help_block_rich", **self.KW)
+        assert legacy != rich
+        # Legacy has single-* bold, rich has **bold** — they differ
+        assert "*" in legacy
+        assert "**" in rich
+
+    def test_command_token_parity(self, bot):
+        for lang in ("tr", "en"):
+            kw = dict(self.KW, language=lang)
+            legacy = bot.t("help_block", **kw)
+            rich = bot.t("help_block_rich", **kw)
+            legacy_cmds = set(re.findall(r"`(/\w+)", legacy))
+            rich_cmds = set(re.findall(r"`(/\w+)", rich))
+            assert legacy_cmds == rich_cmds, (
+                f"{lang}: command mismatch\n"
+                f"  only in legacy: {legacy_cmds - rich_cmds}\n"
+                f"  only in rich: {rich_cmds - legacy_cmds}"
+            )
+
+    def test_help_msg_self_send(self, bot, monkeypatch):
+        monkeypatch.setattr(bot, "get_chat_cfg", lambda: {
+            "default_forms": ["8-K", "10-K"],
+            "tickers": ["AAPL", "MSFT"],
+        })
+        monkeypatch.setattr(bot, "get_lang", lambda: "tr")
+        captured = {}
+
+        def fake_tg(text, rich_md=None):
+            captured["text"] = text
+            captured["rich_md"] = rich_md
+
+        monkeypatch.setattr(bot, "tg", fake_tg)
+        result = bot.help_msg()
+        assert result is None
+        assert "text" in captured
+        assert captured.get("rich_md") is not None
+        assert "### 🤖" in captured["rich_md"]
+
+
+import re
+
+class TestO12RichSurfaces:
+    """O12: 5 ikincil legacy yüzeyi rich'e taşıma testleri."""
+
+    def _no_single_star(self, text):
+        no_backtick = re.sub(r"`[^`]+`", "", text)
+        return re.findall(r"(?<!\*)\*(?!\*)", no_backtick)
+
+    def _settings_kw(self):
+        return dict(model="gpt-4", lookback=30, max_chars=5000,
+                    forms="8-K  10-K", ticker_count=2, ticker_list=" — `AAPL  MSFT`",
+                    language="tr", schedule="08:00", alarm="açık", digest="açık",
+                    prompt_count=1, active_provider="openrouter",
+                    registered_providers="openrouter, anthropic")
+
+    def _mock_cfg(self, monkeypatch, bot, cfg=None):
+        default = {"tickers": ["AAPL", "MSFT"], "model": "gpt-4",
+                   "days_lookback": 30, "max_chars": 5000,
+                   "default_forms": ["8-K", "10-K"], "default_provider": "openrouter",
+                   "api_keys": {"openrouter": "sk-test", "anthropic": "sk-ant"},
+                   "schedule": "08:00", "alarm_on": True, "weekly_digest": True,
+                   "custom_prompts": {"10-K": "Analyze SEC filing"},
+                   "groups": {"tech": ["AAPL", "MSFT"]}, "rich_format": True}
+        if cfg:
+            default.update(cfg)
+        monkeypatch.setattr(bot, "get_chat_cfg", lambda: default)
+        monkeypatch.setattr(bot, "get_lang", lambda: "tr")
+
+    # ── /settings ──────────────────────────────────────────
+    def test_settings_rich_starts_with_h3(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        r = bot._settings_rich()
+        assert r.startswith("### ⚙️")
+
+    def test_settings_rich_no_single_star(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        r = bot._settings_rich()
+        assert self._no_single_star(r) == []
+
+    def test_settings_rich_backticks_preserved(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        r = bot._settings_rich()
+        assert "`openrouter`" in r
+        assert "`gpt-4`" in r
+
+    def test_settings_rich_placeholders_filled(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        r = bot._settings_rich()
+        assert "{model}" not in r
+        assert "{active_provider}" not in r
+
+    def test_settings_legacy_rich_consistency(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        legacy = bot.cmd_settings()
+        rich = bot._settings_rich()
+        assert "openrouter" in legacy
+        assert "openrouter" in rich
+        assert "gpt-4" in legacy
+        assert "gpt-4" in rich
+
+    def test_settings_dual_render(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        captured = {}
+        def fake_tg(text, rich_md=None):
+            captured["text"] = text
+            captured["rich_md"] = rich_md
+        monkeypatch.setattr(bot, "tg", fake_tg)
+        # Simulate dispatch pattern: tg(cmd_settings(), rich_md=_settings_rich() or None)
+        bot.tg(bot.cmd_settings(), rich_md=bot._settings_rich() or None)
+        assert "text" in captured
+        assert captured.get("rich_md") is not None
+        assert "### ⚙️" in captured["rich_md"]
+
+    # ── /apis ──────────────────────────────────────────────
+    def test_apis_rich_with_keys(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        r = bot._apis_rich()
+        assert r.startswith("### 🔑")
+        assert "`openrouter`" in r
+
+    def test_apis_rich_no_single_star(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        r = bot._apis_rich()
+        assert self._no_single_star(r) == []
+
+    def test_apis_rich_empty_returns_empty(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot, {"api_keys": {}, "default_provider": ""})
+        r = bot._apis_rich()
+        assert r == ""
+
+    def test_apis_legacy_rich_consistency(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        legacy = bot.cmd_apis()
+        rich = bot._apis_rich()
+        assert "openrouter" in legacy
+        assert "openrouter" in rich
+
+    def test_apis_dual_render(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        captured = {}
+        def fake_tg(text, rich_md=None):
+            captured["text"] = text
+            captured["rich_md"] = rich_md
+        monkeypatch.setattr(bot, "tg", fake_tg)
+        bot.tg(bot.cmd_apis(), rich_md=bot._apis_rich() or None)
+        assert "text" in captured
+        assert captured.get("rich_md") is not None
+        assert "### 🔑" in captured["rich_md"]
+
+    # ── /listprompts ───────────────────────────────────────
+    def test_listprompts_rich_with_prompts(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        r = bot._listprompts_rich()
+        assert r.startswith("### 📝")
+        assert "**10-K:**" in r
+
+    def test_listprompts_rich_no_single_star(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        r = bot._listprompts_rich()
+        assert self._no_single_star(r) == []
+
+    def test_listprompts_rich_empty_returns_empty(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot, {"custom_prompts": {}})
+        r = bot._listprompts_rich()
+        assert r == ""
+
+    def test_listprompts_legacy_rich_consistency(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        legacy = bot.cmd_listprompts()
+        rich = bot._listprompts_rich()
+        assert "10-K" in legacy
+        assert "10-K" in rich
+        assert "Analyze SEC filing" in legacy
+        assert "Analyze SEC filing" in rich
+
+    def test_listprompts_dual_render(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        captured = {}
+        def fake_tg(text, rich_md=None):
+            captured["text"] = text
+            captured["rich_md"] = rich_md
+        monkeypatch.setattr(bot, "tg", fake_tg)
+        bot.tg(bot.cmd_listprompts(), rich_md=bot._listprompts_rich() or None)
+        assert "text" in captured
+        assert captured.get("rich_md") is not None
+        assert "### 📝" in captured["rich_md"]
+
+    # ── /getprompt ─────────────────────────────────────────
+    def test_getprompt_rich_success(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        r = bot._getprompt_rich(["/getprompt", "10-K"])
+        assert r.startswith("### 📝")
+        assert "10-K" in r
+        assert "Analyze SEC filing" in r
+
+    def test_getprompt_rich_no_single_star(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        r = bot._getprompt_rich(["/getprompt", "10-K"])
+        assert self._no_single_star(r) == []
+
+    def test_getprompt_rich_usage_returns_empty(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        r = bot._getprompt_rich(["/getprompt"])
+        assert r == ""
+
+    def test_getprompt_rich_unknown_form_returns_empty(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        r = bot._getprompt_rich(["/getprompt", "FAKE"])
+        assert r == ""
+
+    def test_getprompt_rich_no_custom_returns_empty(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot, {"custom_prompts": {}})
+        r = bot._getprompt_rich(["/getprompt", "10-K"])
+        assert r == ""
+
+    def test_getprompt_dual_render(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        captured = {}
+        def fake_tg(text, rich_md=None):
+            captured["text"] = text
+            captured["rich_md"] = rich_md
+        monkeypatch.setattr(bot, "tg", fake_tg)
+        parts = ["/getprompt", "10-K"]
+        bot.tg(bot.cmd_getprompt(parts), rich_md=bot._getprompt_rich(parts) or None)
+        assert "text" in captured
+        assert captured.get("rich_md") is not None
+        assert "### 📝" in captured["rich_md"]
+
+    # ── /listgroups ────────────────────────────────────────
+    def test_listgroups_rich_with_groups(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        r = bot._listgroups_rich()
+        assert r.startswith("### 📋")
+        assert "**tech**" in r
+        assert "`AAPL`" in r
+
+    def test_listgroups_rich_no_single_star(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        r = bot._listgroups_rich()
+        assert self._no_single_star(r) == []
+
+    def test_listgroups_rich_empty_returns_empty(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot, {"groups": {}})
+        r = bot._listgroups_rich()
+        assert r == ""
+
+    def test_listgroups_rich_empty_group(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot, {"groups": {"empty": []}})
+        r = bot._listgroups_rich()
+        assert "_empty_" in r
+        assert "### 📋" in r
+
+    def test_listgroups_legacy_rich_consistency(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        legacy = bot.cmd_listgroups()
+        rich = bot._listgroups_rich()
+        assert "tech" in legacy
+        assert "tech" in rich
+        assert "AAPL" in legacy
+        assert "AAPL" in rich
+
+    def test_listgroups_dual_render(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        captured = {}
+        def fake_tg(text, rich_md=None):
+            captured["text"] = text
+            captured["rich_md"] = rich_md
+        monkeypatch.setattr(bot, "tg", fake_tg)
+        bot.tg(bot.cmd_listgroups(), rich_md=bot._listgroups_rich() or None)
+        assert "text" in captured
+        assert captured.get("rich_md") is not None
+        assert "### 📋" in captured["rich_md"]
+
+    # ── Star trap (all surfaces, tr+en) ────────────────────
+    def test_star_trap_all_surfaces_tr(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        for fn in [bot._settings_rich, bot._apis_rich, bot._listprompts_rich,
+                   bot._listgroups_rich]:
+            r = fn()
+            assert self._no_single_star(r) == []
+
+    def test_star_trap_all_surfaces_en(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        monkeypatch.setattr(bot, "get_lang", lambda: "en")
+        for fn in [bot._settings_rich, bot._apis_rich, bot._listprompts_rich,
+                   bot._listgroups_rich]:
+            r = fn()
+            assert self._no_single_star(r) == []
+
+    def test_star_trap_getprompt_rich_tr_en(self, bot, monkeypatch):
+        self._mock_cfg(monkeypatch, bot)
+        for lang in ("tr", "en"):
+            monkeypatch.setattr(bot, "get_lang", lambda: lang)
+            r = bot._getprompt_rich(["/getprompt", "10-K"])
+            assert self._no_single_star(r) == [], f"star trap in {lang}"

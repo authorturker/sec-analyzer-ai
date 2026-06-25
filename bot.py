@@ -3698,6 +3698,15 @@ def cmd_getprompt(parts: list) -> str:
         return t("no_custom_prompt", form=m)
     return t("custom_prompt_show", form=m, prompt=prompt)
 
+def _getprompt_rich(parts: list) -> str:
+    if len(parts) < 2: return ""
+    m = _match_form(parts[1].upper())
+    if not m: return ""
+    prompt = get_chat_cfg()["custom_prompts"].get(m)
+    if not prompt:
+        return ""
+    return t("custom_prompt_show_rich", form=m, prompt=prompt)
+
 def cmd_resetprompt(parts: list) -> str:
     if len(parts) < 2: return t("resetprompt_usage")
     m = _match_form(parts[1].upper())
@@ -3712,6 +3721,15 @@ def cmd_listprompts() -> str:
     lines = [t("listprompts_title")]
     for form, prompt in custom.items():
         lines.append(f"*{form}:* {prompt[:80]}{'...' if len(prompt)>80 else ''}")
+    return "\n".join(lines)
+
+def _listprompts_rich() -> str:
+    custom = get_chat_cfg()["custom_prompts"]
+    if not custom:
+        return ""
+    lines = [t("listprompts_title_rich")]
+    for form, prompt in custom.items():
+        lines.append(f"**{form}:** {prompt[:80]}{'...' if len(prompt)>80 else ''}")
     return "\n".join(lines)
 
 # ─── Portfolio insider sentiment ──────────────────────────
@@ -4088,6 +4106,17 @@ def cmd_listgroups() -> str:
         lines.append(f"*{name}* ({len(members)}): {members_str}")
     return "\n".join(lines)
 
+def _listgroups_rich() -> str:
+    groups = get_chat_cfg().get("groups", {})
+    if not groups:
+        return ""
+    lines = [t("listgroups_title_rich", count=len(groups))]
+    for name in sorted(groups.keys()):
+        members = groups[name]
+        members_str = "  ".join(f"`{x}`" for x in members) if members else "_empty_"
+        lines.append(f"**{name}** ({len(members)}): {members_str}")
+    return "\n".join(lines)
+
 def cmd_scangroup(parts: list):
     """Usage: /scangroup NAME [FORM...]"""
     if len(parts) < 2:
@@ -4205,6 +4234,33 @@ def cmd_settings() -> str:
     rich_line = t("rich_settings_line",
                   rich=t("label_on") if cfg.get('rich_format', True) else t("label_off"))
     return block + "\n" + rich_line
+
+def _settings_rich() -> str:
+    cfg = get_chat_cfg()
+    ticker_list = ""
+    if cfg["tickers"]:
+        ticker_list = " — `" + "  ".join(cfg["tickers"]) + "`"
+    default_prov = cfg.get("default_provider", "")
+    api_keys = cfg.get("api_keys", {})
+    if not default_prov:
+        active_provider = t("settings_provider_none")
+    elif not api_keys.get(default_prov):
+        active_provider = t("settings_provider_no_key", provider=default_prov)
+    else:
+        active_provider = default_prov
+    llm_registered = [p for p in _PROVIDERS if api_keys.get(p)]
+    registered_providers = ", ".join(llm_registered) if llm_registered else t("label_off")
+    kw = dict(model=cfg['model'], lookback=cfg['days_lookback'],
+              max_chars=cfg['max_chars'], forms="  ".join(cfg['default_forms']),
+              ticker_count=len(cfg['tickers']), ticker_list=ticker_list,
+              language=get_lang(), schedule=cfg.get('schedule') or t("label_off"),
+              alarm=t("label_on") if cfg.get('alarm_on') else t("label_off"),
+              digest=t("label_on") if cfg.get('weekly_digest') else t("label_off"),
+              prompt_count=len(cfg.get('custom_prompts', {})),
+              active_provider=active_provider,
+              registered_providers=registered_providers)
+    return t("settings_block_rich", **kw) + "\n" + t("rich_settings_line",
+                  rich=t("label_on") if cfg.get('rich_format', True) else t("label_off"))
 
 def _status_data() -> dict:
     """IO: build status dict from snapshot + config. Single-read, no formatting."""
@@ -5784,13 +5840,15 @@ def cmd_export():
     filename = f"sec_export_{datetime.now().strftime('%Y%m%d')}.csv"
     tg_send_document(filename, content, t("export_caption", count=len(data)))
 
-def help_msg() -> str:
+def help_msg() -> None:
     cfg = get_chat_cfg()
-    return t("help_block",
-             forms="  ".join(cfg['default_forms']),
-             ticker_count=len(cfg['tickers']),
-             language=get_lang(),
-             version=__version__)
+    kw = dict(forms="  ".join(cfg['default_forms']),
+              ticker_count=len(cfg['tickers']),
+              language=get_lang(),
+              version=__version__)
+    legacy = t("help_block", **kw)
+    rich = t("help_block_rich", **kw)
+    tg(legacy, rich_md=rich or None)
 
 # ─── Update handler (polling and webhook) ─────────────────
 def handle_analyze_callback(cq: dict, token: str, idx: int):
@@ -5887,6 +5945,20 @@ def cmd_apis() -> str:
     if not rows:
         return t("apis_empty")
     return t("apis_header") + "\n" + "\n".join(rows)
+
+def _apis_rich() -> str:
+    cfg = get_chat_cfg()
+    api_keys = cfg.get("api_keys", {})
+    default = cfg.get("default_provider", "")
+    rows = []
+    for prov in _PROVIDERS:
+        key = api_keys.get(prov, "")
+        if key:
+            star = " ⭐" if prov == default else ""
+            rows.append(t("apis_row", provider=prov, masked_key=_mask_key(key), star=star))
+    if not rows:
+        return ""
+    return t("apis_header_rich") + "\n" + "\n".join(rows)
 
 
 def cmd_setapi(parts: list) -> str:
@@ -6028,7 +6100,6 @@ def _process_update(upd: dict):
             "/listtickers":  (cmd_listtickers,  False, False),
             "/addgroup":     (cmd_addgroup,     True,  False),
             "/removegroup":  (cmd_removegroup,  True,  False),
-            "/listgroups":   (cmd_listgroups,   False, False),
             "/listforms":    (cmd_listforms,    False, False),
             "/addform":      (cmd_addform,      True,  False),
             "/removeform":   (cmd_removeform,   True,  False),
@@ -6039,14 +6110,11 @@ def _process_update(upd: dict):
             "/removepos":    (cmd_removepos,    True,  False),
             "/pnl":          (cmd_pnl,          False, False),
             "/setprompt":    (cmd_setprompt,    True,  False),
-            "/getprompt":    (cmd_getprompt,    True,  False),
             "/resetprompt":  (cmd_resetprompt,  True,  False),
-            "/listprompts":  (cmd_listprompts,  False, False),
             "/setschedule":  (cmd_setschedule,  True,  False),
             "/alarm":        (cmd_alarm,        True,  False),
             "/setwebhook":   (cmd_setwebhook,   True,  False),
             "/delwebhook":   (cmd_delwebhook,   False, False),
-            "/settings":     (cmd_settings,     False, False),
             "/status":       (cmd_status,       False, False),
             "/setlang":      (cmd_setlang,      True,  False),
             "/setmodel":     (cmd_setmodel,     True,  False),
@@ -6065,7 +6133,6 @@ def _process_update(upd: dict):
             "/company":      (cmd_company,      True,  False),
             # Admin-only commands
             "/addapi":       (cmd_addapi,       True,  False),
-            "/apis":         (cmd_apis,         False, False),
             "/setapi":       (cmd_setapi,       True,  False),
             "/delapi":       (cmd_delapi,       True,  False),
             "/addchat":      (cmd_addchat,      True,  True),
@@ -6106,13 +6173,23 @@ def _process_update(upd: dict):
             if r: tg(r)
         elif komut == "/richtest":
             cmd_richtest()
+        elif komut == "/settings":
+            tg(cmd_settings(), rich_md=_settings_rich() or None)
+        elif komut == "/apis":
+            tg(cmd_apis(), rich_md=_apis_rich() or None)
+        elif komut == "/listprompts":
+            tg(cmd_listprompts(), rich_md=_listprompts_rich() or None)
+        elif komut == "/getprompt":
+            tg(cmd_getprompt(parts), rich_md=_getprompt_rich(parts) or None)
+        elif komut == "/listgroups":
+            tg(cmd_listgroups(), rich_md=_listgroups_rich() or None)
         elif komut == "/report":
             cmd_report()
         elif komut == "/export":
             cmd_export()
         # Natural-language and keyword triggers (not dict-dispatchable)
         elif text in ["/start", "/help"]:
-            tg(help_msg())
+            help_msg()
         elif text.startswith("/sentiment"):
             if len(parts) >= 2 and parts[1].lower() == "trend":
                 cmd_sentiment_trend(parts)

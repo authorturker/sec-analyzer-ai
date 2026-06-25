@@ -160,6 +160,19 @@ class TestHelpBlockCoverage:
         help_en = bot._load_lang("en").get("help_block", "")
         assert "/setrawmax" in help_en
 
+    def test_all_dispatcher_commands_in_help_block_rich(self, bot):
+        """Every dispatcher command (minus exclusions) appears in help_block_rich."""
+        raw_help = bot._load_lang("en").get("help_block_rich", "")
+        dispatcher_cmds = self._dispatcher_commands(bot) - self.EXCLUDED
+        missing = []
+        for cmd in sorted(dispatcher_cmds):
+            if cmd not in raw_help:
+                missing.append(cmd)
+        assert not missing, (
+            f"Commands in dispatcher but missing from help_block_rich:\n"
+            + "\n".join(f"  {c}" for c in missing)
+        )
+
     def test_settings_block_has_provider_placeholders(self, bot):
         """settings_block template contains provider placeholders."""
         for code in ("en", "tr"):
