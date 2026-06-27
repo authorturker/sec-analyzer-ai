@@ -8,7 +8,7 @@ Single-codebase replacement for bot_en.py + bot_tr.py.
 - 8-K EX-99.* exhibit collection, full network I/O hardening, 327 tests.
 """
 
-__version__ = "4.9"
+__version__ = "4.10"
 
 import copy, csv, os, time, json, logging, hashlib, threading, io, uuid
 from datetime import datetime, timedelta, date
@@ -3727,9 +3727,9 @@ def _listprompts_rich() -> str:
     custom = get_chat_cfg()["custom_prompts"]
     if not custom:
         return ""
-    lines = [t("listprompts_title_rich")]
+    lines = [t("listprompts_title_rich"), ""]
     for form, prompt in custom.items():
-        lines.append(f"**{form}:** {prompt[:80]}{'...' if len(prompt)>80 else ''}")
+        lines.append(f"- **{form}:** {_md_escape(prompt[:80])}{'...' if len(prompt)>80 else ''}")
     return "\n".join(lines)
 
 # ─── Portfolio insider sentiment ──────────────────────────
@@ -4258,9 +4258,9 @@ def _settings_rich() -> str:
               digest=t("label_on") if cfg.get('weekly_digest') else t("label_off"),
               prompt_count=len(cfg.get('custom_prompts', {})),
               active_provider=active_provider,
-              registered_providers=registered_providers)
-    return t("settings_block_rich", **kw) + "\n" + t("rich_settings_line",
-                  rich=t("label_on") if cfg.get('rich_format', True) else t("label_off"))
+              registered_providers=registered_providers,
+              rich=t("label_on") if cfg.get('rich_format', True) else t("label_off"))
+    return t("settings_block_rich", **kw)
 
 def _status_data() -> dict:
     """IO: build status dict from snapshot + config. Single-read, no formatting."""
@@ -5183,6 +5183,7 @@ def _sheet_rich_md(ticker: str, period: str, sections: list) -> str:
     for title, short_cols, rows in sections:
         lines.append("")
         lines.append(t("sheet_rich_section", title=title))
+        lines.append("")
         header = "| Concept | " + " | ".join(short_cols) + " |"
         sep = "|:--|" + "--:|" * len(short_cols)
         lines.append(header)
@@ -5955,10 +5956,10 @@ def _apis_rich() -> str:
         key = api_keys.get(prov, "")
         if key:
             star = " ⭐" if prov == default else ""
-            rows.append(t("apis_row", provider=prov, masked_key=_mask_key(key), star=star))
+            rows.append(t("apis_row_rich", provider=prov, masked_key=_mask_key(key), star=star))
     if not rows:
         return ""
-    return t("apis_header_rich") + "\n" + "\n".join(rows)
+    return t("apis_header_rich") + "\n\n" + "\n".join(rows)
 
 
 def cmd_setapi(parts: list) -> str:

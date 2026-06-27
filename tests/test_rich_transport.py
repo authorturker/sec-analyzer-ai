@@ -1286,3 +1286,192 @@ class TestO12RichSurfaces:
             monkeypatch.setattr(bot, "get_lang", lambda: lang)
             r = bot._getprompt_rich(["/getprompt", "10-K"])
             assert self._no_single_star(r) == [], f"star trap in {lang}"
+
+
+# ═══════════════════════════════════════════════════════════
+# RF2 — Soft line-break collapse fix (6 surfaces)
+# ═══════════════════════════════════════════════════════════
+
+import re as _re
+
+
+class TestRF2SheetRich:
+    def test_section_heading_followed_by_blank_line_before_table(self, bot):
+        sections = [
+            ("INCOME STATEMENT", ["FY2024"],
+             [("Revenue", "$394.0B")]),
+        ]
+        out = bot._sheet_rich_md("AAPL", "Yearly", sections)
+        idx_title = out.index("**INCOME STATEMENT**")
+        after_title = out[idx_title + len("**INCOME STATEMENT**"):]
+        assert after_title.startswith("\n\n"), (
+            f"Expected blank line after section title, got: {after_title[:30]!r}")
+        assert "| Concept |" in after_title
+
+    def test_no_star_trap_after_fix(self, bot):
+        sections = [("INCOME STATEMENT", ["FY2024"], [("Revenue", "$394.0B")])]
+        out = bot._sheet_rich_md("AAPL", "Yearly", sections)
+        no_backtick = _re.sub(r"`[^`]+`", "", out)
+        singles = _re.findall(r'(?<!\*)\*(?!\*)', no_backtick)
+        assert singles == [], f"star trap: {singles}"
+
+
+class TestRF2ApisRich:
+    def test_list_items_start_with_dash(self, bot, monkeypatch):
+        monkeypatch.setattr(bot, "get_chat_cfg", lambda: {
+            "api_keys": {"openrouter": "sk-or-xxx"},
+            "default_provider": "openrouter"})
+        out = bot._apis_rich()
+        rows = [l for l in out.split("\n") if l.startswith("- ")]
+        assert len(rows) >= 1, "Expected '- ' prefixed list items"
+
+    def test_header_followed_by_blank_line(self, bot, monkeypatch):
+        monkeypatch.setattr(bot, "get_chat_cfg", lambda: {
+            "api_keys": {"openrouter": "sk-or-xxx"},
+            "default_provider": "openrouter"})
+        out = bot._apis_rich()
+        assert "\n\n" in out[:80], (
+            f"Expected blank line after header in: {out[:80]!r}")
+        assert out.startswith("### ")
+
+    def test_legacy_apis_row_unchanged(self, bot):
+        assert t_bot("apis_row").startswith("•")
+
+    def test_no_star_trap(self, bot, monkeypatch):
+        monkeypatch.setattr(bot, "get_chat_cfg", lambda: {
+            "api_keys": {"openrouter": "sk-or-xxx"},
+            "default_provider": "openrouter"})
+        out = bot._apis_rich()
+        no_backtick = _re.sub(r"`[^`]+`", "", out)
+        singles = _re.findall(r'(?<!\*)\*(?!\*)', no_backtick)
+        assert singles == [], f"star trap: {singles}"
+
+
+class TestRF2SettingsRich:
+    def test_gfm_table_structure(self, bot, monkeypatch):
+        monkeypatch.setattr(bot, "get_chat_cfg", lambda: {
+            "tickers": ["AAPL"], "model": "gpt-4",
+            "days_lookback": 30, "max_chars": 5000,
+            "default_forms": ["8-K"], "default_provider": "openrouter",
+            "api_keys": {"openrouter": "sk-x"},
+            "schedule": "08:00", "alarm_on": True,
+            "weekly_digest": True, "custom_prompts": {},
+            "rich_format": True})
+        monkeypatch.setattr(bot, "get_lang", lambda: "tr")
+        out = bot._settings_rich()
+        assert "| Ayar | Değer |" in out or "| Setting | Value |" in out
+        assert "|:--|:--|" in out
+
+    def test_rich_settings_line_not_in_output(self, bot, monkeypatch):
+        monkeypatch.setattr(bot, "get_chat_cfg", lambda: {
+            "tickers": [], "model": "gpt-4",
+            "days_lookback": 30, "max_chars": 5000,
+            "default_forms": ["8-K"], "default_provider": "",
+            "api_keys": {}, "schedule": None,
+            "alarm_on": False, "weekly_digest": False,
+            "custom_prompts": {}, "rich_format": True})
+        monkeypatch.setattr(bot, "get_lang", lambda: "tr")
+        out = bot._settings_rich()
+        assert "📐 Zengin format  :" not in out, (
+            "Old loose rich_settings_line should not appear")
+        assert "| 📐 Zengin format |" in out, (
+            "Rich format should now be a GFM table row")
+
+    def test_no_star_trap(self, bot, monkeypatch):
+        monkeypatch.setattr(bot, "get_chat_cfg", lambda: {
+            "tickers": ["AAPL"], "model": "gpt-4",
+            "days_lookback": 30, "max_chars": 5000,
+            "default_forms": ["8-K"], "default_provider": "openrouter",
+            "api_keys": {"openrouter": "sk-x"},
+            "schedule": "08:00", "alarm_on": True,
+            "weekly_digest": True, "custom_prompts": {},
+            "rich_format": True})
+        monkeypatch.setattr(bot, "get_lang", lambda: "tr")
+        out = bot._settings_rich()
+        no_backtick = _re.sub(r"`[^`]+`", "", out)
+        singles = _re.findall(r'(?<!\*)\*(?!\*)', no_backtick)
+        assert singles == [], f"star trap: {singles}"
+
+
+class TestRF2HelpRich:
+    def test_section_heading_followed_by_blank_line(self, bot):
+        out = bot.t("help_block_rich", forms="8-K", ticker_count=3,
+                     language="tr", version="4.10")
+        for m in _re.finditer(r'\*\*[^*]+\*\*\n', out):
+            after = out[m.end():]
+            assert after.startswith("\n"), (
+                f"Section '{m.group()}' not followed by blank line")
+
+    def test_command_lines_start_with_dash(self, bot):
+        out = bot.t("help_block_rich", forms="8-K", ticker_count=3,
+                     language="tr", version="4.10")
+        cmd_lines = [l for l in out.split("\n")
+                     if l.startswith("- `")]
+        assert len(cmd_lines) > 20, f"Expected many '- `...' lines, got {len(cmd_lines)}"
+
+    def test_no_star_trap(self, bot):
+        out = bot.t("help_block_rich", forms="8-K", ticker_count=3,
+                     language="tr", version="4.10")
+        no_backtick = _re.sub(r"`[^`]+`", "", out)
+        singles = _re.findall(r'(?<!\*)\*(?!\*)', no_backtick)
+        assert singles == [], f"star trap: {singles}"
+
+
+class TestRF2ListpromptsRich:
+    def test_blank_line_after_title(self, bot, monkeypatch):
+        monkeypatch.setattr(bot, "get_chat_cfg", lambda: {
+            "custom_prompts": {"10-K": "Analyze revenue"}})
+        out = bot._listprompts_rich()
+        idx = out.index("### 📝")
+        after = out[idx:]
+        # Title line ends, then blank line, then list item
+        assert "\n\n- **" in after, (
+            f"Expected blank line between title and list, got: {after[:60]!r}")
+
+    def test_list_items_start_with_dash(self, bot, monkeypatch):
+        monkeypatch.setattr(bot, "get_chat_cfg", lambda: {
+            "custom_prompts": {"10-K": "Analyze revenue"}})
+        out = bot._listprompts_rich()
+        lines = [l for l in out.split("\n") if l.startswith("- **")]
+        assert len(lines) == 1
+
+    def test_md_escape_in_prompt(self, bot, monkeypatch):
+        monkeypatch.setattr(bot, "get_chat_cfg", lambda: {
+            "custom_prompts": {"10-K": "Analyze *bold* and [link](url)"}})
+        out = bot._listprompts_rich()
+        assert "\\*" in out or "\\[" in out, "Expected _md_escape in prompt"
+
+    def test_no_star_trap(self, bot, monkeypatch):
+        monkeypatch.setattr(bot, "get_chat_cfg", lambda: {
+            "custom_prompts": {"10-K": "Analyze *bold* text"}})
+        out = bot._listprompts_rich()
+        no_backtick = _re.sub(r"`[^`]+`", "", out)
+        no_escaped = no_backtick.replace("\\*", "")
+        singles = _re.findall(r'(?<!\*)\*(?!\*)', no_escaped)
+        assert singles == [], f"star trap: {singles}"
+
+
+class TestRF2GetpromptRich:
+    def test_fenced_code_block(self, bot, monkeypatch):
+        monkeypatch.setattr(bot, "get_chat_cfg", lambda: {
+            "custom_prompts": {"10-K": "Analyze revenue carefully"}})
+        monkeypatch.setattr(bot, "_match_form", lambda x: "10-K")
+        out = bot._getprompt_rich(["/getprompt", "10-K"])
+        assert "```\n" in out, "Expected fenced code block"
+        assert out.count("```") >= 2, "Expected opening and closing ```"
+
+    def test_no_star_trap(self, bot, monkeypatch):
+        monkeypatch.setattr(bot, "get_chat_cfg", lambda: {
+            "custom_prompts": {"10-K": "Analyze *bold* and [link]"}})
+        monkeypatch.setattr(bot, "_match_form", lambda x: "10-K")
+        out = bot._getprompt_rich(["/getprompt", "10-K"])
+        # Inside ``` fence, * is literal — no star trap
+        no_fenced = _re.sub(r'```[\s\S]*?```', '', out)
+        no_backtick_inline = _re.sub(r'`[^`]+`', '', no_fenced)
+        singles = _re.findall(r'(?<!\*)\*(?!\*)', no_backtick_inline)
+        assert singles == [], f"star trap: {singles}"
+
+
+def t_bot(key, **kw):
+    import bot as _bot
+    return _bot.t(key, **kw)
