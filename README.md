@@ -9,8 +9,8 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)](https://python.org)
 [![OpenRouter](https://img.shields.io/badge/LLM-OpenRouter%20Free-6c47ff)](https://openrouter.ai)
 [![Telegram](https://img.shields.io/badge/Interface-Telegram-2CA5E0?logo=telegram&logoColor=white)](https://telegram.org)
-[![CI](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-882%20passing-success)](#-tests)
+[![CI](https://github.com/authorturker/sec-analyzer-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/authorturker/sec-analyzer-ai/actions)
+[![Tests](https://img.shields.io/badge/tests-939%20passing-success)](#-tests)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 </div>
@@ -23,6 +23,7 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 |---|---|
 | 📄 **13 Form Types** | 10-K, 10-Q, 8-K, Form 4, SC 13G/D, S-1, DEF 14A, and more |
 | 🌐 **Two languages** | English + Turkish UI, switch live with `/setlang en` / `/setlang tr` |
+| 💎 **Rich Messages** | Telegram Bot API 10.1 native rendering — GFM tables, `###` headings, collapsible `<details>`, inline links across `/sheet` `/pnl` `/compare` `/status` `/help` and more; auto-fallback to legacy markdown then plain text |
 | 🔐 **Insider Trading** | Form 4 analysis with portfolio-wide sentiment score |
 | 📊 **Sentiment trend** | `/sentiment trend [days]` — compare current vs. N-day-ago insider mood |
 | 🆚 **Side-by-side compare** | `/compare AAPL MSFT 10-K` — single LLM call, four-axis comparison |
@@ -52,9 +53,41 @@ Single-file Python, two-language UI, no cloud required. Runs on Android (Termux)
 | 📴 **No-AI Mode** | Without any LLM key the bot still runs: delivers raw filing text with a clear ⚠️ label; never goes silent |
 | 📈 **Portfolio History** | Daily portfolio-value snapshots (up to 730 days); `/pnl` shows 1d / 7d / 30d raw-value delta |
 | 📊 **Grounded Analysis** | 10-K/10-Q/20-F analyses are grounded in audited XBRL facts from EDGAR |
-| 🧪 **Tested** | 720 pytest tests for pure helpers, i18n, config cache, thread safety |
+| 🧪 **Tested** | 939 pytest tests for pure helpers, i18n, config cache, thread safety |
 | ⚡ **OpenRouter Free LLM** | openrouter/free, $0 cost |
-| 📱 **Lightweight** | Single 1.8k-line `bot.py`, runs on a mid-range Android phone via Termux |
+| 📱 **Lightweight** | Single-file `bot.py` (~6.3k lines), runs on a mid-range Android phone via Termux |
+
+---
+
+## 💎 Rich Messages (Telegram Bot API 10.1)
+
+As of **v4.10**, every major output surface renders with Telegram's native rich markdown — real GFM tables, headings, collapsible `<details>` blocks, and inline links — instead of monospace ASCII or plain text.
+
+Delivery is a **three-tier transport** with automatic fallback, so a message is never lost:
+
+1. **Rich** — `sendRichMessage` with GFM markdown (tables, headings, lists, `<details>`, links).
+2. **Legacy markdown** — classic Telegram `*bold*` markdown, if the rich send is rejected.
+3. **Plain text** — raw text, if markdown itself fails.
+
+Each command builds its rich body alongside the legacy one (dual-render); if the rich body is empty or the chat has rich disabled, it falls through to the proven legacy path with zero behaviour change. Toggle per-chat with `/setrich on` / `/setrich off` (on by default).
+
+**Surfaces that render natively:**
+
+| Surface | Rich rendering |
+|---|---|
+| `/sheet` | Income statement, balance sheet & cash flow as three right-aligned GFM tables |
+| `/pnl` | Portfolio P&L as a native GFM table — no monospace column clamp |
+| `/compare` | Side-by-side metrics as a GFM table with a delta column |
+| `/status` | Uptime / error / scan panel as a GFM table |
+| `/settings` | All current settings as a two-column GFM table |
+| `/apis` | Provider list as a GFM list with masked keys |
+| `/help` · `/start` | Command guide with `###` headings and `` `/command` `` code spans |
+| `/listprompts` · `/getprompt` | Custom prompts as escaped lists / fenced code blocks |
+| Filing analysis | GFM headings + collapsible `<details>` risk-factor diff |
+| Weekly digest · daily news · `/checknews` | GFM headings and linked lists |
+| Watchword alerts | GFM list with clickable filing links |
+
+If your Telegram client doesn't support Bot API 10.1 rich messages, the legacy markdown is shown automatically — capability is detected per chat and cached.
 
 ---
 
@@ -75,7 +108,7 @@ sec-analyzer/
 ├── lang/
 │   ├── en.json                  # English UI strings (default)
 │   └── tr.json                  # Turkish UI strings
-├── tests/                       # 720 pytest tests (+ 6 opt-in live network tests)
+├── tests/                       # 939 pytest tests (+ 6 opt-in live network tests)
 │   ├── conftest.py
 │   ├── test_alarm_buttons.py    # Interactive alarm + on-demand .md button
 │   ├── test_bootstrap.py        # Minimal .env bootstrap, master-user init, env migration
@@ -100,6 +133,7 @@ sec-analyzer/
 │   ├── test_startup_company.py  # Startup checks + Company cache
 │   ├── test_state.py            # Locks, raw store, cache TTL
 │   ├── test_watchwords.py       # EDGAR full-text watchword alarm
+│   ├── test_rich_transport.py   # Rich message transport — capability, fallback chain, dual-render, RF2 surface render
 │   ├── test_xbrl_facts.py       # XBRL fact extraction + facts block
 │   └── test_verify.py           # Numeric claim verification
 └── README.md
@@ -299,6 +333,16 @@ Everything else — tickers, default forms, model, schedule, language, custom pr
 
 ## 🧾 Optional Data Sources
 
+The bot needs **no paid data feed** — its core grounding source is free:
+
+| Source | Used for | Key required |
+|---|---|---|
+| **EDGAR XBRL** | Filing text, audited financial facts, `/sheet` statements, full-text watchword search | No — just a valid `EDGAR_IDENTITY` |
+| **yfinance** | `/checkprice`, `/checknews`, `/pnl`, per-filing price-action snippet | No key; optional `pip install yfinance` (~50 MB) |
+| **LLM providers** | Filing analysis & `/compare` — OpenRouter · Gemini · Anthropic · Groq · DeepSeek | Optional — add with `/addapi`; without any key the bot runs in No-AI Mode |
+
+EDGAR XBRL is the **sole financial-data source** (Fiscal AI and Twelve Data were removed in v4.6). yfinance is the only price/news provider and is fully optional — without it, price-dependent commands return a clear message instead of failing.
+
 ---
 
 ## 📋 Supported Form Types
@@ -450,7 +494,7 @@ python -m pytest tests/ -q
 ```
 
 ```
-921 passed, 6 skipped in <3s
+939 passed, 6 skipped in <3s
 ```
 
 The suite covers the pure helpers (`render_filing_message`, `extract_section`, `build_prompt`, `_compute_price_change`, `parse_sentiment_signal`, `build_trend_lines`, `build_compare_prompt`, `_format_price_check`, `_news_extract`, `_format_news_list`, `_md_escape`, `_normalize_xbrl_facts`, `format_facts_block`, `_extract_numeric_claims`, `_parse_facts_block`, `verify_numeric_claims`, `_portfolio_history_delta`, `_pnl_table`, `_fmt_qty_col`, `_should_run_scheduled_scan`, `_digest_top_movers`, `_daily_news_fresh`, `_format_daily_news`, `_watchword_analyzable_hits`, `_classify_rich_error`, `_rich_enabled`, `_sheet_rich_md`, `_pnl_rich_md`, `_filing_rich_md`, `_compare_metrics_data`, `_compare_metrics_legacy`, `_compare_metrics_rich`, `_compare_rich_md`, `_status_data`, `_status_legacy`, `_status_rich`, `_digest_pnl_data`, `_digest_pnl_fmt_legacy`, `_digest_pnl_rich`, `_digest_rich_md`, `_format_daily_news_rich`, `_format_news_list_rich`, `format_watchword_alert_rich`, `_is_private_chat`, `_thinking_draft_md`, `_settings_rich`, `_apis_rich`, `_listprompts_rich`, `_getprompt_rich`, `_listgroups_rich`), the i18n loader (key parity, fallbacks, language switching, LLM-language hint), the config layer (snapshot isolation, atomic mutate, race protection), the per-chat config lock-discipline (TOCTOU flip, single-acquire proof), the chat-data purge (`_purge_chat_data` idempotency, re-add freshness), the per-chat scheduled-scan dedup (multi-chat gate, 90s boundary), the version label single-source (render correctness, placeholder leak), the multi-LLM provider abstraction (provider chain, key masking, retry logic), the No-AI mode (raw text delivery, short-circuit, daily reminder gate), the portfolio-history delta helpers, the command surface inventory (dispatcher↔help parity), the alarm probe (proves the hourly alarm makes no LLM calls and no cache writes), and the rich message transport (capability detection, fallback chain, dual-render callsites, byte-identical legacy path). Network IO is not exercised — tests run offline. The 6 skipped tests are opt-in live endpoint smoke tests; run them with `--network -m network`.
@@ -486,6 +530,19 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 ---
 
 ## 📝 Release Notes
+
+### v4.10
+
+- **Rich render fix — soft-break collapse repaired across 6 surfaces.** Bot API 10.1 treats a single `\n` as a soft break (GFM-style line join), so several rich surfaces that built tables/lists on single newlines collapsed into run-on paragraphs and rendered as plain text — even though the send succeeded (2xx, not a 400). Root cause: a `**bold**` line is a paragraph, so a table on the next single `\n` becomes a lazy continuation that never parses (`/pnl` worked because its `###` heading is a block, not a paragraph). Fixed across all six affected surfaces:
+  - **`/sheet`** — blank line inserted after each section title so the GFM table parses.
+  - **`/apis`** — rows switched to `- ` GFM list markers (new `apis_row_rich` key; legacy `•` preserved) with a blank line after the heading.
+  - **`/settings`** — rebuilt as a two-column GFM table (added a rich-format row); dropped the loose `rich_settings_line`.
+  - **`/help`** — section bodies switched to `- ` lists with a blank line after each `**section**` heading; footer lines split into separate paragraphs.
+  - **`/listprompts`** — `- ` list markers + `_md_escape` on raw prompts.
+  - **`/getprompt`** — raw prompt shown in a fenced code block (no escaping needed).
+- **Verified statically** with a real GFM parser (Python `markdown` + `tables`/`fenced_code`): every surface now produces `<table>` / `<ul>` / `<code>` instead of a collapsed `<p>`.
+- **Legacy paths byte-identical** — every legacy lang key and handler return value unchanged; the diagnostic instrumentation added during triage was fully removed.
+- **Test count:** 939 passing, 6 skipped (945 collected).
 
 ### v4.9
 
@@ -668,13 +725,14 @@ The suite covers the pure helpers (`render_filing_message`, `extract_section`, `
 
 ---
 
+
 ## 📚 Support the Project
 
 If you want to support this work, you can buy me a coffee.
 
-![Bitcoin](https://img.shields.io/badge/bitcoin-2F3134?style=for-the-badge&logo=bitcoin&logoColor=white) : 178hyCd89p2QQnyUCL5y6hpzyJqu7QHz34
+![Bitcoin](https://img.shields.io/badge/bitcoin-F7931A?style=for-the-badge&logo=bitcoin&logoColor=white) : 178hyCd89p2QQnyUCL5y6hpzyJqu7QHz34
 
-![Ethereum](https://img.shields.io/badge/Ethereum-3C3C3D?style=for-the-badge&logo=Ethereum&logoColor=white) : 0xf886b701d0abC89c2f59a8F98d1edF739D4b39a2
+![Bitcoin](https://img.shields.io/badge/bitcoin-FCC01E?style=for-the-badge&logo=bitcoin&logoColor=black) : turker@blink.sv
 
 ![Solana](https://img.shields.io/badge/solana-%239945FF.svg?style=for-the-badge&logo=solana&logoColor=white) : MXpoKvp1ZojjZ1fXYhgLCYfUo3R9U43jiCF8cEA1q1Y
 
